@@ -1,0 +1,19 @@
+{
+  "tokens": [
+    {
+      "id": "token_1",
+      "name": "Main",
+      "class": "apostle",
+      "access_token": "vk1.a.REPLACE_ME",
+      "user_id": 0,
+      "source_chat_id": 48,
+      "target_peer_id": -183040898,
+      "voices": 5,
+      "enabled": true,
+      "last_check": 0
+    }
+  ],
+  "settings": {
+    "delay": 2
+  }
+}
