@@ -1,19 +1,53 @@
 {
   "tokens": [
     {
-      "id": "token_1",
+      "id": "token_main",
       "name": "Main",
       "class": "apostle",
-      "access_token": "vk1.a.REPLACE_ME",
-      "user_id": 0,
+      "access_token": "vk1.a.ВАШ_ТОКЕН_1",
+      "user_id": 104149964,
       "source_chat_id": 48,
       "target_peer_id": -183040898,
       "voices": 5,
+      "enabled": true,
+      "last_check": 0
+    },
+    {
+      "id": "token_backup", 
+      "name": "Backup",
+      "class": "apostle",
+      "access_token": "vk1.a.ВАШ_ТОКЕН_2",
+      "user_id": 555666777,
+      "source_chat_id": 48,
+      "target_peer_id": -183040898,
+      "voices": 3,
+      "enabled": true,
+      "last_check": 0
+    },
+    {
+      "id": "token_warlock",
+      "name": "Warlock",
+      "class": "warlock",
+      "access_token": "vk1.a.ВАШ_ТОКЕН_3", 
+      "user_id": 888999000,
+      "source_chat_id": 48,
+      "target_peer_id": -183040898,
+      "voices": 4,
       "enabled": true,
       "last_check": 0
     }
   ],
   "settings": {
     "delay": 2
+  },
+  "race_pools": {
+    "д": {
+      "enabled_apostles": ["token_main"],
+      "expires": 1738286800
+    },
+    "ч": {
+      "enabled_apostles": ["token_backup"],
+      "expires": 1738290400
+    }
   }
 }
