@@ -9,12 +9,31 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime
+from logging.handlers import RotatingFileHandler  # NEW
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()],
+# === ЛОГИРОВАНИЕ С РОТАЦИЕЙ ===
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+log_formatter = logging.Formatter(
+    fmt="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
+
+file_handler = RotatingFileHandler(
+    "bot.log",
+    maxBytes=5 * 1024 * 1024,  # 5 MB
+    backupCount=5,
+    encoding="utf-8",
+)
+file_handler.setFormatter(log_formatter)
+
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(log_formatter)
+
+logger.handlers.clear()
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
 
 VK_API_BASE = "https://api.vk.com/method"
 VK_API_VERSION = "5.131"
@@ -180,6 +199,26 @@ class TokenWeightManager:
         if old_f > 0 or old_w < 1.0:
             logging.info(f"📈 {token_id}: success weight {old_w:.1f}→{new_w:.1f}, fails reset {old_f}")
 
+# ====== ПРОСТОЙ RATE LIMITER ДЛЯ TOKENS ======
+class SimpleRateLimiter:
+    def __init__(self, max_per_minute: int = 60):
+        self.max_per_minute = max_per_minute
+        self._lock = threading.Lock()
+        self._counters: Dict[str, Tuple[int, float]] = {}  # token_id -> (count, window_start_ts)
+
+    def allow(self, token_id: str) -> bool:
+        now = time.time()
+        with self._lock:
+            count, start = self._counters.get(token_id, (0, now))
+            if now - start >= 60:
+                # новый минутный интервал
+                self._counters[token_id] = (1, now)
+                return True
+            if count < self.max_per_minute:
+                self._counters[token_id] = (count + 1, start)
+                return True
+            return False
+
 # ====== VK ASYNC CLIENT ======
 class VKAsyncClient:
     def __init__(self):
@@ -229,7 +268,8 @@ class ParsedAbility:
 
 # ====== TOKEN HANDLER ======
 class TokenHandler:
-    def __init__(self, cfg: Dict[str, Any], vk: VKAsyncClient, msg_cache: MessageCache, manager: "SimpleTokenManager"):
+    def __init__(self, cfg: Dict[str, Any], vk: VKAsyncClient, msg_cache: MessageCache,
+                 manager: "SimpleTokenManager", rate_limiter: SimpleRateLimiter):
         self.id: str = cfg["id"]
         self.name: str = cfg.get("name", self.id)
         self.class_type: str = cfg.get("class", "apostol")
@@ -245,6 +285,7 @@ class TokenHandler:
         self._vk = vk
         self._cache = msg_cache
         self._manager = manager
+        self._rate_limiter = rate_limiter
 
     def class_name(self) -> str:
         return CLASS_ABILITIES.get(self.class_type, {}).get("name", "Неизвестный")
@@ -267,6 +308,10 @@ class TokenHandler:
             logging.info(f"🔊 {self.name}: voices {old} → {new_voices}")
 
     async def _messages_send(self, text: str, reply_to: int) -> bool:
+        if not self._rate_limiter.allow(self.id):
+            logging.warning(f"🚦 Rate limit for token {self.id}, skipping send")
+            return False
+
         data = {
             "access_token": self.access_token,
             "v": VK_API_VERSION,
@@ -278,12 +323,19 @@ class TokenHandler:
         }
         ret = await self._vk.post("messages.send", data)
         if "error" in ret:
-            logging.error(f"❌ {self.name}: send error {ret['error']}")
+            err = ret["error"]
+            code = err.get("error_code")
+            msg = err.get("error_msg")
+            logging.error(f"❌ {self.name}: send error {code} {msg}")
             return False
         return True
 
     def send_command_reply(self, text: str, reply_to_message_id: int) -> bool:
-        return self._vk.call(self._messages_send(text, reply_to_message_id))
+        try:
+            return self._vk.call(self._messages_send(text, reply_to_message_id))
+        except Exception as e:
+            logging.error(f"❌ {self.name}: send_command_reply exception {e}")
+            return False
 
     def get_history(self, peer_id: int, count: int = 20) -> List[Dict[str, Any]]:
         cached = self._cache.get(peer_id)
@@ -299,6 +351,12 @@ class TokenHandler:
         async def _get():
             try:
                 ret = await self._vk.post("messages.getHistory", data)
+                if "error" in ret:
+                    err = ret["error"]
+                    code = err.get("error_code")
+                    msg = err.get("error_msg")
+                    logging.error(f"❌ {self.name}: getHistory error {code} {msg}")
+                    return []
                 if "response" in ret and "items" in ret["response"]:
                     items = ret["response"]["items"]
                     self._cache.set(peer_id, items)
@@ -325,6 +383,12 @@ class TokenHandler:
         async def _get():
             try:
                 ret = await self._vk.post("messages.getHistory", data)
+                if "error" in ret:
+                    err = ret["error"]
+                    code = err.get("error_code")
+                    msg = err.get("error_msg")
+                    logging.error(f"❌ {self.name}: getHistory_fresh error {code} {msg}")
+                    return []
                 if "response" in ret and "items" in ret["response"]:
                     return ret["response"]["items"]
             except Exception as e:
@@ -345,6 +409,7 @@ class SimpleTokenManager:
         self._vk = vk
         self.msg_cache = MessageCache(ttl=8)
         self.weight = TokenWeightManager()
+        self.rate_limiter = SimpleRateLimiter(max_per_minute=60)  # можно подкрутить
         self.tokens: List[TokenHandler] = []
         self.config: Dict = {}
         self.load()
@@ -369,7 +434,9 @@ class SimpleTokenManager:
                 sc = int(t_cfg.get("source_chat_id", 0))
                 if sc > 2000000000:
                     logging.warning(f"⚠️ source_chat_id looks like peer_id={sc} for {t_cfg.get('id')}")
-                self.tokens.append(TokenHandler(t_cfg, self._vk, self.msg_cache, self))
+                self.tokens.append(
+                    TokenHandler(t_cfg, self._vk, self.msg_cache, self, self.rate_limiter)
+                )
         logging.info(f"📋 Loaded {len(self.tokens)} tokens")
 
     def reload(self) -> None:
@@ -424,10 +491,10 @@ class AbilityExecutor:
         try:
             ok = token.send_command_reply(ability.text, trigger_msg_id)
             if not ok:
-                self.tm.weight.record_failure(token.id, "send_error")
+                self.tm.weight.record_failure(token.id, "send_error_or_rate_limit")
                 logging.warning(
                     f"❌ [{attempt_idx}] {token.name}({token.class_name()}): "
-                    f"{ability.text} SEND_ERROR ({time.time()-start_time:.2f}s)"
+                    f"{ability.text} SEND_ERROR_OR_RATE_LIMIT ({time.time()-start_time:.2f}s)"
                 )
                 return
 
@@ -505,14 +572,15 @@ class MultiTokenBot:
         except Exception as e:
             logging.error(f"❌ Failed to save last_msg_id: {e}")
 
-    # ===== командный парсер (пока только /баф) =====
+    # ===== командный парсер (!баф, максимум 4 буквы) =====
     def parse_command_text(self, text: str, sender_id: int, trigger_msg_id: int) -> List[ParsedAbility]:
         text = text.strip().lower()
-        if not text.startswith("/баф"):
+        if not text.startswith("!баф"):
             return []
-        cmd_text = text[4:].strip()
+        cmd_text = text[3:].strip()
         if not cmd_text:
             return []
+        cmd_text = cmd_text[:4]  # максимум 4 буквы
         abilities: List[ParsedAbility] = []
         for ch in cmd_text:
             for class_type in CLASS_ORDER:
@@ -563,7 +631,7 @@ class MultiTokenBot:
                     abilities = self.parse_command_text(text, sender_id, msg_id)
                     if abilities:
                         logging.info(
-                            f"🎯 /баф from {sender_id}: "
+                            f"🎯 !баф from {sender_id}: "
                             f"{''.join(a.key for a in abilities)} ({len(abilities)} abilities)"
                         )
                         self._process_abilities(abilities, sender_id, msg_id)
@@ -582,16 +650,26 @@ class MultiTokenBot:
         for ability in abilities:
             candidates = self.tm.tokens_for_ability(ability.key)
             if not candidates:
+                logging.warning(
+                    f"⚠️ No tokens for ability '{ability.key}' (class {ability.class_type})"
+                )
                 continue
+
             candidates.sort(key=lambda t: self.tm.weight.get_weight(t.id), reverse=True)
 
             for idx, token in enumerate(candidates, start=1):
-                can, _ = token.can_use_ability(ability.key)
-                if not can:
-                    continue
-                self.executor.execute(token, ability, trigger_msg_id, sender_id, idx)
-                if ability.processed:
-                    break  # строго 1 баф на букву
+                try:
+                    can, _ = token.can_use_ability(ability.key)
+                    if not can:
+                        continue
+                    self.executor.execute(token, ability, trigger_msg_id, sender_id, idx)
+                    if ability.processed:
+                        break  # строго 1 баф на букву
+                except Exception as e:
+                    logging.error(
+                        f"❌ Error while processing ability '{ability.key}' "
+                        f"with token {token.id}: {e}"
+                    )
 
         success_count = len([a for a in abilities if a.processed])
         fail_count = len(abilities) - success_count
