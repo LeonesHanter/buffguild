@@ -3,7 +3,6 @@ import asyncio
 import aiohttp
 import json
 import logging
-import os
 import random
 import threading
 import time
@@ -314,6 +313,30 @@ class TokenHandler:
             logging.error(f"❌ {self.name}: getHistory exception {e}")
             return []
 
+    def get_history_fresh(self, peer_id: int, count: int = 20) -> List[Dict[str, Any]]:
+        """История без кэша — для проверки результата бафа."""
+        data = {
+            "access_token": self.access_token,
+            "v": VK_API_VERSION,
+            "peer_id": int(peer_id),
+            "count": int(count),
+        }
+
+        async def _get():
+            try:
+                ret = await self._vk.post("messages.getHistory", data)
+                if "response" in ret and "items" in ret["response"]:
+                    return ret["response"]["items"]
+            except Exception as e:
+                logging.error(f"getHistory_fresh error: {e}")
+            return []
+
+        try:
+            return self._vk.call(_get())
+        except Exception as e:
+            logging.error(f"❌ {self.name}: getHistory_fresh exception {e}")
+            return []
+
 # ====== TOKEN MANAGER ======
 class SimpleTokenManager:
     def __init__(self, config_path: str, vk: VKAsyncClient):
@@ -343,6 +366,9 @@ class SimpleTokenManager:
                 target = int(t_cfg.get("target_peer_id", 0))
                 if 0 < target < 2000000000:
                     logging.warning(f"⚠️ Suspicious target_peer_id={target} for {t_cfg.get('id')}")
+                sc = int(t_cfg.get("source_chat_id", 0))
+                if sc > 2000000000:
+                    logging.warning(f"⚠️ source_chat_id looks like peer_id={sc} for {t_cfg.get('id')}")
                 self.tokens.append(TokenHandler(t_cfg, self._vk, self.msg_cache, self))
         logging.info(f"📋 Loaded {len(self.tokens)} tokens")
 
@@ -406,7 +432,7 @@ class AbilityExecutor:
                 return
 
             time.sleep(self.timing.get_wait_time())
-            history = token.get_history(token.target_peer_id, count=10)
+            history = token.get_history_fresh(token.target_peer_id, count=10)
             result = self._parse_result(history, ability.text)
 
             if result == "SUCCESS":
@@ -457,17 +483,36 @@ class MultiTokenBot:
             raise RuntimeError("No tokens in config.json")
         self.source_peer_id = self.main_token.source_peer_id
         self._running = False
+        self.last_msg_id = self._load_last_msg_id()
         logging.info("🤖 MultiTokenBot STARTED")
         logging.info(f"📋 Tokens: {len(self.tm.tokens)}")
         logging.info(f"📁 Source chat: {self.source_peer_id}")
         logging.info(f"⏱️ Initial wait time: {self.timing.get_wait_time():.2f}s")
 
-    # ===== командный парсер (упрощённая версия) =====
+    # ===== вспомогательные =====
+    def _load_last_msg_id(self) -> int:
+        try:
+            with open("last_msg_id.json", "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return int(data.get("last_msg_id", 0))
+        except Exception:
+            return 0
+
+    def _save_last_msg_id(self, last_msg_id: int) -> None:
+        try:
+            with open("last_msg_id.json", "w", encoding="utf-8") as f:
+                json.dump({"last_msg_id": int(last_msg_id)}, f)
+        except Exception as e:
+            logging.error(f"❌ Failed to save last_msg_id: {e}")
+
+    # ===== командный парсер (пока только /баф) =====
     def parse_command_text(self, text: str, sender_id: int, trigger_msg_id: int) -> List[ParsedAbility]:
         text = text.strip().lower()
         if not text.startswith("/баф"):
             return []
         cmd_text = text[4:].strip()
+        if not cmd_text:
+            return []
         abilities: List[ParsedAbility] = []
         for ch in cmd_text:
             for class_type in CLASS_ORDER:
@@ -498,15 +543,17 @@ class MultiTokenBot:
     # ===== основной цикл =====
     def run(self):
         self._running = True
-        last_msg_id = 0
         try:
             while self._running:
                 msgs = self.main_token.get_history(self.source_peer_id, count=30)
+                updated = False
+
                 for msg in reversed(msgs):
                     msg_id = msg.get("id", 0)
-                    if msg_id <= last_msg_id:
+                    if msg_id <= self.last_msg_id:
                         continue
-                    last_msg_id = msg_id
+                    self.last_msg_id = msg_id
+                    updated = True
 
                     text = msg.get("text", "").strip()
                     sender_id = msg.get("from_id", 0)
@@ -517,9 +564,13 @@ class MultiTokenBot:
                     if abilities:
                         logging.info(
                             f"🎯 /баф from {sender_id}: "
-                            f\"{''.join(a.key for a in abilities)}\" ({len(abilities)} abilities)"
+                            f"{''.join(a.key for a in abilities)} ({len(abilities)} abilities)"
                         )
                         self._process_abilities(abilities, sender_id, msg_id)
+
+                if updated:
+                    self._save_last_msg_id(self.last_msg_id)
+
                 time.sleep(1.0)
         except KeyboardInterrupt:
             logging.info("⏹️ Stopping...")
