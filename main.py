@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import random
-import re
 import threading
 import time
 from dataclasses import dataclass
@@ -21,11 +20,11 @@ logging.basicConfig(
 VK_API_BASE = "https://api.vk.com/method"
 VK_API_VERSION = "5.131"
 
-# ====== КЛАССЫ И СПОСОБНОСТИ (ОБНОВЛЕНО) ======
-CLASS_ORDER = ["apostle", "warlock", "crusader", "light_incarnation"]
+# ====== КЛАССЫ И СПОСОБНОСТИ ======
+CLASS_ORDER = ["apostol", "warlock", "crusader", "light_incarnation"]
 
 CLASS_ABILITIES: Dict[str, Dict[str, Any]] = {
-    "apostle": {
+    "apostol": {
         "name": "Апостол",
         "prefix": "благословение",
         "uses_voices": True,
@@ -47,7 +46,7 @@ CLASS_ABILITIES: Dict[str, Dict[str, Any]] = {
         "name": "Чернокнижник",
         "prefix": "проклятие",
         "uses_voices": True,
-        "default_cooldown": 3600,  # ← 1 ЧАС
+        "default_cooldown": 3600,
         "abilities": {
             "л": "неудачи",
             "б": "боли",
@@ -81,11 +80,11 @@ CLASS_ABILITIES: Dict[str, Dict[str, Any]] = {
 RACE_NAMES = {
     "ч": "человек",
     "г": "гоблин",
-    "н": "нежить", 
+    "н": "нежить",
     "э": "эльф",
     "м": "гном",
     "д": "демон",
-    "о": "орк"
+    "о": "орк",
 }
 
 # ====== АДАПТИВНЫЙ ТАЙМИНГ ======
@@ -182,22 +181,6 @@ class TokenWeightManager:
         if old_f > 0 or old_w < 1.0:
             logging.info(f"📈 {token_id}: success weight {old_w:.1f}→{new_w:.1f}, fails reset {old_f}")
 
-    def choose_weighted_unique(self, tokens: List["TokenHandler"], count: int) -> List["TokenHandler"]:
-        if not tokens:
-            return []
-        if count >= len(tokens):
-            return tokens[:]
-        pool = tokens[:]
-        selected: List[TokenHandler] = []
-        for _ in range(count):
-            if not pool:
-                break
-            weights = [self.get_weight(t.id) for t in pool]
-            chosen = random.choices(pool, weights=weights, k=1)[0]
-            selected.append(chosen)
-            pool.remove(chosen)
-        return selected
-
 # ====== VK ASYNC CLIENT ======
 class VKAsyncClient:
     def __init__(self):
@@ -235,7 +218,7 @@ class VKAsyncClient:
         async with self._session.post(url, data=data) as resp:
             return await resp.json()
 
-# ====== TOKEN HANDLER ======
+# ====== DATA ======
 @dataclass
 class ParsedAbility:
     key: str
@@ -243,12 +226,14 @@ class ParsedAbility:
     cooldown: int
     class_type: str
     uses_voices: bool
+    processed: bool = False  # успешно выдан
 
+# ====== TOKEN HANDLER ======
 class TokenHandler:
     def __init__(self, cfg: Dict[str, Any], vk: VKAsyncClient, msg_cache: MessageCache, manager: "SimpleTokenManager"):
         self.id: str = cfg["id"]
         self.name: str = cfg.get("name", self.id)
-        self.class_type: str = cfg.get("class", "apostle")
+        self.class_type: str = cfg.get("class", "apostol")
         self.access_token: str = cfg["access_token"]
         self.user_id: int = cfg.get("user_id", 0)
         self.source_chat_id: int = int(cfg["source_chat_id"])
@@ -311,6 +296,7 @@ class TokenHandler:
             "peer_id": int(peer_id),
             "count": int(count),
         }
+
         async def _get():
             try:
                 ret = await self._vk.post("messages.getHistory", data)
@@ -321,6 +307,7 @@ class TokenHandler:
             except Exception as e:
                 logging.error(f"getHistory error: {e}")
             return []
+
         try:
             return self._vk.call(_get())
         except Exception as e:
@@ -388,7 +375,6 @@ class SimpleTokenManager:
 
     def tokens_for_ability(self, ability_key: str) -> List[TokenHandler]:
         tokens = []
-        # Основной пул
         for token in self.tokens:
             if not token.enabled:
                 continue
@@ -398,31 +384,74 @@ class SimpleTokenManager:
             ok, _ = token.can_use_ability(ability_key)
             if ok:
                 tokens.append(token)
-        
-        # ДОПОЛНИТЕЛЬНЫЙ ПУЛ для рас (только Апостолы)
-        race_pools = self.config.get("race_pools", {})
-        if ability_key in RACE_NAMES:
-            pool = race_pools.get(ability_key, {})
-            expires = pool.get("expires", 0)
-            if time.time() < expires:
-                for token_id in pool.get("enabled_apostles", []):
-                    for token in self.tokens:
-                        if (token.id == token_id and 
-                            token.class_type == "apostle" and 
-                            token.enabled):
-                            ok, _ = token.can_use_ability(ability_key)
-                            if ok and token not in tokens:  # Избегаем дублей
-                                tokens.append(token)
         return tokens
 
-# ====== ОСНОВНОЙ БОТ ======
-class MultiTokenBot:
-    MAX_PARALLEL = 4
-    MAX_ITERATIONS = 5
+# ====== EXECUTOR ======
+class AbilityExecutor:
+    def __init__(self, timing: AdaptiveTiming, tm: SimpleTokenManager):
+        self.timing = timing
+        self.tm = tm
 
+    def execute(self, token: TokenHandler, ability: ParsedAbility,
+                trigger_msg_id: int, sender_id: int, attempt_idx: int) -> None:
+        start_time = time.time()
+        try:
+            ok = token.send_command_reply(ability.text, trigger_msg_id)
+            if not ok:
+                self.tm.weight.record_failure(token.id, "send_error")
+                logging.warning(
+                    f"❌ [{attempt_idx}] {token.name}({token.class_name()}): "
+                    f"{ability.text} SEND_ERROR ({time.time()-start_time:.2f}s)"
+                )
+                return
+
+            time.sleep(self.timing.get_wait_time())
+            history = token.get_history(token.target_peer_id, count=10)
+            result = self._parse_result(history, ability.text)
+
+            if result == "SUCCESS":
+                ability.processed = True
+                token.set_ability_cooldown(ability.key, ability.cooldown)
+                if ability.uses_voices:
+                    token.update_voices(token.voices - 1)
+                self.tm.weight.record_success(token.id)
+                self.timing.record_response_time(time.time() - start_time)
+                logging.info(
+                    f"✅ [{attempt_idx}] {token.name}({token.class_name()}): "
+                    f"{ability.text} ({time.time()-start_time:.2f}s)"
+                )
+            elif result == "NO_VOICES":
+                token.update_voices(0)
+                self.tm.weight.record_failure(token.id, "no_voices")
+                logging.warning(
+                    f"🔇 [{attempt_idx}] {token.name}({token.class_name()}): "
+                    f"{ability.text} NO_VOICES ({time.time()-start_time:.2f}s)"
+                )
+            else:
+                self.tm.weight.record_failure(token.id, result)
+                logging.warning(
+                    f"⚠️ [{attempt_idx}] {token.name}({token.class_name()}): "
+                    f"{ability.text} {result} ({time.time()-start_time:.2f}s)"
+                )
+        except Exception as e:
+            logging.error(f"❌ Attempt error idx={attempt_idx}: {e}")
+            self.tm.weight.record_failure(token.id, "exception")
+
+    def _parse_result(self, history: List[Dict], sent_text: str) -> str:
+        for msg in history:
+            text = msg.get("text", "").lower()
+            if "на вас наложено" in text or "наложено" in text:
+                return "SUCCESS"
+            if "требуется голос" in text or "голоса" in text:
+                return "NO_VOICES"
+        return "UNKNOWN"
+
+# ====== БОТ ======
+class MultiTokenBot:
     def __init__(self, config_path: str):
         self.tm = SimpleTokenManager(config_path, VKAsyncClient())
         self.timing = AdaptiveTiming()
+        self.executor = AbilityExecutor(self.timing, self.tm)
         self.main_token = self.tm.tokens[0] if self.tm.tokens else None
         if not self.main_token:
             raise RuntimeError("No tokens in config.json")
@@ -433,40 +462,21 @@ class MultiTokenBot:
         logging.info(f"📁 Source chat: {self.source_peer_id}")
         logging.info(f"⏱️ Initial wait time: {self.timing.get_wait_time():.2f}s")
 
+    # ===== командный парсер (упрощённая версия) =====
     def parse_command_text(self, text: str, sender_id: int, trigger_msg_id: int) -> List[ParsedAbility]:
         text = text.strip().lower()
-        
-        # Новые команды
-        if self._handle_special_commands(text, sender_id, trigger_msg_id):
+        if not text.startswith("/баф"):
             return []
-        
-        # Обычный парсинг /баф
-        if not text.startswith('/баф'):
-            return []
-        
-        abilities = []
         cmd_text = text[4:].strip()
-        
-        for char in cmd_text:
+        abilities: List[ParsedAbility] = []
+        for ch in cmd_text:
             for class_type in CLASS_ORDER:
-                ability_info = self._build_ability_text_and_cd(class_type, char)
-                if ability_info:
-                    text, cooldown, uses_voices = ability_info
-                    abilities.append(ParsedAbility(char, text, cooldown, class_type, uses_voices))
+                info = self._build_ability_text_and_cd(class_type, ch)
+                if info:
+                    txt, cd, uses_voices = info
+                    abilities.append(ParsedAbility(ch, txt, cd, class_type, uses_voices))
                     break
         return abilities
-
-    def _handle_special_commands(self, text: str, sender_id: int, trigger_msg_id: int) -> bool:
-        if text.startswith('/апо'):
-            self._cmd_apo(trigger_msg_id, sender_id)
-            return True
-        if '/мои голос' in text:
-            self._cmd_restore_voices(text, trigger_msg_id, sender_id)
-            return True
-        if text.startswith('/допраса'):
-            self._cmd_doprasa(text, trigger_msg_id, sender_id)
-            return True
-        return False
 
     def _build_ability_text_and_cd(self, class_type: str, key: str) -> Optional[Tuple[str, int, bool]]:
         c = CLASS_ABILITIES.get(class_type)
@@ -481,227 +491,95 @@ class MultiTokenBot:
         text = f"{prefix} {v}".strip() if prefix else str(v)
         return text, default_cd, uses_voices
 
-    def _cmd_apo(self, trigger_msg_id: int, sender_id: int) -> None:
-        """📋 Команда /апо"""
-        apostles_info = []
-        race_pools = self.tm.config.get("race_pools", {})
-        
-        for token in self.tm.tokens:
-            if token.class_type != "apostle":
-                continue
-            
-            voices_str = f"🔊 **{token.voices} голосов**"
-            status = "✅" if token.enabled else "❌"
-            
-            races_list = []
-            for race_key, pool in race_pools.items():
-                if token.id in pool.get("enabled_apostles", []):
-                    expires = pool.get("expires", 0)
-                    remaining = max(0, expires - time.time())
-                    if remaining > 0:
-                        hours = int(remaining // 3600)
-                        mins = int((remaining % 3600) // 60)
-                        race_name = RACE_NAMES.get(race_key, race_key)
-                        time_str = f"({hours}ч{mins}м)" if hours > 0 else f"({mins}м)"
-                        races_list.append(f"{race_name} {time_str}")
-            
-            races_str = "🏺 **" + ", ".join(races_list) + "**" if races_list else "🏺 **-**"
-            apostles_info.append(
-                f"**{token.name}**  {status}\n"
-                f"{voices_str}\n"
-                f"{races_str}"
-            )
-        
-        status_text = "📋 **Апостолы:**\n\n" + "\n\n".join([f"**{i+1}.** {info}" for i, info in enumerate(apostles_info)])
-        self._send_reaction(trigger_msg_id, status_text[:4000], sender_id)
-
-    def _cmd_restore_voices(self, text: str, trigger_msg_id: int, sender_id: int) -> None:
-        """🔊 Команда /мои голоса N"""
-        match = re.match(r'/мои\s+голос[аы]\s+(\d+)', text, re.IGNORECASE)
-        if not match:
-            self._send_reaction(trigger_msg_id, "❌ Формат: /мои голоса 5", sender_id)
-            return
-        
-        voices_count = int(match.group(1))
-        sender_token = None
-        for token in self.tm.tokens:
-            if token.user_id == sender_id and token.class_type == "apostle":
-                sender_token = token
-                break
-        
-        if not sender_token:
-            self._send_reaction(trigger_msg_id, "❌ Апостол не найден", sender_id)
-            return
-        
-        old_voices = sender_token.voices
-        sender_token.update_voices(voices_count)
-        self.tm.weight.record_success(sender_token.id)
-        self._send_reaction(trigger_msg_id, f"✅ {sender_token.name}: голоса {old_voices}→{voices_count}, weight=1.0", sender_id)
-
-    def _cmd_doprasa(self, text: str, trigger_msg_id: int, sender_id: int) -> None:
-        """🌟 Команда /допраса д"""
-        match = re.match(r'/допраса\s+([чгнэмдо])', text.lower())
-        if not match:
-            self._send_reaction(trigger_msg_id, "❌ Формат: /допраса д", sender_id)
-            return
-        
-        race_key = match.group(1)
-        expires = time.time() + 2 * 3600  # 2 часа
-        
-        apostle_token = None
-        for token in self.tm.tokens:
-            if (token.class_type == "apostle" and 
-                token.enabled and 
-                token.user_id == sender_id and 
-                token.voices > 0):
-                apostle_token = token
-                break
-        
-        if not apostle_token:
-            self._send_reaction(trigger_msg_id, "❌ Нет доступных апостолов с голосами", sender_id)
-            return
-        
-        race_pools = self.tm.config.get("race_pools", {})
-        race_pools[race_key] = race_pools.get(race_key, {})
-        if "enabled_apostles" not in race_pools[race_key]:
-            race_pools[race_key]["enabled_apostles"] = []
-        if apostle_token.id not in race_pools[race_key]["enabled_apostles"]:
-            race_pools[race_key]["enabled_apostles"].append(apostle_token.id)
-        race_pools[race_key]["expires"] = expires
-        
-        self.tm.config["race_pools"] = race_pools
-        self.tm.save()
-        
-        race_name = RACE_NAMES.get(race_key, race_key)
-        self._send_reaction(trigger_msg_id, f"✅ {apostle_token.name} в пуле {race_name} (2ч)", sender_id)
-
     def _send_reaction(self, trigger_msg_id: int, text: str, sender_id: int) -> None:
-        """Отправить реакцию на сообщение отправителя"""
         if self.main_token:
             self.main_token.send_command_reply(text, trigger_msg_id)
 
+    # ===== основной цикл =====
     def run(self):
         self._running = True
+        last_msg_id = 0
         try:
-            last_msg_id = 0
             while self._running:
                 msgs = self.main_token.get_history(self.source_peer_id, count=30)
                 for msg in reversed(msgs):
                     msg_id = msg.get("id", 0)
                     if msg_id <= last_msg_id:
                         continue
-                    last_msg_id = max(last_msg_id, msg_id)
-                    
+                    last_msg_id = msg_id
+
                     text = msg.get("text", "").strip()
                     sender_id = msg.get("from_id", 0)
-                    
                     if sender_id <= 0:
                         continue
-                    
+
                     abilities = self.parse_command_text(text, sender_id, msg_id)
                     if abilities:
-                        logging.info(f"🎯 /баф from {sender_id}: {''.join([a.key for a in abilities])} ({len(abilities)} abilities)")
+                        logging.info(
+                            f"🎯 /баф from {sender_id}: "
+                            f\"{''.join(a.key for a in abilities)}\" ({len(abilities)} abilities)"
+                        )
                         self._process_abilities(abilities, sender_id, msg_id)
+                time.sleep(1.0)
         except KeyboardInterrupt:
             logging.info("⏹️ Stopping...")
         finally:
             self._running = False
 
+    # ===== обработка способностей =====
     def _process_abilities(self, abilities: List[ParsedAbility], sender_id: int, trigger_msg_id: int) -> None:
-        remaining_abilities = abilities[:]
-        for iteration in range(self.MAX_ITERATIONS):
-            if not remaining_abilities:
-                break
-                
-            logging.info(f"🔄 Iteration {iteration+1}/{self.MAX_ITERATIONS}: remaining={len(remaining_abilities)}")
-            
-            # Группируем по классам
-            ability_groups: Dict[str, List[ParsedAbility]] = {}
-            for ability in remaining_abilities:
-                if ability.class_type not in ability_groups:
-                    ability_groups[ability.class_type] = []
-                ability_groups[ability.class_type].append(ability)
-            
-            threads = []
-            for class_type, class_abilities in ability_groups.items():
-                available_tokens = self.tm.tokens_for_ability(class_abilities[0].key)
-                selected_tokens = self.tm.weight.choose_weighted_unique(available_tokens, min(len(class_abilities), self.MAX_PARALLEL))
-                
-                for i, (token, ability) in enumerate(zip(selected_tokens, class_abilities)):
-                    if not token.can_use_ability(ability.key)[0]:
-                        continue
-                    
-                    thread = threading.Thread(target=self._execute_ability, 
-                                            args=(token, ability, trigger_msg_id, sender_id, i+1))
-                    threads.append(thread)
-                    thread.start()
-                    if len(threads) >= self.MAX_PARALLEL:
-                        break
-            
-            # Ждём завершения
-            for thread in threads:
-                thread.join()
-            
-            wait_time = self.timing.get_wait_time()
-            time.sleep(wait_time)
-            
-            # Фильтруем успешно выполненные
-            remaining_abilities = [a for a in remaining_abilities if not a.processed]
-        
-        success_count = len(abilities) - len(remaining_abilities)
+        for ability in abilities:
+            candidates = self.tm.tokens_for_ability(ability.key)
+            if not candidates:
+                continue
+            candidates.sort(key=lambda t: self.tm.weight.get_weight(t.id), reverse=True)
+
+            for idx, token in enumerate(candidates, start=1):
+                can, _ = token.can_use_ability(ability.key)
+                if not can:
+                    continue
+                self.executor.execute(token, ability, trigger_msg_id, sender_id, idx)
+                if ability.processed:
+                    break  # строго 1 баф на букву
+
+        success_count = len([a for a in abilities if a.processed])
+        fail_count = len(abilities) - success_count
+
         if success_count == len(abilities):
             logging.info(f"🎉 All {len(abilities)} abilities used for {sender_id}")
         elif success_count > 0:
             logging.warning(f"⚠️ Partial success: {success_count}/{len(abilities)} for {sender_id}")
         else:
-            logging.error(f"❌ Failed all abilities for {sender_id}")
+            logging.error(f"❌ Failed all {len(abilities)} for {sender_id}")
 
-    def _execute_ability(self, token: TokenHandler, ability: ParsedAbility, 
-                        trigger_msg_id: int, sender_id: int, thread_idx: int) -> None:
-        start_time = time.time()
-        ability.processed = True
-        
-        try:
-            success = token.send_command_reply(ability.text, trigger_msg_id)
-            if not success:
-                self.tm.record_token_result(token.id, False, "send_error")
-                logging.warning(f"❌ [{thread_idx}] {token.name}({token.class_name()}): {ability.text} SEND_ERROR ({time.time()-start_time:.2f}s)")
-                return
-            
-            time.sleep(self.timing.get_wait_time())
-            
-            # Проверяем результат
-            history = token.get_history(token.target_peer_id, count=10)
-            result = self._parse_result(history, ability.text)
-            
-            if result == "SUCCESS":
-                token.set_ability_cooldown(ability.key, ability.cooldown)
-                if ability.uses_voices:
-                    token.update_voices(token.voices - 1)
-                self.tm.record_token_result(token.id, True)
-                self.timing.record_response_time(time.time() - start_time)
-                logging.info(f"✅ [{thread_idx}] {token.name}({token.class_name()}): {ability.text} ({time.time()-start_time:.2f}s)")
-            elif result == "NO_VOICES":
-                token.update_voices(0)
-                self.tm.record_token_result(token.id, False, "no_voices")
-                logging.warning(f"🔇 [{thread_idx}] {token.name}({token.class_name()}): {ability.text} NO_VOICES ({time.time()-start_time:.2f}s)")
+        self._log_success_stats(sender_id, abilities)
+
+    # ===== статистика успешных бафов =====
+    def _log_success_stats(self, sender_id: int, abilities: List[ParsedAbility]) -> None:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        keys = "".join(a.key for a in abilities)
+        success_flags = []
+        success_count = 0
+        fail_count = 0
+        for a in abilities:
+            if a.processed:
+                success_flags.append(f"{a.key}:ok")
+                success_count += 1
             else:
-                self.tm.record_token_result(token.id, False, result)
-                logging.warning(f"⚠️ [{thread_idx}] {token.name}({token.class_name()}): {ability.text} {result} ({time.time()-start_time:.2f}s)")
-                
+                success_flags.append(f"{a.key}:fail")
+                fail_count += 1
+        line = (
+            f"{ts};sender={sender_id};abilities={keys};"
+            f"success={success_count};fail={fail_count};"
+            f"details={','.join(success_flags)}\n"
+        )
+        try:
+            with open("buff_stats.log", "a", encoding="utf-8") as f:
+                f.write(line)
         except Exception as e:
-            logging.error(f"❌ Thread error idx={thread_idx}: {e}")
-            self.tm.record_token_result(token.id, False, "exception")
+            logging.error(f"❌ Failed to write buff_stats.log: {e}")
 
-    def _parse_result(self, history: List[Dict], sent_text: str) -> str:
-        for msg in history:
-            text = msg.get("text", "").lower()
-            if "на вас наложено" in text or "наложено" in text:
-                return "SUCCESS"
-            if "требуется голос" in text or "голоса" in text:
-                return "NO_VOICES"
-        return "UNKNOWN"
-
+# ===== main =====
 if __name__ == "__main__":
     bot = MultiTokenBot("config.json")
     try:
