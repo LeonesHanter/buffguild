@@ -9,9 +9,7 @@ Telegram админ-бот для управления токенами.
 - /enable <id|name> - Включить токен
 - /disable <id|name> - Отключить токен
 - /remove <id|name> - Удалить токен
-- /weights - Статистика весов
-- /timing - Статистика таймингов
-- /reset_weights - Сбросить веса
+- /reload - Перезагрузить конфиг (если bot_instance подключен)
 """
 
 import json
@@ -35,7 +33,6 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-
 # Классы персонажей
 CLASS_CHOICES = {
     "apostle": "Апостол",
@@ -47,7 +44,7 @@ CLASS_CHOICES = {
 
 class TelegramAdmin:
     """Telegram бот для управления токенами"""
-    
+
     WAIT_NAME = 1
     WAIT_CLASS = 2
     WAIT_TOKEN = 3
@@ -75,7 +72,7 @@ class TelegramAdmin:
         """Загрузка config.json"""
         if not os.path.exists(self.config_path):
             return {"tokens": [], "settings": {"delay": 2}}
-        
+
         try:
             with open(self.config_path, "r", encoding="utf-8") as f:
                 return json.load(f)
@@ -89,7 +86,7 @@ class TelegramAdmin:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
 
     # ---- Команды ----
-    
+
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /start"""
         uid = update.effective_user.id
@@ -102,18 +99,15 @@ class TelegramAdmin:
             "📋 *Команды:*\n"
             "/add\\_token — добавить токен\n"
             "/list\\_tokens — список токенов\n"
-            "/weights — статистика весов\n"
-            "/timing — статистика таймингов\n"
             "/enable <id\\|name> — включить токен\n"
             "/disable <id\\|name> — отключить токен\n"
             "/remove <id\\|name> — удалить токен\n"
-            "/reset\\_weights — сбросить веса\n"
             "/reload — перезагрузить конфиг"
         )
         await update.message.reply_text(msg, parse_mode="MarkdownV2")
 
     # ---- Добавление токена (диалог) ----
-    
+
     async def add_token(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Начало добавления токена"""
         uid = update.effective_user.id
@@ -134,18 +128,18 @@ class TelegramAdmin:
         """Получение имени"""
         uid = update.effective_user.id
         name = update.message.text.strip()
-        
+
         if len(name) < 2:
             await update.message.reply_text("Слишком короткое имя. Ещё раз:")
             return self.WAIT_NAME
-        
+
         self.tmp[uid]["name"] = name
 
         classes = "\n".join([
-            f"`{k}` — {v}" 
+            f"`{k}` — {v}"
             for k, v in CLASS_CHOICES.items()
         ])
-        
+
         await update.message.reply_text(
             f"✅ Имя: *{name}*\n\n"
             f"🎭 Шаг 2/5: Выберите класс\n\n"
@@ -159,7 +153,7 @@ class TelegramAdmin:
         """Получение класса"""
         uid = update.effective_user.id
         cls = update.message.text.strip().lower()
-        
+
         if cls not in CLASS_CHOICES:
             await update.message.reply_text(
                 f"❌ Неизвестный класс: `{cls}`\n\n"
@@ -167,10 +161,10 @@ class TelegramAdmin:
                 parse_mode="MarkdownV2"
             )
             return self.WAIT_CLASS
-        
+
         self.tmp[uid]["class"] = cls
         class_name = CLASS_CHOICES[cls]
-        
+
         await update.message.reply_text(
             f"✅ Класс: *{class_name}*\n\n"
             f"🔑 Шаг 3/5: Отправьте VK access token\n"
@@ -183,15 +177,15 @@ class TelegramAdmin:
         """Получение токена"""
         uid = update.effective_user.id
         token = update.message.text.strip()
-        
+
         if not token.startswith("vk1.a."):
             await update.message.reply_text(
                 "❌ Неверный формат токена. Должен начинаться с `vk1.a.`"
             )
             return self.WAIT_TOKEN
-        
+
         self.tmp[uid]["access_token"] = token
-        
+
         await update.message.reply_text(
             "✅ Токен сохранён\n\n"
             "📁 Шаг 4/5: ID чата \\(source\\_chat\\_id\\)\n"
@@ -203,15 +197,15 @@ class TelegramAdmin:
     async def recv_chat(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Получение chat_id"""
         uid = update.effective_user.id
-        
+
         try:
             chat_id = int(update.message.text.strip())
         except ValueError:
             await update.message.reply_text("❌ Нужно число.")
             return self.WAIT_CHAT
-        
+
         self.tmp[uid]["source_chat_id"] = chat_id
-        
+
         await update.message.reply_text(
             f"✅ Chat ID: `{chat_id}`\n\n"
             f"🎯 Шаг 5/5: Target peer\\_id\n"
@@ -223,7 +217,7 @@ class TelegramAdmin:
     async def recv_target(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Получение target_peer_id и завершение"""
         uid = update.effective_user.id
-        
+
         try:
             target_peer = int(update.message.text.strip())
         except ValueError:
@@ -232,7 +226,7 @@ class TelegramAdmin:
 
         data = self.tmp.get(uid, {})
         token_id = f"token_{int(time.time())}"
-        
+
         new_token = {
             "id": token_id,
             "name": data["name"],
@@ -251,14 +245,13 @@ class TelegramAdmin:
         cfg.setdefault("settings", {}).setdefault("delay", 2)
         self._save(cfg)
 
-        # Перезагружаем конфиг в боте (если подключён)
         if self.bot_instance:
             self.bot_instance.tm.reload()
 
         self.tmp.pop(uid, None)
 
         class_name = CLASS_CHOICES[new_token["class"]]
-        
+
         await update.message.reply_text(
             f"✅ *Токен добавлен\\!*\n\n"
             f"📛 Имя: *{new_token['name']}*\n"
@@ -280,7 +273,7 @@ class TelegramAdmin:
         return ConversationHandler.END
 
     # ---- Список токенов ----
-    
+
     async def list_tokens(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Список всех токенов"""
         uid = update.effective_user.id
@@ -290,46 +283,46 @@ class TelegramAdmin:
 
         cfg = self._load()
         tokens = cfg.get("tokens", [])
-        
+
         if not tokens:
             await update.message.reply_text("📭 Нет токенов.")
             return
 
         lines = ["📋 *Список токенов:*\n"]
-        
+
         for i, t in enumerate(tokens, 1):
             cls = t.get("class", "apostle")
             cls_name = CLASS_CHOICES.get(cls, cls)
             status = "✅" if t.get("enabled", True) else "🚫"
             voices = t.get("voices", "?")
-            voices_emoji = "🔊" if voices > 0 else "🔇"
-            
+            voices_emoji = "🔊" if isinstance(voices, int) and voices > 0 else "🔇"
+
             lines.append(
                 f"{i}\\. *{t.get('name', t['id'])}*\n"
                 f"   🎭 {cls_name}\n"
                 f"   {status} {voices_emoji} Голосов: `{voices}`\n"
                 f"   🆔 `{t['id']}`\n"
             )
-        
+
         await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
 
     # ---- Включение/отключение токенов ----
-    
+
     def _toggle(self, ident: str, enabled: bool) -> bool:
         """Включить/отключить токен по ID или имени"""
         cfg = self._load()
         changed = False
-        
+
         for t in cfg.get("tokens", []):
             if t.get("id") == ident or t.get("name") == ident:
                 t["enabled"] = enabled
                 changed = True
-        
+
         if changed:
             self._save(cfg)
             if self.bot_instance:
                 self.bot_instance.tm.reload()
-        
+
         return changed
 
     async def enable(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -338,14 +331,14 @@ class TelegramAdmin:
         if not self.is_admin(uid):
             await update.message.reply_text("❌ Нет прав.")
             return
-        
+
         if not context.args:
             await update.message.reply_text("Использование: `/enable <id|name>`", parse_mode="MarkdownV2")
             return
-        
+
         ident = " ".join(context.args)
         ok = self._toggle(ident, True)
-        
+
         await update.message.reply_text(
             f"✅ Токен `{ident}` включён" if ok else f"❌ Не найдено: `{ident}`",
             parse_mode="MarkdownV2"
@@ -357,32 +350,32 @@ class TelegramAdmin:
         if not self.is_admin(uid):
             await update.message.reply_text("❌ Нет прав.")
             return
-        
+
         if not context.args:
             await update.message.reply_text("Использование: `/disable <id|name>`", parse_mode="MarkdownV2")
             return
-        
+
         ident = " ".join(context.args)
         ok = self._toggle(ident, False)
-        
+
         await update.message.reply_text(
             f"🚫 Токен `{ident}` отключён" if ok else f"❌ Не найдено: `{ident}`",
             parse_mode="MarkdownV2"
         )
 
     # ---- Удаление токена ----
-    
+
     async def remove(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Удалить токен"""
         uid = update.effective_user.id
         if not self.is_admin(uid):
             await update.message.reply_text("❌ Нет прав.")
             return
-        
+
         if not context.args:
             await update.message.reply_text("Использование: `/remove <id|name>`", parse_mode="MarkdownV2")
             return
-        
+
         ident = " ".join(context.args)
 
         cfg = self._load()
@@ -392,7 +385,7 @@ class TelegramAdmin:
             if t.get("id") != ident and t.get("name") != ident
         ]
         after = len(cfg["tokens"])
-        
+
         if after < before:
             self._save(cfg)
             if self.bot_instance:
@@ -400,94 +393,6 @@ class TelegramAdmin:
             await update.message.reply_text(f"🗑️ Токен `{ident}` удалён", parse_mode="MarkdownV2")
         else:
             await update.message.reply_text(f"❌ Не найдено: `{ident}`", parse_mode="MarkdownV2")
-
-    # ---- Статистика ----
-    
-    async def weights(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Статистика весов токенов"""
-        uid = update.effective_user.id
-        if not self.is_admin(uid):
-            await update.message.reply_text("❌ Нет прав.")
-            return
-
-        if not self.bot_instance:
-            await update.message.reply_text("⚠️ Бот не подключён")
-            return
-
-        stats = self.bot_instance.tm.get_weight_stats()
-        
-        if not stats:
-            await update.message.reply_text("📭 Нет данных о весах.")
-            return
-
-        lines = ["⚖️ *Веса токенов:*\n"]
-        
-        for s in stats:
-            token_id = s["token_id"]
-            weight = s["weight"]
-            failures = s["consecutive_failures"]
-            
-            # Находим имя токена
-            token_name = token_id
-            for t in self.bot_instance.tm.get_all_tokens_info():
-                if t["id"] == token_id:
-                    token_name = t["name"]
-                    break
-            
-            # Визуальная шкала веса
-            bar_full = int(weight * 10)
-            bar = "█" * bar_full + "░" * (10 - bar_full)
-            
-            lines.append(
-                f"*{token_name}*\n"
-                f"   {bar} `{weight:.1f}`\n"
-                f"   Провалов подряд: `{failures}`\n"
-            )
-        
-        await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
-
-    async def timing_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Статистика таймингов"""
-        uid = update.effective_user.id
-        if not self.is_admin(uid):
-            await update.message.reply_text("❌ Нет прав.")
-            return
-
-        if not self.bot_instance:
-            await update.message.reply_text("⚠️ Бот не подключён")
-            return
-
-        stats = self.bot_instance.timing.get_stats()
-        
-        if not stats:
-            await update.message.reply_text("📭 Недостаточно данных.")
-            return
-
-        msg = (
-            f"⏱️ *Статистика таймингов*\n\n"
-            f"⏰ Текущее ожидание: `{stats['current_wait']:.2f}` сек\n"
-            f"📊 Среднее: `{stats['avg_response']:.2f}` сек\n"
-            f"⚡ Минимум: `{stats['min_response']:.2f}` сек\n"
-            f"🐌 Максимум: `{stats['max_response']:.2f}` сек\n"
-            f"📈 Образцов: `{int(stats['samples'])}`\n\n"
-            f"💡 Система автоматически подстраивает время ожидания"
-        )
-        
-        await update.message.reply_text(msg, parse_mode="MarkdownV2")
-
-    async def reset_weights(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Сбросить веса всех токенов"""
-        uid = update.effective_user.id
-        if not self.is_admin(uid):
-            await update.message.reply_text("❌ Нет прав.")
-            return
-
-        if not self.bot_instance:
-            await update.message.reply_text("⚠️ Бот не подключён")
-            return
-
-        self.bot_instance.tm.weight.reset_all()
-        await update.message.reply_text("♻️ Все веса сброшены до 1\\.0", parse_mode="MarkdownV2")
 
     async def reload_config(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Перезагрузить конфигурацию"""
@@ -503,7 +408,6 @@ class TelegramAdmin:
             await update.message.reply_text("⚠️ Бот не подключён")
 
     # ---- Запуск ----
-    
     def run(self):
         """Запуск Telegram бота"""
         app = Application.builder().token(self.telegram_token).build()
@@ -521,16 +425,13 @@ class TelegramAdmin:
             fallbacks=[CommandHandler("cancel", self.cancel)],
         )
 
-        # Регистрация команд
+        # Регистрация команд (weights/timing/reset_weights убраны временно)
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(conv)
         app.add_handler(CommandHandler("list_tokens", self.list_tokens))
         app.add_handler(CommandHandler("enable", self.enable))
         app.add_handler(CommandHandler("disable", self.disable))
         app.add_handler(CommandHandler("remove", self.remove))
-        app.add_handler(CommandHandler("weights", self.weights))
-        app.add_handler(CommandHandler("timing", self.timing_stats))
-        app.add_handler(CommandHandler("reset_weights", self.reset_weights))
         app.add_handler(CommandHandler("reload", self.reload_config))
 
         logging.info("🤖 Telegram Admin Bot started")
@@ -541,15 +442,15 @@ def main():
     """Точка входа"""
     tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
     admins = os.getenv("ADMIN_USER_IDS", "")
-    
+
     if not tg_token:
         raise SystemExit("❌ Set TELEGRAM_BOT_TOKEN environment variable")
-    
+
     if not admins:
         raise SystemExit("❌ Set ADMIN_USER_IDS environment variable (comma-separated)")
 
     admin_ids = [int(x.strip()) for x in admins.split(",") if x.strip()]
-    
+
     TelegramAdmin(tg_token, admin_ids, "config.json").run()
 
 
