@@ -4,15 +4,13 @@ import aiohttp
 import json
 import logging
 import random
-import re
 import threading
 import time
-from concurrent.futures import TimeoutError as FuturesTimeoutError
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 
 # === ЛОГИРОВАНИЕ С РОТАЦИЕЙ ===
 logger = logging.getLogger()
@@ -25,7 +23,7 @@ log_formatter = logging.Formatter(
 
 file_handler = RotatingFileHandler(
     "bot.log",
-    maxBytes=5 * 1024 * 1024,  # 5 MB
+    maxBytes=5 * 1024 * 1024,
     backupCount=5,
     encoding="utf-8",
 )
@@ -42,8 +40,9 @@ VK_API_BASE = "https://api.vk.com/method"
 VK_API_VERSION = "5.131"
 
 # ====== КЛАССЫ И СПОСОБНОСТИ ======
-# 1.1 FIX: apostol -> apostle
 CLASS_ORDER = ["apostle", "warlock", "crusader", "light_incarnation"]
+
+RACE_KEYS = {"ч", "г", "н", "э", "м", "д", "о"}
 
 CLASS_ABILITIES: Dict[str, Dict[str, Any]] = {
     "apostle": {
@@ -73,8 +72,7 @@ CLASS_ABILITIES: Dict[str, Dict[str, Any]] = {
             "л": "неудачи",
             "б": "боли",
             "ю": "добычи",
-            "р": "расы",
-            "с": "судьбы",
+            # УБРАНО: "р": "расы", "с": "судьбы"
         },
     },
     "crusader": {
@@ -208,7 +206,7 @@ class SimpleRateLimiter:
     def __init__(self, max_per_minute: int = 60):
         self.max_per_minute = max_per_minute
         self._lock = threading.Lock()
-        self._counters: Dict[str, Tuple[int, float]] = {}  # token_id -> (count, window_start_ts)
+        self._counters: Dict[str, Tuple[int, float]] = {}
 
     def allow(self, token_id: str) -> bool:
         now = time.time()
@@ -248,15 +246,10 @@ class VKAsyncClient:
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
         try:
             return fut.result(timeout=20)
-        except FuturesTimeoutError:  # 1.4 FIX
+        except FuturesTimeoutError:
             fut.cancel()
             raise
         except Exception:
-            # на всякий — чтобы не оставлять dangling future
-            try:
-                fut.cancel()
-            except Exception:
-                pass
             raise
 
     async def post(self, method: str, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -266,16 +259,18 @@ class VKAsyncClient:
         async with self._session.post(url, data=data) as resp:
             return await resp.json()
 
-    # 4.2 FIX: корректное закрытие aiohttp + остановка loop
     def close(self) -> None:
         async def _close():
-            if self._session and not self._session.closed:
-                await self._session.close()
+            try:
+                if self._session and not self._session.closed:
+                    await self._session.close()
+            except Exception:
+                pass
 
         try:
-            asyncio.run_coroutine_threadsafe(_close(), self._loop).result(timeout=10)
-        except Exception as e:
-            logging.warning(f"⚠️ VK client close warning: {e}")
+            self.call(_close())
+        except Exception:
+            pass
 
         try:
             self._loop.call_soon_threadsafe(self._loop.stop)
@@ -290,7 +285,7 @@ class ParsedAbility:
     cooldown: int
     class_type: str
     uses_voices: bool
-    processed: bool = False  # успешно выдан
+    processed: bool = False
 
 # ====== TOKEN HANDLER ======
 class TokenHandler:
@@ -298,7 +293,7 @@ class TokenHandler:
                  manager: "SimpleTokenManager", rate_limiter: SimpleRateLimiter):
         self.id: str = cfg["id"]
         self.name: str = cfg.get("name", self.id)
-        self.class_type: str = cfg.get("class", "apostle")  # 1.1 FIX
+        self.class_type: str = cfg.get("class", "apostle")
         self.access_token: str = cfg["access_token"]
         self.user_id: int = cfg.get("user_id", 0)
         self.source_chat_id: int = int(cfg["source_chat_id"])
@@ -307,14 +302,21 @@ class TokenHandler:
         self.voices: int = int(cfg.get("voices", 5))
         self.enabled: bool = bool(cfg.get("enabled", True))
         self.last_check: int = int(cfg.get("last_check", 0))
+
+        # NEW: расы апостола (минимум 2 задаются через TG)
+        raw_races = cfg.get("races", [])
+        if isinstance(raw_races, list):
+            self.races: List[str] = [str(x).strip().lower() for x in raw_races if str(x).strip()]
+        else:
+            self.races = []
+        self.races = [r for r in self.races if r in RACE_KEYS]
+        self.races = list(dict.fromkeys(self.races))  # unique, keep order
+
         self._ability_cd: Dict[str, float] = {}
         self._vk = vk
         self._cache = msg_cache
         self._manager = manager
         self._rate_limiter = rate_limiter
-
-        # 4.1: лок, чтобы один токен не пытался бафать параллельно две буквы
-        self._use_lock = threading.Lock()
 
     def class_name(self) -> str:
         return CLASS_ABILITIES.get(self.class_type, {}).get("name", "Неизвестный")
@@ -336,46 +338,77 @@ class TokenHandler:
             self._manager.save()
             logging.info(f"🔊 {self.name}: voices {old} → {new_voices}")
 
-    # 2.1: возвращаем id отправленного сообщения, чтобы проверить ответ
-    async def _messages_send(self, text: str, reply_to: int) -> Optional[int]:
+    def get_last_message_id_fresh(self, peer_id: int) -> int:
+        hist = self.get_history_fresh(peer_id, count=1)
+        if hist and isinstance(hist, list):
+            return int(hist[0].get("id", 0) or 0)
+        return 0
+
+    async def _messages_send_with_forward(
+        self,
+        text: str,
+        forward_from_peer_id: Optional[int] = None,
+        forward_conversation_message_id: Optional[int] = None,
+    ) -> Tuple[bool, Optional[int]]:
         if not self._rate_limiter.allow(self.id):
             logging.warning(f"🚦 Rate limit for token {self.id}, skipping send")
-            return None
+            return False, None
 
-        data = {
+        data: Dict[str, Any] = {
             "access_token": self.access_token,
             "v": VK_API_VERSION,
             "peer_id": self.target_peer_id,
             "message": text,
             "random_id": random.randrange(1, 2_000_000_000),
             "disable_mentions": 1,
-            "reply_to": int(reply_to),
         }
+
+        if forward_from_peer_id and forward_conversation_message_id:
+            data["forward"] = json.dumps(
+                {
+                    "peer_id": int(forward_from_peer_id),
+                    "conversation_message_ids": [int(forward_conversation_message_id)],
+                    "is_reply": 0,
+                },
+                ensure_ascii=False,
+            )
+
         ret = await self._vk.post("messages.send", data)
         if "error" in ret:
             err = ret["error"]
             code = err.get("error_code")
             msg = err.get("error_msg")
             logging.error(f"❌ {self.name}: send error {code} {msg}")
-            return None
+            return False, None
 
-        # VK обычно возвращает int в "response"
-        sent_id = ret.get("response")
-        if isinstance(sent_id, int):
-            return sent_id
-        return None
+        msg_id = None
+        if "response" in ret:
+            try:
+                msg_id = int(ret["response"])
+            except Exception:
+                msg_id = None
 
-    def send_command_reply(self, text: str, reply_to_message_id: int) -> Optional[int]:
+        return True, msg_id
+
+    def send_command_with_forward(
+        self,
+        text: str,
+        forward_from_peer_id: Optional[int] = None,
+        forward_conversation_message_id: Optional[int] = None,
+    ) -> Tuple[bool, Optional[int]]:
         try:
-            return self._vk.call(self._messages_send(text, reply_to_message_id))
+            return self._vk.call(
+                self._messages_send_with_forward(text, forward_from_peer_id, forward_conversation_message_id)
+            )
         except Exception as e:
-            logging.error(f"❌ {self.name}: send_command_reply exception {e}")
-            return None
+            logging.error(f"❌ {self.name}: send_command_with_forward exception {e}")
+            return False, None
 
     def get_history(self, peer_id: int, count: int = 20) -> List[Dict[str, Any]]:
         cached = self._cache.get(peer_id)
         if cached is not None:
             return cached[:count]
+
         data = {
             "access_token": self.access_token,
             "v": VK_API_VERSION,
@@ -407,7 +440,6 @@ class TokenHandler:
             return []
 
     def get_history_fresh(self, peer_id: int, count: int = 20) -> List[Dict[str, Any]]:
-        """История без кэша — для проверки результата бафа."""
         data = {
             "access_token": self.access_token,
             "v": VK_API_VERSION,
@@ -455,7 +487,7 @@ class SimpleTokenManager:
                 self.config = json.load(f)
         except FileNotFoundError:
             logging.warning(f"⚠️ {self.config_path} not found, creating empty")
-            self.config = {"tokens": [], "settings": {"delay": 2}, "race_pools": {}}
+            self.config = {"tokens": [], "settings": {"delay": 2}}
             self.save()
         except json.JSONDecodeError as e:
             logging.error(f"❌ Invalid JSON in {self.config_path}: {e}")
@@ -464,15 +496,8 @@ class SimpleTokenManager:
         with self._lock:
             self.tokens = []
             for t_cfg in self.config.get("tokens", []):
-                target = int(t_cfg.get("target_peer_id", 0))
-                if 0 < target < 2000000000:
-                    logging.warning(f"⚠️ Suspicious target_peer_id={target} for {t_cfg.get('id')}")
-                sc = int(t_cfg.get("source_chat_id", 0))
-                if sc > 2000000000:
-                    logging.warning(f"⚠️ source_chat_id looks like peer_id={sc} for {t_cfg.get('id')}")
-                self.tokens.append(
-                    TokenHandler(t_cfg, self._vk, self.msg_cache, self, self.rate_limiter)
-                )
+                self.tokens.append(TokenHandler(t_cfg, self._vk, self.msg_cache, self, self.rate_limiter))
+
         logging.info(f"📋 Loaded {len(self.tokens)} tokens")
 
     def reload(self) -> None:
@@ -494,8 +519,10 @@ class SimpleTokenManager:
                     "voices": t.voices,
                     "enabled": t.enabled,
                     "last_check": t.last_check,
+                    "races": t.races,  # NEW
                 })
             self.config["tokens"] = tokens_payload
+
         try:
             with open(self.config_path, "w", encoding="utf-8") as f:
                 json.dump(self.config, f, ensure_ascii=False, indent=2)
@@ -503,16 +530,24 @@ class SimpleTokenManager:
             logging.error(f"❌ Failed to save config: {e}")
 
     def tokens_for_ability(self, ability_key: str) -> List[TokenHandler]:
-        tokens = []
+        tokens: List[TokenHandler] = []
         for token in self.tokens:
             if not token.enabled:
                 continue
+
             class_data = CLASS_ABILITIES.get(token.class_type)
             if not class_data or ability_key not in class_data["abilities"]:
                 continue
+
+            # NEW: фильтр по расе для апостола
+            if token.class_type == "apostle" and ability_key in RACE_KEYS:
+                if ability_key not in token.races:
+                    continue
+
             ok, _ = token.can_use_ability(ability_key)
             if ok:
                 tokens.append(token)
+
         return tokens
 
 # ====== EXECUTOR ======
@@ -521,104 +556,101 @@ class AbilityExecutor:
         self.timing = timing
         self.tm = tm
 
-    def execute(self, token: TokenHandler, ability: ParsedAbility,
-                trigger_msg_id: int, sender_id: int, attempt_idx: int) -> None:
+    def execute(
+        self,
+        token: TokenHandler,
+        ability: ParsedAbility,
+        trigger_source_peer_id: int,
+        trigger_conversation_message_id: int,
+        attempt_idx: int,
+    ) -> None:
         start_time = time.time()
+        try:
+            baseline_id = token.get_last_message_id_fresh(token.target_peer_id)
 
-        # 4.1: один токен — одна активная попытка за раз
-        with token._use_lock:
-            try:
-                sent_msg_id = token.send_command_reply(ability.text, trigger_msg_id)
-                if not sent_msg_id:
-                    self.tm.weight.record_failure(token.id, "send_error_or_rate_limit")
-                    logging.warning(
-                        f"❌ [{attempt_idx}] {token.name}({token.class_name()}): "
-                        f"{ability.text} SEND_ERROR_OR_RATE_LIMIT ({time.time()-start_time:.2f}s)"
-                    )
-                    return
+            ok, _sent_id = token.send_command_with_forward(
+                ability.text,
+                forward_from_peer_id=trigger_source_peer_id,
+                forward_conversation_message_id=trigger_conversation_message_id,
+            )
+            if not ok:
+                self.tm.weight.record_failure(token.id, "send_error_or_rate_limit")
+                logging.warning(
+                    f"❌ [{attempt_idx}] {token.name}({token.class_name()}): "
+                    f"{ability.text} SEND_ERROR_OR_RATE_LIMIT ({time.time()-start_time:.2f}s)"
+                )
+                return
 
-                # ждём ответ + несколько коротких попыток прочитать свежую историю
-                time.sleep(self.timing.get_wait_time())
+            time.sleep(self.timing.get_wait_time())
+            history = token.get_history_fresh(token.target_peer_id, count=20)
+            new_msgs = [m for m in history if int(m.get("id", 0) or 0) > int(baseline_id)]
+            result = self._parse_result(new_msgs)
 
-                result = "UNKNOWN"
-                for _ in range(3):
-                    history = token.get_history_fresh(token.target_peer_id, count=20)
-                    result = self._parse_result(history, sent_msg_id, trigger_msg_id)
-                    if result != "UNKNOWN":
-                        break
-                    time.sleep(0.6)
+            if result == "SUCCESS":
+                ability.processed = True
+                token.set_ability_cooldown(ability.key, ability.cooldown)
+                if ability.uses_voices:
+                    token.update_voices(max(0, token.voices - 1))
+                self.tm.weight.record_success(token.id)
+                self.timing.record_response_time(time.time() - start_time)
+                logging.info(
+                    f"✅ [{attempt_idx}] {token.name}({token.class_name()}): "
+                    f"{ability.text} ({time.time()-start_time:.2f}s)"
+                )
+            elif result == "NO_VOICES":
+                token.update_voices(0)
+                self.tm.weight.record_failure(token.id, "no_voices")
+                logging.warning(
+                    f"🔇 [{attempt_idx}] {token.name}({token.class_name()}): "
+                    f"{ability.text} NO_VOICES ({time.time()-start_time:.2f}s)"
+                )
+            else:
+                self.tm.weight.record_failure(token.id, result)
+                logging.warning(
+                    f"⚠️ [{attempt_idx}] {token.name}({token.class_name()}): "
+                    f"{ability.text} {result} ({time.time()-start_time:.2f}s)"
+                )
+        except Exception as e:
+            logging.error(f"❌ Attempt error idx={attempt_idx}: {e}")
+            self.tm.weight.record_failure(token.id, "exception")
 
-                if result == "SUCCESS":
-                    ability.processed = True
-                    token.set_ability_cooldown(ability.key, ability.cooldown)
-                    if ability.uses_voices:
-                        token.update_voices(max(0, token.voices - 1))
-                    self.tm.weight.record_success(token.id)
-                    self.timing.record_response_time(time.time() - start_time)
-                    logging.info(
-                        f"✅ [{attempt_idx}] {token.name}({token.class_name()}): "
-                        f"{ability.text} ({time.time()-start_time:.2f}s)"
-                    )
-                elif result == "NO_VOICES":
-                    token.update_voices(0)
-                    self.tm.weight.record_failure(token.id, "no_voices")
-                    logging.warning(
-                        f"🔇 [{attempt_idx}] {token.name}({token.class_name()}): "
-                        f"{ability.text} NO_VOICES ({time.time()-start_time:.2f}s)"
-                    )
-                else:
-                    self.tm.weight.record_failure(token.id, result)
-                    logging.warning(
-                        f"⚠️ [{attempt_idx}] {token.name}({token.class_name()}): "
-                        f"{ability.text} {result} ({time.time()-start_time:.2f}s)"
-                    )
-            except Exception as e:
-                logging.error(f"❌ Attempt error idx={attempt_idx}: {e}")
-                self.tm.weight.record_failure(token.id, "exception")
-
-    # 2.1 FIX: привязка ответа к конкретной отправке (reply на sent_msg_id / trigger_msg_id)
-    def _parse_result(self, history: List[Dict], sent_msg_id: int, trigger_msg_id: int) -> str:
-        for msg in history:
-            # VK может класть объект reply_message
-            reply = msg.get("reply_message") or {}
-            reply_id = reply.get("id")
-
-            # интересуют только сообщения-ответы на нашу отправку (или как fallback на триггер)
-            if reply_id not in (sent_msg_id, trigger_msg_id):
-                continue
-
+    def _parse_result(self, new_history: List[Dict[str, Any]]) -> str:
+        for msg in new_history:
             text = (msg.get("text", "") or "").lower()
-
             if "на вас наложено" in text or "наложено" in text:
                 return "SUCCESS"
-            if "требуется голос" in text or "требуются голоса" in text or "недостаточно голос" in text:
+            if "требуется голос" in text or "голоса" in text:
                 return "NO_VOICES"
-
         return "UNKNOWN"
 
 # ====== БОТ ======
 class MultiTokenBot:
     def __init__(self, config_path: str):
-        self._vk_client = VKAsyncClient()
-        self.tm = SimpleTokenManager(config_path, self._vk_client)
+        self.vk = VKAsyncClient()
+        self.tm = SimpleTokenManager(config_path, self.vk)
         self.timing = AdaptiveTiming()
         self.executor = AbilityExecutor(self.timing, self.tm)
+
         self.main_token = self.tm.tokens[0] if self.tm.tokens else None
         if not self.main_token:
             raise RuntimeError("No tokens in config.json")
+
         self.source_peer_id = self.main_token.source_peer_id
         self._running = False
         self.last_msg_id = self._load_last_msg_id()
-
-        # 4.1: пул потоков для параллельной обработки букв (макс 4)
-        self._pool = ThreadPoolExecutor(max_workers=4)
 
         logging.info("🤖 MultiTokenBot STARTED")
         logging.info(f"📋 Tokens: {len(self.tm.tokens)}")
         logging.info(f"📁 Source chat: {self.source_peer_id}")
         logging.info(f"⏱️ Initial wait time: {self.timing.get_wait_time():.2f}s")
 
-    # ===== вспомогательные =====
+    def stop(self) -> None:
+        self._running = False
+        try:
+            self.vk.close()
+        except Exception:
+            pass
+
     def _load_last_msg_id(self) -> int:
         try:
             with open("last_msg_id.json", "r", encoding="utf-8") as f:
@@ -635,22 +667,16 @@ class MultiTokenBot:
             logging.error(f"❌ Failed to save last_msg_id: {e}")
 
     # ===== командный парсер (!баф, максимум 4 буквы) =====
-    # 1.2 FIX: после !баф берём только 4 буквы, пробелы игнорируем: "!баф зуча" => "зуча"
-    def parse_command_text(self, text: str, sender_id: int, trigger_msg_id: int) -> List[ParsedAbility]:
+    def parse_command_text(self, text: str) -> List[ParsedAbility]:
         text = (text or "").strip().lower()
         if not text.startswith("!баф"):
             return []
 
-        rest = text[4:]  # 1.2 FIX: правильно отрезаем "!баф"
-        rest = rest.strip()
-        if not rest:
+        cmd_text = text[4:].strip()
+        if not cmd_text:
             return []
 
-        # игнорируем пробелы/табуляции между буквами
-        rest = re.sub(r"\s+", "", rest)
-
-        # строго максимум 4 буквы
-        cmd_text = rest[:4]
+        cmd_text = "".join(ch for ch in cmd_text if ch.isalpha())[:4]
         if not cmd_text:
             return []
 
@@ -677,11 +703,6 @@ class MultiTokenBot:
         text = f"{prefix} {v}".strip() if prefix else str(v)
         return text, default_cd, uses_voices
 
-    def _send_reaction(self, trigger_msg_id: int, text: str, sender_id: int) -> None:
-        if self.main_token:
-            self.main_token.send_command_reply(text, trigger_msg_id)
-
-    # ===== основной цикл =====
     def run(self):
         self._running = True
         try:
@@ -690,24 +711,32 @@ class MultiTokenBot:
                 updated = False
 
                 for msg in reversed(msgs):
-                    msg_id = msg.get("id", 0)
+                    msg_id = int(msg.get("id", 0) or 0)
                     if msg_id <= self.last_msg_id:
                         continue
+
                     self.last_msg_id = msg_id
                     updated = True
 
                     text = (msg.get("text", "") or "").strip()
-                    sender_id = msg.get("from_id", 0)
+                    sender_id = int(msg.get("from_id", 0) or 0)
                     if sender_id <= 0:
                         continue
 
-                    abilities = self.parse_command_text(text, sender_id, msg_id)
+                    conversation_message_id = int(msg.get("conversation_message_id", 0) or 0)
+
+                    abilities = self.parse_command_text(text)
                     if abilities:
                         logging.info(
                             f"🎯 !баф from {sender_id}: "
                             f"{''.join(a.key for a in abilities)} ({len(abilities)} abilities)"
                         )
-                        self._process_abilities(abilities, sender_id, msg_id)
+
+                        threading.Thread(
+                            target=self._process_abilities,
+                            args=(abilities, sender_id, conversation_message_id),
+                            daemon=True,
+                        ).start()
 
                 if updated:
                     self._save_last_msg_id(self.last_msg_id)
@@ -718,37 +747,39 @@ class MultiTokenBot:
         finally:
             self.stop()
 
-    # 4.2 FIX: корректная остановка
-    def stop(self) -> None:
-        if not self._running:
-            return
-        self._running = False
+    def _process_abilities(
+        self,
+        abilities: List[ParsedAbility],
+        sender_id: int,
+        trigger_conversation_message_id: int,
+    ) -> None:
+        trigger_source_peer_id = self.source_peer_id
 
-        try:
-            self._pool.shutdown(wait=False, cancel_futures=True)
-        except Exception:
-            pass
-
-        try:
-            self._vk_client.close()
-        except Exception as e:
-            logging.warning(f"⚠️ stop() warning: {e}")
-
-        logging.info("🧹 Bot stopped cleanly")
-
-    # ===== обработка способностей =====
-    # 4.1: параллельная обработка букв (до 4)
-    def _process_abilities(self, abilities: List[ParsedAbility], sender_id: int, trigger_msg_id: int) -> None:
-        futures = []
         for ability in abilities:
-            futures.append(self._pool.submit(self._process_single_ability, ability, sender_id, trigger_msg_id))
+            candidates = self.tm.tokens_for_ability(ability.key)
+            if not candidates:
+                logging.warning(f"⚠️ No tokens for ability '{ability.key}'")
+                continue
 
-        for _ in as_completed(futures):
-            pass
+            candidates.sort(key=lambda t: self.tm.weight.get_weight(t.id), reverse=True)
+
+            for idx, token in enumerate(candidates, start=1):
+                can, _ = token.can_use_ability(ability.key)
+                if not can:
+                    continue
+
+                self.executor.execute(
+                    token=token,
+                    ability=ability,
+                    trigger_source_peer_id=trigger_source_peer_id,
+                    trigger_conversation_message_id=trigger_conversation_message_id,
+                    attempt_idx=idx,
+                )
+
+                if ability.processed:
+                    break
 
         success_count = len([a for a in abilities if a.processed])
-        fail_count = len(abilities) - success_count
-
         if success_count == len(abilities):
             logging.info(f"🎉 All {len(abilities)} abilities used for {sender_id}")
         elif success_count > 0:
@@ -758,29 +789,6 @@ class MultiTokenBot:
 
         self._log_success_stats(sender_id, abilities)
 
-    def _process_single_ability(self, ability: ParsedAbility, sender_id: int, trigger_msg_id: int) -> None:
-        candidates = self.tm.tokens_for_ability(ability.key)
-        if not candidates:
-            logging.warning(f"⚠️ No tokens for ability '{ability.key}' (class {ability.class_type})")
-            return
-
-        candidates.sort(key=lambda t: self.tm.weight.get_weight(t.id), reverse=True)
-
-        for idx, token in enumerate(candidates, start=1):
-            try:
-                can, _ = token.can_use_ability(ability.key)
-                if not can:
-                    continue
-                self.executor.execute(token, ability, trigger_msg_id, sender_id, idx)
-                if ability.processed:
-                    break  # строго 1 баф на букву
-            except Exception as e:
-                logging.error(
-                    f"❌ Error while processing ability '{ability.key}' "
-                    f"with token {token.id}: {e}"
-                )
-
-    # ===== статистика успешных бафов =====
     def _log_success_stats(self, sender_id: int, abilities: List[ParsedAbility]) -> None:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         keys = "".join(a.key for a in abilities)
@@ -811,4 +819,4 @@ if __name__ == "__main__":
     try:
         bot.run()
     except KeyboardInterrupt:
-        bot.stop()
+        pass
