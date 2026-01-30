@@ -6,13 +6,16 @@ import logging
 import random
 import threading
 import time
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 
-# === ЛОГИРОВАНИЕ С РОТАЦИЕЙ ===
+# =========================
+# LOGGING
+# =========================
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
@@ -39,10 +42,17 @@ logger.addHandler(console_handler)
 VK_API_BASE = "https://api.vk.com/method"
 VK_API_VERSION = "5.131"
 
-# ====== КЛАССЫ И СПОСОБНОСТИ ======
-CLASS_ORDER = ["apostle", "warlock", "crusader", "light_incarnation"]
+# =========================
+# CONFIG / CONSTANTS
+# =========================
+MAX_BUFF_LETTERS = 4
+COLLECT_WINDOW = 1.2  # seconds: waiting to collect same trigger from all tokens
+REQUEST_TTL = 12.0    # seconds: session storage TTL
+POLL_TRIES = 4
 
 RACE_KEYS = {"ч", "г", "н", "э", "м", "д", "о"}
+
+CLASS_ORDER = ["apostle", "warlock", "crusader", "light_incarnation"]
 
 CLASS_ABILITIES: Dict[str, Dict[str, Any]] = {
     "apostle": {
@@ -72,7 +82,6 @@ CLASS_ABILITIES: Dict[str, Dict[str, Any]] = {
             "л": "неудачи",
             "б": "боли",
             "ю": "добычи",
-            # УБРАНО: "р": "расы", "с": "судьбы"
         },
     },
     "crusader": {
@@ -97,19 +106,26 @@ CLASS_ABILITIES: Dict[str, Dict[str, Any]] = {
     },
 }
 
-RACE_NAMES = {
-    "ч": "человек",
-    "г": "гоблин",
-    "н": "нежить",
-    "э": "эльф",
-    "м": "гном",
-    "д": "демон",
-    "о": "орк",
-}
+# =========================
+# HELPERS
+# =========================
+def now_ts() -> float:
+    return time.time()
 
-# ====== АДАПТИВНЫЙ ТАЙМИНГ ======
+def clamp(x: float, a: float, b: float) -> float:
+    return max(a, min(b, x))
+
+def safe_int(x: Any, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+# =========================
+# Adaptive wait (target response)
+# =========================
 class AdaptiveTiming:
-    def __init__(self, initial_wait: float = 3.0, min_wait: float = 1.0, max_wait: float = 5.0):
+    def __init__(self, initial_wait: float = 3.0, min_wait: float = 1.0, max_wait: float = 6.0):
         self._lock = threading.Lock()
         self._samples: List[float] = []
         self._wait = initial_wait
@@ -131,96 +147,15 @@ class AdaptiveTiming:
             idx = int(len(s) * 0.95)
             idx = min(max(idx, 0), len(s) - 1)
             p95 = s[idx]
-            new_wait = p95 * 1.1
-            old_wait = self._wait
-            self._wait = max(self._min, min(self._max, new_wait))
-            if abs(old_wait - self._wait) > 0.1:
-                logging.info(f"⏱️ Timing updated: {old_wait:.2f}s → {self._wait:.2f}s")
+            new_wait = clamp(p95 * 1.1, self._min, self._max)
+            old = self._wait
+            self._wait = new_wait
+            if abs(old - new_wait) > 0.1:
+                logging.info(f"⏱️ Timing updated: {old:.2f}s → {new_wait:.2f}s")
 
-# ====== КЭШ СООБЩЕНИЙ ======
-class MessageCache:
-    def __init__(self, ttl: int = 8):
-        self.ttl = ttl
-        self._lock = threading.Lock()
-        self._cache: Dict[int, Tuple[float, List[Dict[str, Any]]]] = {}
-
-    def get(self, peer_id: int) -> Optional[List[Dict[str, Any]]]:
-        now = time.time()
-        with self._lock:
-            item = self._cache.get(peer_id)
-            if not item:
-                return None
-            ts, messages = item
-            if now - ts > self.ttl:
-                return None
-            return messages[:]
-
-    def set(self, peer_id: int, messages: List[Dict[str, Any]]) -> None:
-        with self._lock:
-            self._cache[peer_id] = (time.time(), messages)
-
-    def clear(self) -> None:
-        with self._lock:
-            self._cache.clear()
-
-# ====== СИСТЕМА ВЕСОВ ======
-class TokenWeightManager:
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._fails: Dict[str, int] = {}
-        self._weights: Dict[str, float] = {}
-
-    def _calc_weight(self, fails: int) -> float:
-        return max(0.1, 1.0 - 0.1 * fails)
-
-    def get_weight(self, token_id: str) -> float:
-        with self._lock:
-            f = self._fails.get(token_id, 0)
-            w = self._weights.get(token_id)
-            if w is None:
-                w = self._calc_weight(f)
-                self._weights[token_id] = w
-            return w
-
-    def record_failure(self, token_id: str, failure_type: str = "no_voices") -> None:
-        with self._lock:
-            self._fails[token_id] = self._fails.get(token_id, 0) + 1
-            f = self._fails[token_id]
-            old = self._weights.get(token_id, 1.0)
-            new = self._calc_weight(f)
-            self._weights[token_id] = new
-        logging.info(f"📉 {token_id}: fail#{f} ({failure_type}) weight {old:.1f}→{new:.1f}")
-
-    def record_success(self, token_id: str) -> None:
-        with self._lock:
-            old_f = self._fails.get(token_id, 0)
-            old_w = self._weights.get(token_id, 1.0)
-            self._fails[token_id] = 0
-            self._weights[token_id] = min(1.0, old_w + 0.2)
-            new_w = self._weights[token_id]
-        if old_f > 0 or old_w < 1.0:
-            logging.info(f"📈 {token_id}: success weight {old_w:.1f}→{new_w:.1f}, fails reset {old_f}")
-
-# ====== ПРОСТОЙ RATE LIMITER ДЛЯ TOKENS ======
-class SimpleRateLimiter:
-    def __init__(self, max_per_minute: int = 60):
-        self.max_per_minute = max_per_minute
-        self._lock = threading.Lock()
-        self._counters: Dict[str, Tuple[int, float]] = {}
-
-    def allow(self, token_id: str) -> bool:
-        now = time.time()
-        with self._lock:
-            count, start = self._counters.get(token_id, (0, now))
-            if now - start >= 60:
-                self._counters[token_id] = (1, now)
-                return True
-            if count < self.max_per_minute:
-                self._counters[token_id] = (count + 1, start)
-                return True
-            return False
-
-# ====== VK ASYNC CLIENT ======
+# =========================
+# VK Async Client
+# =========================
 class VKAsyncClient:
     def __init__(self):
         self._loop = asyncio.new_event_loop()
@@ -245,11 +180,9 @@ class VKAsyncClient:
     def call(self, coro):
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
         try:
-            return fut.result(timeout=20)
+            return fut.result(timeout=25)
         except FuturesTimeoutError:
             fut.cancel()
-            raise
-        except Exception:
             raise
 
     async def post(self, method: str, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -271,13 +204,35 @@ class VKAsyncClient:
             self.call(_close())
         except Exception:
             pass
-
         try:
             self._loop.call_soon_threadsafe(self._loop.stop)
         except Exception:
             pass
 
-# ====== DATA ======
+# =========================
+# Rate limiter (send)
+# =========================
+class SimpleRateLimiter:
+    def __init__(self, max_per_minute: int = 40):
+        self.max_per_minute = max_per_minute
+        self._lock = threading.Lock()
+        self._counters: Dict[str, Tuple[int, float]] = {}  # token_id -> (count, window_start)
+
+    def allow(self, token_id: str) -> bool:
+        now = now_ts()
+        with self._lock:
+            count, start = self._counters.get(token_id, (0, now))
+            if now - start >= 60:
+                self._counters[token_id] = (1, now)
+                return True
+            if count < self.max_per_minute:
+                self._counters[token_id] = (count + 1, start)
+                return True
+            return False
+
+# =========================
+# Parsed Ability
+# =========================
 @dataclass
 class ParsedAbility:
     key: str
@@ -287,401 +242,459 @@ class ParsedAbility:
     uses_voices: bool
     processed: bool = False
 
-# ====== TOKEN HANDLER ======
+# =========================
+# Token Handler
+# =========================
 class TokenHandler:
-    def __init__(self, cfg: Dict[str, Any], vk: VKAsyncClient, msg_cache: MessageCache,
-                 manager: "SimpleTokenManager", rate_limiter: SimpleRateLimiter):
+    def __init__(self, cfg: Dict[str, Any], vk: VKAsyncClient, rate_limiter: SimpleRateLimiter):
         self.id: str = cfg["id"]
         self.name: str = cfg.get("name", self.id)
         self.class_type: str = cfg.get("class", "apostle")
         self.access_token: str = cfg["access_token"]
-        self.user_id: int = cfg.get("user_id", 0)
+
         self.source_chat_id: int = int(cfg["source_chat_id"])
-        self.target_peer_id: int = int(cfg["target_peer_id"])
         self.source_peer_id: int = 2000000000 + self.source_chat_id
+        self.target_peer_id: int = int(cfg["target_peer_id"])
+
         self.voices: int = int(cfg.get("voices", 5))
         self.enabled: bool = bool(cfg.get("enabled", True))
-        self.last_check: int = int(cfg.get("last_check", 0))
 
-        # NEW: расы апостола (минимум 2 задаются через TG)
         raw_races = cfg.get("races", [])
         if isinstance(raw_races, list):
             self.races: List[str] = [str(x).strip().lower() for x in raw_races if str(x).strip()]
         else:
             self.races = []
         self.races = [r for r in self.races if r in RACE_KEYS]
-        self.races = list(dict.fromkeys(self.races))  # unique, keep order
+        self.races = list(dict.fromkeys(self.races))
 
-        self._ability_cd: Dict[str, float] = {}
         self._vk = vk
-        self._cache = msg_cache
-        self._manager = manager
         self._rate_limiter = rate_limiter
 
+        # per-token cooldown map: ability_key -> unix_ts
+        self._ability_cd: Dict[str, float] = {}
+        # backoff for getHistory flood
+        self.next_history_ts: float = 0.0
+
+        # lock around send/getHistory to reduce bursts per token
+        self._io_lock = threading.Lock()
+
     def class_name(self) -> str:
-        return CLASS_ABILITIES.get(self.class_type, {}).get("name", "Неизвестный")
+        return CLASS_ABILITIES.get(self.class_type, {}).get("name", self.class_type)
 
     def can_use_ability(self, ability_key: str) -> Tuple[bool, float]:
         ts = self._ability_cd.get(ability_key, 0.0)
-        rem = ts - time.time()
+        rem = ts - now_ts()
         if rem > 0:
             return False, rem
         return True, 0.0
 
-    def set_ability_cooldown(self, ability_key: str, cooldown_seconds: int) -> None:
-        self._ability_cd[ability_key] = time.time() + int(cooldown_seconds)
+    def set_ability_cooldown(self, ability_key: str, seconds: int) -> None:
+        self._ability_cd[ability_key] = now_ts() + int(max(1, seconds))
 
-    def update_voices(self, new_voices: int) -> None:
-        if self.voices != new_voices:
-            old = self.voices
-            self.voices = new_voices
-            self._manager.save()
-            logging.info(f"🔊 {self.name}: voices {old} → {new_voices}")
+    def disable(self, reason: str) -> None:
+        if self.enabled:
+            self.enabled = False
+        logging.error(f"⛔ {self.name}: disabled ({reason})")
 
-    def get_last_message_id_fresh(self, peer_id: int) -> int:
-        hist = self.get_history_fresh(peer_id, count=1)
-        if hist and isinstance(hist, list):
-            return int(hist[0].get("id", 0) or 0)
-        return 0
+    async def _messages_send(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        return await self._vk.post("messages.send", data)
 
-    async def _messages_send_with_forward(
+    def send_text(
         self,
+        peer_id: int,
         text: str,
-        forward_from_peer_id: Optional[int] = None,
+        reply_to: Optional[int] = None,
+        forward_peer_id: Optional[int] = None,
         forward_conversation_message_id: Optional[int] = None,
-    ) -> Tuple[bool, Optional[int]]:
+    ) -> Tuple[bool, Optional[int], Optional[int], Optional[str]]:
+        """
+        Returns: (ok, message_id, error_code, error_msg)
+        """
         if not self._rate_limiter.allow(self.id):
-            logging.warning(f"🚦 Rate limit for token {self.id}, skipping send")
-            return False, None
+            return False, None, -1, "rate_limited"
 
-        data: Dict[str, Any] = {
-            "access_token": self.access_token,
-            "v": VK_API_VERSION,
-            "peer_id": self.target_peer_id,
-            "message": text,
-            "random_id": random.randrange(1, 2_000_000_000),
-            "disable_mentions": 1,
-        }
+        async def _send():
+            data: Dict[str, Any] = {
+                "access_token": self.access_token,
+                "v": VK_API_VERSION,
+                "peer_id": int(peer_id),
+                "message": text,
+                "random_id": random.randrange(1, 2_000_000_000),
+                "disable_mentions": 1,
+            }
+            if reply_to is not None:
+                data["reply_to"] = int(reply_to)
 
-        if forward_from_peer_id and forward_conversation_message_id:
-            data["forward"] = json.dumps(
-                {
-                    "peer_id": int(forward_from_peer_id),
-                    "conversation_message_ids": [int(forward_conversation_message_id)],
-                    "is_reply": 0,
-                },
-                ensure_ascii=False,
-            )
+            if forward_peer_id is not None and forward_conversation_message_id is not None:
+                data["forward"] = json.dumps(
+                    {
+                        "peer_id": int(forward_peer_id),
+                        "conversation_message_ids": [int(forward_conversation_message_id)],
+                        "is_reply": 0,
+                    },
+                    ensure_ascii=False,
+                )
 
-        ret = await self._vk.post("messages.send", data)
+            ret = await self._messages_send(data)
+            return ret
+
+        with self._io_lock:
+            try:
+                ret = self._vk.call(_send())
+            except Exception as e:
+                return False, None, -2, f"exception: {e}"
+
         if "error" in ret:
             err = ret["error"]
             code = err.get("error_code")
             msg = err.get("error_msg")
-            logging.error(f"❌ {self.name}: send error {code} {msg}")
-            return False, None
+            return False, None, safe_int(code, -3), str(msg)
 
         msg_id = None
-        if "response" in ret:
-            try:
-                msg_id = int(ret["response"])
-            except Exception:
-                msg_id = None
-
-        return True, msg_id
-
-    def send_command_with_forward(
-        self,
-        text: str,
-        forward_from_peer_id: Optional[int] = None,
-        forward_conversation_message_id: Optional[int] = None,
-    ) -> Tuple[bool, Optional[int]]:
         try:
-            return self._vk.call(
-                self._messages_send_with_forward(text, forward_from_peer_id, forward_conversation_message_id)
-            )
-        except Exception as e:
-            logging.error(f"❌ {self.name}: send_command_with_forward exception {e}")
-            return False, None
+            msg_id = int(ret.get("response"))
+        except Exception:
+            msg_id = None
 
-    def get_history(self, peer_id: int, count: int = 20) -> List[Dict[str, Any]]:
-        cached = self._cache.get(peer_id)
-        if cached is not None:
-            return cached[:count]
+        return True, msg_id, None, None
 
-        data = {
-            "access_token": self.access_token,
-            "v": VK_API_VERSION,
-            "peer_id": int(peer_id),
-            "count": int(count),
-        }
+    def get_history(self, peer_id: int, count: int = 30) -> Tuple[List[Dict[str, Any]], Optional[int], Optional[str]]:
+        """
+        Returns: (items, error_code, error_msg)
+        """
+        now = now_ts()
+        if now < self.next_history_ts:
+            return [], 9, "backoff"
 
         async def _get():
+            data = {
+                "access_token": self.access_token,
+                "v": VK_API_VERSION,
+                "peer_id": int(peer_id),
+                "count": int(count),
+            }
+            return await self._vk.post("messages.getHistory", data)
+
+        with self._io_lock:
             try:
-                ret = await self._vk.post("messages.getHistory", data)
-                if "error" in ret:
-                    err = ret["error"]
-                    code = err.get("error_code")
-                    msg = err.get("error_msg")
-                    logging.error(f"❌ {self.name}: getHistory error {code} {msg}")
-                    return []
-                if "response" in ret and "items" in ret["response"]:
-                    items = ret["response"]["items"]
-                    self._cache.set(peer_id, items)
-                    return items
+                ret = self._vk.call(_get())
             except Exception as e:
-                logging.error(f"getHistory error: {e}")
-            return []
+                return [], -2, f"exception: {e}"
 
-        try:
-            return self._vk.call(_get())
-        except Exception as e:
-            logging.error(f"❌ {self.name}: getHistory exception {e}")
-            return []
+        if "error" in ret:
+            err = ret["error"]
+            code = safe_int(err.get("error_code"), -3)
+            msg = str(err.get("error_msg"))
+            logging.error(f"❌ {self.name}: getHistory error {code} {msg}")
 
-    def get_history_fresh(self, peer_id: int, count: int = 20) -> List[Dict[str, Any]]:
-        data = {
-            "access_token": self.access_token,
-            "v": VK_API_VERSION,
-            "peer_id": int(peer_id),
-            "count": int(count),
-        }
+            if code == 9:
+                self.next_history_ts = now_ts() + random.randint(10, 20)
+                logging.warning(f"🧊 {self.name}: history backoff {int(self.next_history_ts - now_ts())}s")
+            if code == 14:
+                self.disable("captcha needed (getHistory)")
+            if code == 5:
+                self.disable("invalid access_token (getHistory)")
 
-        async def _get():
-            try:
-                ret = await self._vk.post("messages.getHistory", data)
-                if "error" in ret:
-                    err = ret["error"]
-                    code = err.get("error_code")
-                    msg = err.get("error_msg")
-                    logging.error(f"❌ {self.name}: getHistory_fresh error {code} {msg}")
-                    return []
-                if "response" in ret and "items" in ret["response"]:
-                    return ret["response"]["items"]
-            except Exception as e:
-                logging.error(f"getHistory_fresh error: {e}")
-            return []
+            return [], code, msg
 
-        try:
-            return self._vk.call(_get())
-        except Exception as e:
-            logging.error(f"❌ {self.name}: getHistory_fresh exception {e}")
-            return []
+        items = ret.get("response", {}).get("items", [])
+        return items, None, None
 
-# ====== TOKEN MANAGER ======
-class SimpleTokenManager:
-    def __init__(self, config_path: str, vk: VKAsyncClient):
-        self.config_path = config_path
-        self._lock = threading.Lock()
-        self._vk = vk
-        self.msg_cache = MessageCache(ttl=8)
-        self.weight = TokenWeightManager()
-        self.rate_limiter = SimpleRateLimiter(max_per_minute=60)
-        self.tokens: List[TokenHandler] = []
-        self.config: Dict = {}
-        self.load()
+# =========================
+# Request session collector
+# =========================
+@dataclass
+class RequestSession:
+    key: str
+    created_ts: float
+    sender_id: int
+    abilities: List[ParsedAbility]
+    # token_id -> (source_peer_id, conversation_message_id)
+    sightings: Dict[str, Tuple[int, int]] = field(default_factory=dict)
+    finalized: bool = False
 
-    def load(self) -> None:
-        try:
-            with open(self.config_path, "r", encoding="utf-8") as f:
-                self.config = json.load(f)
-        except FileNotFoundError:
-            logging.warning(f"⚠️ {self.config_path} not found, creating empty")
-            self.config = {"tokens": [], "settings": {"delay": 2}}
-            self.save()
-        except json.JSONDecodeError as e:
-            logging.error(f"❌ Invalid JSON in {self.config_path}: {e}")
-            raise
-
-        with self._lock:
-            self.tokens = []
-            for t_cfg in self.config.get("tokens", []):
-                self.tokens.append(TokenHandler(t_cfg, self._vk, self.msg_cache, self, self.rate_limiter))
-
-        logging.info(f"📋 Loaded {len(self.tokens)} tokens")
-
-    def reload(self) -> None:
-        self.msg_cache.clear()
-        self.load()
-
-    def save(self) -> None:
-        with self._lock:
-            tokens_payload = []
-            for t in self.tokens:
-                tokens_payload.append({
-                    "id": t.id,
-                    "name": t.name,
-                    "class": t.class_type,
-                    "access_token": t.access_token,
-                    "user_id": t.user_id,
-                    "source_chat_id": t.source_chat_id,
-                    "target_peer_id": t.target_peer_id,
-                    "voices": t.voices,
-                    "enabled": t.enabled,
-                    "last_check": t.last_check,
-                    "races": t.races,  # NEW
-                })
-            self.config["tokens"] = tokens_payload
-
-        try:
-            with open(self.config_path, "w", encoding="utf-8") as f:
-                json.dump(self.config, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logging.error(f"❌ Failed to save config: {e}")
-
-    def tokens_for_ability(self, ability_key: str) -> List[TokenHandler]:
-        tokens: List[TokenHandler] = []
-        for token in self.tokens:
-            if not token.enabled:
-                continue
-
-            class_data = CLASS_ABILITIES.get(token.class_type)
-            if not class_data or ability_key not in class_data["abilities"]:
-                continue
-
-            # NEW: фильтр по расе для апостола
-            if token.class_type == "apostle" and ability_key in RACE_KEYS:
-                if ability_key not in token.races:
-                    continue
-
-            ok, _ = token.can_use_ability(ability_key)
-            if ok:
-                tokens.append(token)
-
-        return tokens
-
-# ====== EXECUTOR ======
+# =========================
+# Buff Executor (per token)
+# =========================
 class AbilityExecutor:
-    def __init__(self, timing: AdaptiveTiming, tm: SimpleTokenManager):
+    def __init__(self, timing: AdaptiveTiming):
         self.timing = timing
-        self.tm = tm
 
-    def execute(
+    def execute_one(
         self,
         token: TokenHandler,
         ability: ParsedAbility,
-        trigger_source_peer_id: int,
-        trigger_conversation_message_id: int,
-        attempt_idx: int,
-    ) -> None:
-        start_time = time.time()
-        try:
-            baseline_id = token.get_last_message_id_fresh(token.target_peer_id)
+        source_peer_id: int,
+        source_conv_msg_id: int,
+    ) -> Tuple[bool, str]:
+        """
+        Executes ability using ONE token:
+          1) forward trigger from token's source to token's target
+          2) send ability reply_to forwarded msg_id
+          3) poll results in token's target dialog
+        Returns: (done, status)
+          done=True if ability considered finished (SUCCESS or ALREADY)
+          done=False if retryable failure and we should try another token
+        """
+        # local cd
+        can, rem = token.can_use_ability(ability.key)
+        if not can:
+            return False, f"COOLDOWN_LOCAL({rem:.1f}s)"
 
-            ok, _sent_id = token.send_command_with_forward(
-                ability.text,
-                forward_from_peer_id=trigger_source_peer_id,
-                forward_conversation_message_id=trigger_conversation_message_id,
-            )
-            if not ok:
-                self.tm.weight.record_failure(token.id, "send_error_or_rate_limit")
-                logging.warning(
-                    f"❌ [{attempt_idx}] {token.name}({token.class_name()}): "
-                    f"{ability.text} SEND_ERROR_OR_RATE_LIMIT ({time.time()-start_time:.2f}s)"
-                )
-                return
+        # race restriction: only for apostle race abilities
+        if token.class_type == "apostle" and ability.key in RACE_KEYS:
+            if ability.key not in token.races:
+                return False, "RACE_NOT_ALLOWED"
 
+        baseline_id = self._last_msg_id(token, token.target_peer_id)
+
+        # 1) forward trigger to target
+        ok, fwd_msg_id, ecode, emsg = token.send_text(
+            peer_id=token.target_peer_id,
+            text=" ",
+            forward_peer_id=source_peer_id,
+            forward_conversation_message_id=source_conv_msg_id,
+        )
+        if not ok or not fwd_msg_id:
+            if ecode == 14:
+                token.disable("captcha needed (forward)")
+                return False, "CAPTCHA"
+            if ecode == 5:
+                token.disable("invalid token (forward)")
+                return False, "INVALID"
+            if ecode == 9:
+                return False, "FLOOD"
+            return False, f"SEND_ERROR_FORWARD({ecode} {emsg})"
+
+        # 2) send ability as reply_to fwd
+        ok2, _mid2, e2, m2 = token.send_text(
+            peer_id=token.target_peer_id,
+            text=ability.text,
+            reply_to=fwd_msg_id,
+        )
+        if not ok2:
+            if e2 == 14:
+                token.disable("captcha needed (send)")
+                return False, "CAPTCHA"
+            if e2 == 5:
+                token.disable("invalid token (send)")
+                return False, "INVALID"
+            if e2 == 9:
+                token.set_ability_cooldown(ability.key, 20)
+                return False, "FLOOD"
+            return False, f"SEND_ERROR({e2} {m2})"
+
+        # 3) poll result
+        status, cd = self._poll_result(token, token.target_peer_id, baseline_id)
+
+        if status == "SUCCESS":
+            ability.processed = True
+            token.set_ability_cooldown(ability.key, ability.cooldown)
+            if ability.uses_voices:
+                token.voices = max(0, token.voices - 1)
+            return True, "SUCCESS"
+
+        if status == "ALREADY":
+            # ВАЖНО: это НЕ ошибка — баф уже висит, считаем выполненным
+            ability.processed = True
+            return True, "ALREADY"
+
+        if status == "NO_VOICES":
+            token.voices = 0
+            return False, "NO_VOICES"
+
+        if status == "COOLDOWN":
+            sec = int(max(10, cd or 30))
+            token.set_ability_cooldown(ability.key, sec)
+            return False, f"COOLDOWN({sec}s)"
+
+        if status == "UNKNOWN":
+            return False, "UNKNOWN"
+
+        return False, status
+
+    def _last_msg_id(self, token: TokenHandler, peer_id: int) -> int:
+        items, _c, _m = token.get_history(peer_id, count=1)
+        if items:
+            return safe_int(items[0].get("id"), 0)
+        return 0
+
+    def _poll_result(self, token: TokenHandler, peer_id: int, baseline_id: int) -> Tuple[str, int]:
+        for i in range(1, POLL_TRIES + 1):
             time.sleep(self.timing.get_wait_time())
-            history = token.get_history_fresh(token.target_peer_id, count=20)
-            new_msgs = [m for m in history if int(m.get("id", 0) or 0) > int(baseline_id)]
-            result = self._parse_result(new_msgs)
+            items, _c, _m = token.get_history(peer_id, count=60)
+            new_msgs = [m for m in items if safe_int(m.get("id"), 0) > baseline_id]
+            status, cd = self._parse_result(new_msgs)
+            if status != "UNKNOWN":
+                return status, cd
+            logging.info(f"🕵️ [{token.name}] no result yet (poll {i}/{POLL_TRIES})")
+        return "UNKNOWN", 0
 
-            if result == "SUCCESS":
-                ability.processed = True
-                token.set_ability_cooldown(ability.key, ability.cooldown)
-                if ability.uses_voices:
-                    token.update_voices(max(0, token.voices - 1))
-                self.tm.weight.record_success(token.id)
-                self.timing.record_response_time(time.time() - start_time)
-                logging.info(
-                    f"✅ [{attempt_idx}] {token.name}({token.class_name()}): "
-                    f"{ability.text} ({time.time()-start_time:.2f}s)"
-                )
-            elif result == "NO_VOICES":
-                token.update_voices(0)
-                self.tm.weight.record_failure(token.id, "no_voices")
-                logging.warning(
-                    f"🔇 [{attempt_idx}] {token.name}({token.class_name()}): "
-                    f"{ability.text} NO_VOICES ({time.time()-start_time:.2f}s)"
-                )
-            else:
-                self.tm.weight.record_failure(token.id, result)
-                logging.warning(
-                    f"⚠️ [{attempt_idx}] {token.name}({token.class_name()}): "
-                    f"{ability.text} {result} ({time.time()-start_time:.2f}s)"
-                )
-        except Exception as e:
-            logging.error(f"❌ Attempt error idx={attempt_idx}: {e}")
-            self.tm.weight.record_failure(token.id, "exception")
+    def _parse_result(self, msgs: List[Dict[str, Any]]) -> Tuple[str, int]:
+        for m in msgs:
+            text = (m.get("text", "") or "").lower()
 
-    def _parse_result(self, new_history: List[Dict[str, Any]]) -> str:
-        for msg in new_history:
-            text = (msg.get("text", "") or "").lower()
-            if "на вас наложено" in text or "наложено" in text:
-                return "SUCCESS"
-            if "требуется голос" in text or "голоса" in text:
-                return "NO_VOICES"
-        return "UNKNOWN"
+            # SUCCESS
+            if "на вас наложено" in text or ("наложено" in text and ("благослов" in text or "проклят" in text)):
+                return "SUCCESS", 0
 
-# ====== БОТ ======
+            # ALREADY (расширено под твой текст)
+            # примеры:
+            # "🚫..., на эту цель уже действует такое благословение!"
+            # "нельзя наложить ... уже имеющейся"
+            if (
+                ("уже действует" in text and ("благослов" in text or "проклят" in text))
+                or ("на эту цель" in text and "уже действует" in text)
+                or ("уже действует" in text and "такое" in text and ("благослов" in text or "проклят" in text))
+                or ("нельзя наложить" in text and ("уже име" in text or "уже есть" in text))
+                or ("уже наложено" in text and ("благослов" in text or "проклят" in text))
+            ):
+                return "ALREADY", 0
+
+            # NO_VOICES
+            if "требуется голос" in text or "нет голос" in text:
+                return "NO_VOICES", 0
+
+            # COOLDOWN / too often
+            if ("слишком часто" in text) or ("подождите" in text) or ("доступно через" in text) or ("попробуйте позже" in text):
+                return "COOLDOWN", self._extract_cd_seconds(text)
+
+        return "UNKNOWN", 0
+
+    def _extract_cd_seconds(self, text: str) -> int:
+        minutes = 0
+        seconds = 0
+        m = re.search(r"(\d+)\s*(минут|минута|минуты|мин)\b", text)
+        if m:
+            minutes = int(m.group(1))
+        s = re.search(r"(\d+)\s*(секунд|секунда|секунды|сек)\b", text)
+        if s:
+            seconds = int(s.group(1))
+        if minutes or seconds:
+            return minutes * 60 + seconds
+        n = re.search(r"\b(\d+)\b", text)
+        if n:
+            return int(n.group(1))
+        return 30
+
+# =========================
+# Bot
+# =========================
 class MultiTokenBot:
     def __init__(self, config_path: str):
+        self.config_path = config_path
+        self._lock = threading.Lock()
+
         self.vk = VKAsyncClient()
-        self.tm = SimpleTokenManager(config_path, self.vk)
+        self.rate_limiter = SimpleRateLimiter(max_per_minute=40)
         self.timing = AdaptiveTiming()
-        self.executor = AbilityExecutor(self.timing, self.tm)
+        self.executor = AbilityExecutor(self.timing)
 
-        self.main_token = self.tm.tokens[0] if self.tm.tokens else None
-        if not self.main_token:
-            raise RuntimeError("No tokens in config.json")
+        self.config: Dict[str, Any] = {}
+        self.tokens: List[TokenHandler] = []
 
-        self.source_peer_id = self.main_token.source_peer_id
+        self.poll_interval = 2.0
+        self.poll_count = 20
+
+        # source_peer_id -> token
+        self.sources: Dict[int, TokenHandler] = {}
+        self.last_msg_ids: Dict[str, int] = {}
+
+        # request sessions
+        self.sessions: Dict[str, RequestSession] = {}
+        self.sessions_lock = threading.Lock()
+
         self._running = False
-        self.last_msg_id = self._load_last_msg_id()
+
+        self.load()
+        self.last_msg_ids = self._load_last_msg_ids()
 
         logging.info("🤖 MultiTokenBot STARTED")
-        logging.info(f"📋 Tokens: {len(self.tm.tokens)}")
-        logging.info(f"📁 Source chat: {self.source_peer_id}")
+        logging.info(f"📋 Tokens: {len(self.tokens)}")
+        logging.info(f"📁 Source chats: {len(self.sources)}")
         logging.info(f"⏱️ Initial wait time: {self.timing.get_wait_time():.2f}s")
+        logging.info(f"🛰️ Poll interval: {self.poll_interval:.1f}s, poll_count={self.poll_count}")
 
-    def stop(self) -> None:
-        self._running = False
+    def load(self) -> None:
+        with open(self.config_path, "r", encoding="utf-8") as f:
+            self.config = json.load(f)
+
+        settings = self.config.get("settings", {}) if isinstance(self.config, dict) else {}
+        self.poll_interval = float(settings.get("poll_interval", 2.0))
+        self.poll_count = int(settings.get("poll_count", 20))
+
+        self.tokens = []
+        self.sources = {}
+
+        for t_cfg in self.config.get("tokens", []):
+            t = TokenHandler(t_cfg, self.vk, self.rate_limiter)
+            self.tokens.append(t)
+            self.sources[t.source_peer_id] = t
+
+    def save_config(self) -> None:
+        # сохраняем voices/enabled обратно
+        with self._lock:
+            tokens_payload = []
+            for t in self.tokens:
+                orig = None
+                for x in self.config.get("tokens", []):
+                    if x.get("id") == t.id:
+                        orig = dict(x)
+                        break
+                if orig is None:
+                    orig = {"id": t.id}
+
+                orig["name"] = t.name
+                orig["class"] = t.class_type
+                orig["access_token"] = t.access_token
+                orig["source_chat_id"] = t.source_chat_id
+                orig["target_peer_id"] = t.target_peer_id
+                orig["voices"] = t.voices
+                orig["enabled"] = t.enabled
+                orig["races"] = t.races
+                tokens_payload.append(orig)
+
+            self.config["tokens"] = tokens_payload
+
+            with open(self.config_path, "w", encoding="utf-8") as f:
+                json.dump(self.config, f, ensure_ascii=False, indent=2)
+
+    def _load_last_msg_ids(self) -> Dict[str, int]:
         try:
-            self.vk.close()
+            with open("last_msg_ids.json", "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return {str(k): int(v) for k, v in data.items()}
         except Exception:
             pass
+        return {}
 
-    def _load_last_msg_id(self) -> int:
+    def _save_last_msg_ids(self) -> None:
         try:
-            with open("last_msg_id.json", "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return int(data.get("last_msg_id", 0))
-        except Exception:
-            return 0
-
-    def _save_last_msg_id(self, last_msg_id: int) -> None:
-        try:
-            with open("last_msg_id.json", "w", encoding="utf-8") as f:
-                json.dump({"last_msg_id": int(last_msg_id)}, f)
+            with open("last_msg_ids.json", "w", encoding="utf-8") as f:
+                json.dump(self.last_msg_ids, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            logging.error(f"❌ Failed to save last_msg_id: {e}")
+            logging.error(f"❌ Failed to save last_msg_ids: {e}")
 
-    # ===== командный парсер (!баф, максимум 4 буквы) =====
+    # -------------------------
+    # Parsing
+    # -------------------------
     def parse_command_text(self, text: str) -> List[ParsedAbility]:
         text = (text or "").strip().lower()
         if not text.startswith("!баф"):
             return []
 
-        cmd_text = text[4:].strip()
-        if not cmd_text:
+        cmd = text[4:].strip()
+        if not cmd:
             return []
 
-        cmd_text = "".join(ch for ch in cmd_text if ch.isalpha())[:4]
-        if not cmd_text:
+        # only letters, max 4
+        cmd = "".join(ch for ch in cmd if ch.isalpha())[:MAX_BUFF_LETTERS]
+        if not cmd:
             return []
 
         abilities: List[ParsedAbility] = []
-        for ch in cmd_text:
+        for ch in cmd:
             for class_type in CLASS_ORDER:
                 info = self._build_ability_text_and_cd(class_type, ch)
                 if info:
@@ -703,120 +716,251 @@ class MultiTokenBot:
         text = f"{prefix} {v}".strip() if prefix else str(v)
         return text, default_cd, uses_voices
 
+    # -------------------------
+    # Session Key
+    # -------------------------
+    def _make_session_key(self, sender_id: int, abilities: List[ParsedAbility]) -> str:
+        keys = "".join(a.key for a in abilities)
+        bucket = int(now_ts() // 2)
+        return f"{sender_id}:{keys}:{bucket}"
+
+    # -------------------------
+    # Run loop
+    # -------------------------
     def run(self):
         self._running = True
         try:
             while self._running:
-                msgs = self.main_token.get_history(self.source_peer_id, count=30)
-                updated = False
+                updated_any = False
 
-                for msg in reversed(msgs):
-                    msg_id = int(msg.get("id", 0) or 0)
-                    if msg_id <= self.last_msg_id:
+                self._cleanup_sessions()
+
+                for source_peer_id, token in self.sources.items():
+                    if not token.enabled:
                         continue
 
-                    self.last_msg_id = msg_id
-                    updated = True
-
-                    text = (msg.get("text", "") or "").strip()
-                    sender_id = int(msg.get("from_id", 0) or 0)
-                    if sender_id <= 0:
+                    items, code, _msg = token.get_history(source_peer_id, count=self.poll_count)
+                    if code is not None and code != 9:
                         continue
 
-                    conversation_message_id = int(msg.get("conversation_message_id", 0) or 0)
+                    last_id = int(self.last_msg_ids.get(str(source_peer_id), 0) or 0)
 
-                    abilities = self.parse_command_text(text)
-                    if abilities:
+                    for m in reversed(items):
+                        mid = safe_int(m.get("id"), 0)
+                        if mid <= last_id:
+                            continue
+
+                        last_id = mid
+                        updated_any = True
+
+                        text = (m.get("text", "") or "").strip()
+                        sender_id = safe_int(m.get("from_id"), 0)
+                        conv_msg_id = safe_int(m.get("conversation_message_id"), 0)
+
+                        if sender_id <= 0 or conv_msg_id <= 0:
+                            continue
+
+                        abilities = self.parse_command_text(text)
+                        if not abilities:
+                            continue
+
+                        session_key = self._make_session_key(sender_id, abilities)
+
                         logging.info(
                             f"🎯 !баф from {sender_id}: "
-                            f"{''.join(a.key for a in abilities)} ({len(abilities)} abilities)"
+                            f"{''.join(a.key for a in abilities)} ({len(abilities)} abilities) "
+                            f"[token={token.name} source={source_peer_id} target={token.target_peer_id}]"
                         )
 
-                        threading.Thread(
-                            target=self._process_abilities,
-                            args=(abilities, sender_id, conversation_message_id),
-                            daemon=True,
-                        ).start()
+                        self._register_sighting(session_key, sender_id, abilities, token, source_peer_id, conv_msg_id)
 
-                if updated:
-                    self._save_last_msg_id(self.last_msg_id)
+                    self.last_msg_ids[str(source_peer_id)] = last_id
 
-                time.sleep(1.0)
+                if updated_any:
+                    self._save_last_msg_ids()
+
+                self._finalize_ready_sessions()
+
+                time.sleep(self.poll_interval)
+
         except KeyboardInterrupt:
             logging.info("⏹️ Stopping...")
         finally:
-            self.stop()
+            self._running = False
+            self.save_config()
+            self.vk.close()
 
-    def _process_abilities(
+    def _cleanup_sessions(self):
+        with self.sessions_lock:
+            now = now_ts()
+            for k in list(self.sessions.keys()):
+                s = self.sessions[k]
+                if now - s.created_ts > REQUEST_TTL:
+                    self.sessions.pop(k, None)
+
+    def _register_sighting(
         self,
-        abilities: List[ParsedAbility],
+        session_key: str,
         sender_id: int,
-        trigger_conversation_message_id: int,
-    ) -> None:
-        trigger_source_peer_id = self.source_peer_id
+        abilities: List[ParsedAbility],
+        token: TokenHandler,
+        source_peer_id: int,
+        conv_msg_id: int,
+    ):
+        with self.sessions_lock:
+            s = self.sessions.get(session_key)
+            if not s:
+                s = RequestSession(
+                    key=session_key,
+                    created_ts=now_ts(),
+                    sender_id=sender_id,
+                    abilities=abilities,
+                    sightings={},
+                    finalized=False,
+                )
+                self.sessions[session_key] = s
 
-        for ability in abilities:
-            candidates = self.tm.tokens_for_ability(ability.key)
-            if not candidates:
-                logging.warning(f"⚠️ No tokens for ability '{ability.key}'")
+            s.sightings[token.id] = (source_peer_id, conv_msg_id)
+
+    def _finalize_ready_sessions(self):
+        to_finalize: List[RequestSession] = []
+        with self.sessions_lock:
+            now = now_ts()
+            for s in self.sessions.values():
+                if s.finalized:
+                    continue
+                if now - s.created_ts >= COLLECT_WINDOW:
+                    s.finalized = True
+                    to_finalize.append(s)
+
+        for s in to_finalize:
+            threading.Thread(target=self._process_session, args=(s,), daemon=True).start()
+
+    # -------------------------
+    # Core logic: distribute letters across tokens
+    # -------------------------
+    def _process_session(self, sess: RequestSession):
+        abilities = sess.abilities[:]  # copy
+        assigned: Dict[str, str] = {}
+
+        tokens_with_sighting: List[TokenHandler] = []
+        for t in self.tokens:
+            if t.id in sess.sightings and t.enabled:
+                tokens_with_sighting.append(t)
+
+        if not tokens_with_sighting:
+            logging.error(f"❌ Session {sess.key}: no tokens with sighting, skipping")
+            return
+
+        used_tokens: set[str] = set()
+
+        for ab in abilities:
+            cand = self._candidates_for_ability(tokens_with_sighting, ab)
+            if not cand:
+                logging.warning(f"⚠️ Session {sess.key}: no candidates for '{ab.key}'")
                 continue
 
-            candidates.sort(key=lambda t: self.tm.weight.get_weight(t.id), reverse=True)
+            chosen = None
+            for t in cand:
+                if t.id not in used_tokens:
+                    chosen = t
+                    break
+            if not chosen:
+                chosen = cand[0]
 
-            for idx, token in enumerate(candidates, start=1):
-                can, _ = token.can_use_ability(ability.key)
-                if not can:
+            assigned[ab.key] = chosen.id
+            used_tokens.add(chosen.id)
+
+        for ab in abilities:
+            if ab.key not in assigned:
+                continue
+
+            first_token_id = assigned[ab.key]
+            order = self._candidates_for_ability(tokens_with_sighting, ab)
+
+            if order:
+                idx = next((i for i, t in enumerate(order) if t.id == first_token_id), 0)
+                order = order[idx:] + order[:idx]
+
+            done = False
+            for attempt_idx, token in enumerate(order, start=1):
+                if token.id not in sess.sightings:
                     continue
 
-                self.executor.execute(
+                source_peer_id, conv_msg_id = sess.sightings[token.id]
+
+                done2, status = self.executor.execute_one(
                     token=token,
-                    ability=ability,
-                    trigger_source_peer_id=trigger_source_peer_id,
-                    trigger_conversation_message_id=trigger_conversation_message_id,
-                    attempt_idx=idx,
+                    ability=ab,
+                    source_peer_id=source_peer_id,
+                    source_conv_msg_id=conv_msg_id,
                 )
 
-                if ability.processed:
+                if status.startswith("COOLDOWN_LOCAL"):
+                    logging.info(f"⏳ [{attempt_idx}] {token.name}: {ab.text} {status}")
+                    continue
+
+                if status == "RACE_NOT_ALLOWED":
+                    continue
+
+                if done2:
+                    if status == "SUCCESS":
+                        logging.info(f"✅ {token.name}({token.class_name()}): {ab.text}")
+                    else:
+                        logging.info(f"ℹ️ {token.name}({token.class_name()}): {ab.text} {status}")
+                    done = True
                     break
 
-        success_count = len([a for a in abilities if a.processed])
-        if success_count == len(abilities):
-            logging.info(f"🎉 All {len(abilities)} abilities used for {sender_id}")
-        elif success_count > 0:
-            logging.warning(f"⚠️ Partial success: {success_count}/{len(abilities)} for {sender_id}")
-        else:
-            logging.error(f"❌ Failed all {len(abilities)} for {sender_id}")
+                logging.warning(f"⚠️ [{attempt_idx}] {token.name}({token.class_name()}): {ab.text} -> {status}")
 
-        self._log_success_stats(sender_id, abilities)
+            if not done:
+                logging.error(f"❌ Session {sess.key}: ability '{ab.key}' not processed")
 
-    def _log_success_stats(self, sender_id: int, abilities: List[ParsedAbility]) -> None:
+        self.save_config()
+        self._log_stats(sess.sender_id, abilities)
+
+    def _candidates_for_ability(self, tokens: List[TokenHandler], ab: ParsedAbility) -> List[TokenHandler]:
+        out: List[TokenHandler] = []
+        for t in tokens:
+            if not t.enabled:
+                continue
+
+            class_data = CLASS_ABILITIES.get(t.class_type)
+            if not class_data or ab.key not in class_data["abilities"]:
+                continue
+
+            can, _rem = t.can_use_ability(ab.key)
+            if not can:
+                continue
+
+            if ab.uses_voices and t.voices <= 0:
+                continue
+
+            if t.class_type == "apostle" and ab.key in RACE_KEYS:
+                if ab.key not in t.races:
+                    continue
+
+            out.append(t)
+
+        out.sort(key=lambda x: (x.voices, random.random()), reverse=True)
+        return out
+
+    def _log_stats(self, sender_id: int, abilities: List[ParsedAbility]) -> None:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         keys = "".join(a.key for a in abilities)
-        success_flags = []
-        success_count = 0
-        fail_count = 0
-        for a in abilities:
-            if a.processed:
-                success_flags.append(f"{a.key}:ok")
-                success_count += 1
-            else:
-                success_flags.append(f"{a.key}:fail")
-                fail_count += 1
-        line = (
-            f"{ts};sender={sender_id};abilities={keys};"
-            f"success={success_count};fail={fail_count};"
-            f"details={','.join(success_flags)}\n"
-        )
+        success_count = sum(1 for a in abilities if a.processed)
+        fail_count = len(abilities) - success_count
+        details = ",".join(f"{a.key}:{'ok' if a.processed else 'fail'}" for a in abilities)
+        line = f"{ts};sender={sender_id};abilities={keys};success={success_count};fail={fail_count};details={details}\n"
         try:
             with open("buff_stats.log", "a", encoding="utf-8") as f:
                 f.write(line)
         except Exception as e:
             logging.error(f"❌ Failed to write buff_stats.log: {e}")
 
-# ===== main =====
+# =========================
+# main
+# =========================
 if __name__ == "__main__":
     bot = MultiTokenBot("config.json")
-    try:
-        bot.run()
-    except KeyboardInterrupt:
-        pass
+    bot.run()
