@@ -43,12 +43,28 @@ VK_API_BASE = "https://api.vk.com/method"
 VK_API_VERSION = "5.131"
 
 # =========================
-# CONFIG / CONSTANTS
+# REACTIONS
+# =========================
+REACTION_FAIL = 7   # 😢
+REACTION_OK = 16    # 🎉
+
+# =========================
+# BOT CONSTANTS
 # =========================
 MAX_BUFF_LETTERS = 4
-COLLECT_WINDOW = 1.2  # seconds: waiting to collect same trigger from all tokens
-REQUEST_TTL = 12.0    # seconds: session storage TTL
+COLLECT_WINDOW = 1.2
+REQUEST_TTL = 12.0
+
+# Poll result from target:
 POLL_TRIES = 4
+POLL_SLEEP_SECONDS = 10.0  # <--- requested: 10 sec between polls
+
+# Captcha ban:
+CAPTCHA_BAN_SECONDS = 60.0  # <--- requested: 1 minute pause
+
+# Jitter:
+SEND_JITTER_MIN = 0.10
+SEND_JITTER_MAX = 0.20
 
 RACE_KEYS = {"ч", "г", "н", "э", "м", "д", "о"}
 
@@ -121,37 +137,8 @@ def safe_int(x: Any, default: int = 0) -> int:
     except Exception:
         return default
 
-# =========================
-# Adaptive wait (target response)
-# =========================
-class AdaptiveTiming:
-    def __init__(self, initial_wait: float = 3.0, min_wait: float = 1.0, max_wait: float = 6.0):
-        self._lock = threading.Lock()
-        self._samples: List[float] = []
-        self._wait = initial_wait
-        self._min = min_wait
-        self._max = max_wait
-
-    def get_wait_time(self) -> float:
-        with self._lock:
-            return self._wait
-
-    def record_response_time(self, elapsed: float) -> None:
-        with self._lock:
-            self._samples.append(float(elapsed))
-            if len(self._samples) > 50:
-                self._samples.pop(0)
-            if len(self._samples) < 10:
-                return
-            s = sorted(self._samples)
-            idx = int(len(s) * 0.95)
-            idx = min(max(idx, 0), len(s) - 1)
-            p95 = s[idx]
-            new_wait = clamp(p95 * 1.1, self._min, self._max)
-            old = self._wait
-            self._wait = new_wait
-            if abs(old - new_wait) > 0.1:
-                logging.info(f"⏱️ Timing updated: {old:.2f}s → {new_wait:.2f}s")
+def jitter_sleep():
+    time.sleep(random.uniform(SEND_JITTER_MIN, SEND_JITTER_MAX))
 
 # =========================
 # VK Async Client
@@ -216,7 +203,7 @@ class SimpleRateLimiter:
     def __init__(self, max_per_minute: int = 40):
         self.max_per_minute = max_per_minute
         self._lock = threading.Lock()
-        self._counters: Dict[str, Tuple[int, float]] = {}  # token_id -> (count, window_start)
+        self._counters: Dict[str, Tuple[int, float]] = {}
 
     def allow(self, token_id: str) -> bool:
         now = now_ts()
@@ -259,6 +246,9 @@ class TokenHandler:
         self.voices: int = int(cfg.get("voices", 5))
         self.enabled: bool = bool(cfg.get("enabled", True))
 
+        # captcha ban
+        self.captcha_until: float = float(cfg.get("captcha_until", 0) or 0)
+
         raw_races = cfg.get("races", [])
         if isinstance(raw_races, list):
             self.races: List[str] = [str(x).strip().lower() for x in raw_races if str(x).strip()]
@@ -270,16 +260,27 @@ class TokenHandler:
         self._vk = vk
         self._rate_limiter = rate_limiter
 
-        # per-token cooldown map: ability_key -> unix_ts
         self._ability_cd: Dict[str, float] = {}
-        # backoff for getHistory flood
         self.next_history_ts: float = 0.0
-
-        # lock around send/getHistory to reduce bursts per token
         self._io_lock = threading.Lock()
 
     def class_name(self) -> str:
         return CLASS_ABILITIES.get(self.class_type, {}).get("name", self.class_type)
+
+    def is_available(self) -> bool:
+        if not self.enabled:
+            return False
+        if now_ts() < self.captcha_until:
+            return False
+        return True
+
+    def captcha_ban(self, seconds: float = CAPTCHA_BAN_SECONDS, context: str = "") -> None:
+        until = now_ts() + float(seconds)
+        self.captcha_until = until
+        if context:
+            logging.warning(f"🧩 {self.name}: captcha ban {int(seconds)}s ({context})")
+        else:
+            logging.warning(f"🧩 {self.name}: captcha ban {int(seconds)}s")
 
     def can_use_ability(self, ability_key: str) -> Tuple[bool, float]:
         ts = self._ability_cd.get(ability_key, 0.0)
@@ -291,13 +292,50 @@ class TokenHandler:
     def set_ability_cooldown(self, ability_key: str, seconds: int) -> None:
         self._ability_cd[ability_key] = now_ts() + int(max(1, seconds))
 
-    def disable(self, reason: str) -> None:
-        if self.enabled:
-            self.enabled = False
-        logging.error(f"⛔ {self.name}: disabled ({reason})")
-
     async def _messages_send(self, data: Dict[str, Any]) -> Dict[str, Any]:
         return await self._vk.post("messages.send", data)
+
+    async def _messages_send_reaction(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        return await self._vk.post("messages.sendReaction", data)
+
+    def send_reaction(self, peer_id: int, cmid: int, reaction_id: int) -> bool:
+        if cmid is None or int(cmid) <= 0:
+            return False
+        if not self.is_available():
+            return False
+
+        # jitter before reaction (requested)
+        jitter_sleep()
+
+        async def _send():
+            data = {
+                "access_token": self.access_token,
+                "v": VK_API_VERSION,
+                "peer_id": int(peer_id),
+                "cmid": int(cmid),
+                "reaction_id": int(reaction_id),
+            }
+            return await self._messages_send_reaction(data)
+
+        with self._io_lock:
+            try:
+                ret = self._vk.call(_send())
+            except Exception as e:
+                logging.error(f"❌ {self.name}: sendReaction exception: {e}")
+                return False
+
+        if "error" in ret:
+            err = ret["error"]
+            code = err.get("error_code")
+            msg = err.get("error_msg")
+            if safe_int(code) == 14:
+                self.captcha_ban(context="sendReaction")
+            logging.warning(f"⚠️ {self.name}: sendReaction error {code} {msg} (peer={peer_id} cmid={cmid})")
+            return False
+
+        emoji = {REACTION_FAIL: "😢", REACTION_OK: "🎉"}.get(reaction_id, str(reaction_id))
+        logging.info(f"🙂 {self.name}: реакция {emoji} поставлена (peer={peer_id} cmid={cmid})")
+        return True
 
     def send_text(
         self,
@@ -307,11 +345,13 @@ class TokenHandler:
         forward_peer_id: Optional[int] = None,
         forward_conversation_message_id: Optional[int] = None,
     ) -> Tuple[bool, Optional[int], Optional[int], Optional[str]]:
-        """
-        Returns: (ok, message_id, error_code, error_msg)
-        """
+        if not self.is_available():
+            return False, None, -100, "token_not_available"
         if not self._rate_limiter.allow(self.id):
             return False, None, -1, "rate_limited"
+
+        # jitter before send (requested)
+        jitter_sleep()
 
         async def _send():
             data: Dict[str, Any] = {
@@ -346,9 +386,13 @@ class TokenHandler:
 
         if "error" in ret:
             err = ret["error"]
-            code = err.get("error_code")
-            msg = err.get("error_msg")
-            return False, None, safe_int(code, -3), str(msg)
+            code = safe_int(err.get("error_code"), -3)
+            msg = str(err.get("error_msg"))
+
+            # Captcha -> ban 60s, NOT disable
+            if code == 14:
+                self.captcha_ban(context="messages.send")
+            return False, None, code, msg
 
         msg_id = None
         try:
@@ -359,9 +403,9 @@ class TokenHandler:
         return True, msg_id, None, None
 
     def get_history(self, peer_id: int, count: int = 30) -> Tuple[List[Dict[str, Any]], Optional[int], Optional[str]]:
-        """
-        Returns: (items, error_code, error_msg)
-        """
+        if not self.is_available():
+            return [], -100, "token_not_available"
+
         now = now_ts()
         if now < self.next_history_ts:
             return [], 9, "backoff"
@@ -390,10 +434,14 @@ class TokenHandler:
             if code == 9:
                 self.next_history_ts = now_ts() + random.randint(10, 20)
                 logging.warning(f"🧊 {self.name}: history backoff {int(self.next_history_ts - now_ts())}s")
+
             if code == 14:
-                self.disable("captcha needed (getHistory)")
+                self.captcha_ban(context="getHistory")
+
             if code == 5:
-                self.disable("invalid access_token (getHistory)")
+                # invalid token: still disabling (this is not captcha)
+                self.enabled = False
+                logging.error(f"⛔ {self.name}: disabled (invalid access_token)")
 
             return [], code, msg
 
@@ -409,17 +457,13 @@ class RequestSession:
     created_ts: float
     sender_id: int
     abilities: List[ParsedAbility]
-    # token_id -> (source_peer_id, conversation_message_id)
-    sightings: Dict[str, Tuple[int, int]] = field(default_factory=dict)
+    sightings: Dict[str, Tuple[int, int]] = field(default_factory=dict)  # token_id -> (source_peer_id, cmid)
     finalized: bool = False
 
 # =========================
-# Buff Executor (per token)
+# Ability Executor
 # =========================
 class AbilityExecutor:
-    def __init__(self, timing: AdaptiveTiming):
-        self.timing = timing
-
     def execute_one(
         self,
         token: TokenHandler,
@@ -427,21 +471,11 @@ class AbilityExecutor:
         source_peer_id: int,
         source_conv_msg_id: int,
     ) -> Tuple[bool, str]:
-        """
-        Executes ability using ONE token:
-          1) forward trigger from token's source to token's target
-          2) send ability reply_to forwarded msg_id
-          3) poll results in token's target dialog
-        Returns: (done, status)
-          done=True if ability considered finished (SUCCESS or ALREADY)
-          done=False if retryable failure and we should try another token
-        """
-        # local cd
         can, rem = token.can_use_ability(ability.key)
         if not can:
+            token.send_reaction(source_peer_id, source_conv_msg_id, REACTION_FAIL)
             return False, f"COOLDOWN_LOCAL({rem:.1f}s)"
 
-        # race restriction: only for apostle race abilities
         if token.class_type == "apostle" and ability.key in RACE_KEYS:
             if ability.key not in token.races:
                 return False, "RACE_NOT_ALLOWED"
@@ -456,35 +490,33 @@ class AbilityExecutor:
             forward_conversation_message_id=source_conv_msg_id,
         )
         if not ok or not fwd_msg_id:
+            token.send_reaction(source_peer_id, source_conv_msg_id, REACTION_FAIL)
             if ecode == 14:
-                token.disable("captcha needed (forward)")
                 return False, "CAPTCHA"
             if ecode == 5:
-                token.disable("invalid token (forward)")
                 return False, "INVALID"
             if ecode == 9:
                 return False, "FLOOD"
             return False, f"SEND_ERROR_FORWARD({ecode} {emsg})"
 
-        # 2) send ability as reply_to fwd
+        # 2) send ability reply_to forwarded msg_id
         ok2, _mid2, e2, m2 = token.send_text(
             peer_id=token.target_peer_id,
             text=ability.text,
             reply_to=fwd_msg_id,
         )
         if not ok2:
+            token.send_reaction(source_peer_id, source_conv_msg_id, REACTION_FAIL)
             if e2 == 14:
-                token.disable("captcha needed (send)")
                 return False, "CAPTCHA"
             if e2 == 5:
-                token.disable("invalid token (send)")
                 return False, "INVALID"
             if e2 == 9:
                 token.set_ability_cooldown(ability.key, 20)
                 return False, "FLOOD"
             return False, f"SEND_ERROR({e2} {m2})"
 
-        # 3) poll result
+        # 3) poll result (10s between polls)
         status, cd = self._poll_result(token, token.target_peer_id, baseline_id)
 
         if status == "SUCCESS":
@@ -492,25 +524,26 @@ class AbilityExecutor:
             token.set_ability_cooldown(ability.key, ability.cooldown)
             if ability.uses_voices:
                 token.voices = max(0, token.voices - 1)
+            token.send_reaction(source_peer_id, source_conv_msg_id, REACTION_OK)
             return True, "SUCCESS"
 
         if status == "ALREADY":
-            # ВАЖНО: это НЕ ошибка — баф уже висит, считаем выполненным
             ability.processed = True
+            token.send_reaction(source_peer_id, source_conv_msg_id, REACTION_FAIL)
             return True, "ALREADY"
 
         if status == "NO_VOICES":
             token.voices = 0
+            token.send_reaction(source_peer_id, source_conv_msg_id, REACTION_FAIL)
             return False, "NO_VOICES"
 
         if status == "COOLDOWN":
             sec = int(max(10, cd or 30))
             token.set_ability_cooldown(ability.key, sec)
+            token.send_reaction(source_peer_id, source_conv_msg_id, REACTION_FAIL)
             return False, f"COOLDOWN({sec}s)"
 
-        if status == "UNKNOWN":
-            return False, "UNKNOWN"
-
+        token.send_reaction(source_peer_id, source_conv_msg_id, REACTION_FAIL)
         return False, status
 
     def _last_msg_id(self, token: TokenHandler, peer_id: int) -> int:
@@ -521,42 +554,39 @@ class AbilityExecutor:
 
     def _poll_result(self, token: TokenHandler, peer_id: int, baseline_id: int) -> Tuple[str, int]:
         for i in range(1, POLL_TRIES + 1):
-            time.sleep(self.timing.get_wait_time())
-            items, _c, _m = token.get_history(peer_id, count=60)
+            time.sleep(POLL_SLEEP_SECONDS)
+
+            items, _c, _m = token.get_history(peer_id, count=80)
             new_msgs = [m for m in items if safe_int(m.get("id"), 0) > baseline_id]
             status, cd = self._parse_result(new_msgs)
             if status != "UNKNOWN":
                 return status, cd
             logging.info(f"🕵️ [{token.name}] no result yet (poll {i}/{POLL_TRIES})")
+
         return "UNKNOWN", 0
 
     def _parse_result(self, msgs: List[Dict[str, Any]]) -> Tuple[str, int]:
         for m in msgs:
             text = (m.get("text", "") or "").lower()
 
-            # SUCCESS
             if "на вас наложено" in text or ("наложено" in text and ("благослов" in text or "проклят" in text)):
                 return "SUCCESS", 0
 
-            # ALREADY (расширено под твой текст)
-            # примеры:
-            # "🚫..., на эту цель уже действует такое благословение!"
-            # "нельзя наложить ... уже имеющейся"
             if (
-                ("уже действует" in text and ("благослов" in text or "проклят" in text))
-                or ("на эту цель" in text and "уже действует" in text)
-                or ("уже действует" in text and "такое" in text and ("благослов" in text or "проклят" in text))
+                ("на эту цель" in text and "уже действует" in text)
+                or ("уже действует" in text and ("благослов" in text or "проклят" in text))
                 or ("нельзя наложить" in text and ("уже име" in text or "уже есть" in text))
                 or ("уже наложено" in text and ("благослов" in text or "проклят" in text))
             ):
                 return "ALREADY", 0
 
-            # NO_VOICES
-            if "требуется голос" in text or "нет голос" in text:
+            if "требуется голос" in text or "нет голос" in text or "голос древних" in text:
                 return "NO_VOICES", 0
 
-            # COOLDOWN / too often
-            if ("слишком часто" in text) or ("подождите" in text) or ("доступно через" in text) or ("попробуйте позже" in text):
+            if (
+                ("слишком часто" in text) or ("подождите" in text) or ("доступно через" in text)
+                or ("попробуйте позже" in text) or ("социальные эффекты" in text and "определенное время" in text)
+            ):
                 return "COOLDOWN", self._extract_cd_seconds(text)
 
         return "UNKNOWN", 0
@@ -578,7 +608,7 @@ class AbilityExecutor:
         return 30
 
 # =========================
-# Bot
+# MultiToken Bot
 # =========================
 class MultiTokenBot:
     def __init__(self, config_path: str):
@@ -587,8 +617,7 @@ class MultiTokenBot:
 
         self.vk = VKAsyncClient()
         self.rate_limiter = SimpleRateLimiter(max_per_minute=40)
-        self.timing = AdaptiveTiming()
-        self.executor = AbilityExecutor(self.timing)
+        self.executor = AbilityExecutor()
 
         self.config: Dict[str, Any] = {}
         self.tokens: List[TokenHandler] = []
@@ -596,13 +625,15 @@ class MultiTokenBot:
         self.poll_interval = 2.0
         self.poll_count = 20
 
-        # source_peer_id -> token
         self.sources: Dict[int, TokenHandler] = {}
         self.last_msg_ids: Dict[str, int] = {}
 
-        # request sessions
         self.sessions: Dict[str, RequestSession] = {}
         self.sessions_lock = threading.Lock()
+
+        # round-robin poll state
+        self._source_peer_ids: List[int] = []
+        self._rr_idx = 0
 
         self._running = False
 
@@ -612,7 +643,6 @@ class MultiTokenBot:
         logging.info("🤖 MultiTokenBot STARTED")
         logging.info(f"📋 Tokens: {len(self.tokens)}")
         logging.info(f"📁 Source chats: {len(self.sources)}")
-        logging.info(f"⏱️ Initial wait time: {self.timing.get_wait_time():.2f}s")
         logging.info(f"🛰️ Poll interval: {self.poll_interval:.1f}s, poll_count={self.poll_count}")
 
     def load(self) -> None:
@@ -631,8 +661,11 @@ class MultiTokenBot:
             self.tokens.append(t)
             self.sources[t.source_peer_id] = t
 
+        self._source_peer_ids = list(self.sources.keys())
+        self._source_peer_ids.sort()
+        self._rr_idx = 0
+
     def save_config(self) -> None:
-        # сохраняем voices/enabled обратно
         with self._lock:
             tokens_payload = []
             for t in self.tokens:
@@ -652,6 +685,10 @@ class MultiTokenBot:
                 orig["voices"] = t.voices
                 orig["enabled"] = t.enabled
                 orig["races"] = t.races
+
+                # persist captcha ban
+                orig["captcha_until"] = int(t.captcha_until) if t.captcha_until else 0
+
                 tokens_payload.append(orig)
 
             self.config["tokens"] = tokens_payload
@@ -676,19 +713,13 @@ class MultiTokenBot:
         except Exception as e:
             logging.error(f"❌ Failed to save last_msg_ids: {e}")
 
-    # -------------------------
-    # Parsing
-    # -------------------------
     def parse_command_text(self, text: str) -> List[ParsedAbility]:
         text = (text or "").strip().lower()
         if not text.startswith("!баф"):
             return []
-
         cmd = text[4:].strip()
         if not cmd:
             return []
-
-        # only letters, max 4
         cmd = "".join(ch for ch in cmd if ch.isalpha())[:MAX_BUFF_LETTERS]
         if not cmd:
             return []
@@ -716,70 +747,67 @@ class MultiTokenBot:
         text = f"{prefix} {v}".strip() if prefix else str(v)
         return text, default_cd, uses_voices
 
-    # -------------------------
-    # Session Key
-    # -------------------------
     def _make_session_key(self, sender_id: int, abilities: List[ParsedAbility]) -> str:
         keys = "".join(a.key for a in abilities)
         bucket = int(now_ts() // 2)
         return f"{sender_id}:{keys}:{bucket}"
 
-    # -------------------------
-    # Run loop
-    # -------------------------
+    # ===== main loop (reduced getHistory) =====
     def run(self):
         self._running = True
         try:
             while self._running:
                 updated_any = False
-
                 self._cleanup_sessions()
 
-                for source_peer_id, token in self.sources.items():
-                    if not token.enabled:
-                        continue
+                # round-robin: poll only ONE source chat per tick
+                if self._source_peer_ids:
+                    source_peer_id = self._source_peer_ids[self._rr_idx % len(self._source_peer_ids)]
+                    self._rr_idx += 1
 
-                    items, code, _msg = token.get_history(source_peer_id, count=self.poll_count)
-                    if code is not None and code != 9:
-                        continue
+                    token = self.sources.get(source_peer_id)
+                    if token and token.is_available():
+                        items, code, _msg = token.get_history(source_peer_id, count=self.poll_count)
+                        if code is None or code == 9:
+                            last_id = int(self.last_msg_ids.get(str(source_peer_id), 0) or 0)
+                            for m in reversed(items):
+                                mid = safe_int(m.get("id"), 0)
+                                if mid <= last_id:
+                                    continue
 
-                    last_id = int(self.last_msg_ids.get(str(source_peer_id), 0) or 0)
+                                last_id = mid
+                                updated_any = True
 
-                    for m in reversed(items):
-                        mid = safe_int(m.get("id"), 0)
-                        if mid <= last_id:
-                            continue
+                                text = (m.get("text", "") or "").strip()
+                                sender_id = safe_int(m.get("from_id"), 0)
+                                conv_msg_id = safe_int(m.get("conversation_message_id"), 0)
 
-                        last_id = mid
-                        updated_any = True
+                                if sender_id <= 0 or conv_msg_id <= 0:
+                                    continue
 
-                        text = (m.get("text", "") or "").strip()
-                        sender_id = safe_int(m.get("from_id"), 0)
-                        conv_msg_id = safe_int(m.get("conversation_message_id"), 0)
+                                abilities = self.parse_command_text(text)
+                                if not abilities:
+                                    continue
 
-                        if sender_id <= 0 or conv_msg_id <= 0:
-                            continue
+                                session_key = self._make_session_key(sender_id, abilities)
 
-                        abilities = self.parse_command_text(text)
-                        if not abilities:
-                            continue
+                                logging.info(
+                                    f"🎯 !баф from {sender_id}: "
+                                    f"{''.join(a.key for a in abilities)} ({len(abilities)} abilities) "
+                                    f"[token={token.name} source={source_peer_id} target={token.target_peer_id}]"
+                                )
 
-                        session_key = self._make_session_key(sender_id, abilities)
+                                self._register_sighting(session_key, sender_id, abilities, token, source_peer_id, conv_msg_id)
 
-                        logging.info(
-                            f"🎯 !баф from {sender_id}: "
-                            f"{''.join(a.key for a in abilities)} ({len(abilities)} abilities) "
-                            f"[token={token.name} source={source_peer_id} target={token.target_peer_id}]"
-                        )
-
-                        self._register_sighting(session_key, sender_id, abilities, token, source_peer_id, conv_msg_id)
-
-                    self.last_msg_ids[str(source_peer_id)] = last_id
+                            self.last_msg_ids[str(source_peer_id)] = last_id
 
                 if updated_any:
                     self._save_last_msg_ids()
 
                 self._finalize_ready_sessions()
+
+                # persist captcha_until changes relatively quickly
+                self.save_config()
 
                 time.sleep(self.poll_interval)
 
@@ -819,7 +847,6 @@ class MultiTokenBot:
                     finalized=False,
                 )
                 self.sessions[session_key] = s
-
             s.sightings[token.id] = (source_peer_id, conv_msg_id)
 
     def _finalize_ready_sessions(self):
@@ -836,16 +863,13 @@ class MultiTokenBot:
         for s in to_finalize:
             threading.Thread(target=self._process_session, args=(s,), daemon=True).start()
 
-    # -------------------------
-    # Core logic: distribute letters across tokens
-    # -------------------------
     def _process_session(self, sess: RequestSession):
-        abilities = sess.abilities[:]  # copy
+        abilities = sess.abilities[:]
         assigned: Dict[str, str] = {}
 
         tokens_with_sighting: List[TokenHandler] = []
         for t in self.tokens:
-            if t.id in sess.sightings and t.enabled:
+            if t.id in sess.sightings and t.is_available():
                 tokens_with_sighting.append(t)
 
         if not tokens_with_sighting:
@@ -888,17 +912,12 @@ class MultiTokenBot:
                     continue
 
                 source_peer_id, conv_msg_id = sess.sightings[token.id]
-
                 done2, status = self.executor.execute_one(
                     token=token,
                     ability=ab,
                     source_peer_id=source_peer_id,
                     source_conv_msg_id=conv_msg_id,
                 )
-
-                if status.startswith("COOLDOWN_LOCAL"):
-                    logging.info(f"⏳ [{attempt_idx}] {token.name}: {ab.text} {status}")
-                    continue
 
                 if status == "RACE_NOT_ALLOWED":
                     continue
@@ -916,13 +935,12 @@ class MultiTokenBot:
             if not done:
                 logging.error(f"❌ Session {sess.key}: ability '{ab.key}' not processed")
 
-        self.save_config()
         self._log_stats(sess.sender_id, abilities)
 
     def _candidates_for_ability(self, tokens: List[TokenHandler], ab: ParsedAbility) -> List[TokenHandler]:
         out: List[TokenHandler] = []
         for t in tokens:
-            if not t.enabled:
+            if not t.is_available():
                 continue
 
             class_data = CLASS_ABILITIES.get(t.class_type)
@@ -942,6 +960,7 @@ class MultiTokenBot:
 
             out.append(t)
 
+        # Prefer more voices, then random
         out.sort(key=lambda x: (x.voices, random.random()), reverse=True)
         return out
 
