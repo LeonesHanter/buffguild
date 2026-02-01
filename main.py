@@ -9,6 +9,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -139,6 +140,31 @@ def now_ts() -> int:
     return int(time.time())
 
 
+# ===== TEMPORARY RACES =====
+class TemporaryRace:
+    def __init__(self, race_key: str, expires_at: int):
+        self.race_key = race_key
+        self.expires_at = expires_at  # timestamp
+    
+    def is_expired(self) -> bool:
+        return time.time() > self.expires_at
+    
+    def get_remaining_time(self) -> int:
+        remaining = self.expires_at - time.time()
+        return max(0, int(remaining))
+    
+    def format_remaining(self) -> str:
+        remaining = self.get_remaining_time()
+        if remaining >= 3600:
+            hours = remaining // 3600
+            minutes = (remaining % 3600) // 60
+            return f"{hours}ч{minutes}м"
+        else:
+            minutes = remaining // 60
+            seconds = remaining % 60
+            return f"{minutes}м{seconds}с"
+
+
 # ===== VK ASYNC CLIENT =====
 class VKAsyncClient:
     def __init__(self):
@@ -221,6 +247,16 @@ class TokenHandler:
         self.enabled: bool = bool(cfg.get("enabled", True))
         self.races: List[str] = list(cfg.get("races", []))
 
+        # временные расы
+        self.temp_races: List[Dict[str, Any]] = []
+        temp_races_cfg = cfg.get("temp_races", [])
+        for tr in temp_races_cfg:
+            if isinstance(tr, dict) and "race" in tr and "expires" in tr:
+                self.temp_races.append({
+                    "race": tr["race"],
+                    "expires": int(tr["expires"])
+                })
+
         self.captcha_until: int = int(cfg.get("captcha_until", 0))
         self.level: int = int(cfg.get("level", 0))
 
@@ -229,6 +265,7 @@ class TokenHandler:
         self.next_virtual_grant_ts: int = int(cfg.get("next_virtual_grant_ts", 0))
 
         self._ability_cd: Dict[str, float] = {}
+        self._last_temp_race_cleanup: float = 0.0
 
     def fetch_owner_id_lazy(self) -> int:
         """Лениво определяем owner_vk_id через users.get (делаем это только по необходимости)."""
@@ -272,7 +309,89 @@ class TokenHandler:
         self._ability_cd[ability_key] = time.time() + int(cooldown_seconds)
 
     def has_race(self, race_key: str) -> bool:
-        return race_key in self.races
+        """Проверяет наличие расы (включая временные)"""
+        # Основные расы
+        if race_key in self.races:
+            return True
+        
+        # Временные расы
+        self._cleanup_expired_temp_races()
+        for tr in self.temp_races:
+            if tr["race"] == race_key:
+                return True
+        
+        return False
+
+    def get_all_races_display(self) -> str:
+        """Возвращает строку для отображения всех рас (основные + временные)"""
+        self._cleanup_expired_temp_races()
+        
+        # Основные расы
+        base_races = "/".join(sorted(self.races)) if self.races else ""
+        
+        # Временные расы
+        temp_parts = []
+        for tr in self.temp_races:
+            remaining = int(tr["expires"] - time.time())
+            if remaining > 0:
+                if remaining >= 3600:
+                    hours = remaining // 3600
+                    minutes = (remaining % 3600) // 60
+                    time_str = f"{hours}ч{minutes}м"
+                else:
+                    minutes = remaining // 60
+                    seconds = remaining % 60
+                    time_str = f"{minutes}м{seconds}с"
+                temp_parts.append(f"{tr['race']}-({time_str})")
+        
+        # Комбинируем
+        result_parts = []
+        if base_races:
+            result_parts.append(base_races)
+        if temp_parts:
+            result_parts.append("/".join(temp_parts))
+        
+        return "/".join(result_parts) if result_parts else "-"
+
+    def add_temporary_race(self, race_key: str, duration_hours: int = 2) -> bool:
+        """Добавляет временную расу на указанное количество часов"""
+        if race_key not in RACE_NAMES:
+            return False
+        
+        self._cleanup_expired_temp_races()
+        
+        # Проверяем уже есть ли такая раса (основная или временная)
+        if self.has_race(race_key):
+            return False
+        
+        # Добавляем временную расу
+        expires_at = int(time.time() + duration_hours * 3600)
+        self.temp_races.append({
+            "race": race_key,
+            "expires": expires_at
+        })
+        
+        # Сохраняем в конфиг
+        self._manager.save()
+        
+        logging.info(f"🎯 {self.name}: добавлена временная раса '{race_key}' на {duration_hours} часов (до {datetime.fromtimestamp(expires_at).strftime('%H:%M:%S')})")
+        return True
+
+    def _cleanup_expired_temp_races(self) -> None:
+        """Удаляет просроченные временные расы"""
+        now = time.time()
+        # Делаем cleanup не чаще чем раз в 5 минут
+        if now - self._last_temp_race_cleanup < 300:
+            return
+        
+        original_count = len(self.temp_races)
+        self.temp_races = [tr for tr in self.temp_races if tr["expires"] > now]
+        
+        if len(self.temp_races) != original_count:
+            self._manager.save()
+            logging.info(f"🧹 {self.name}: очищены просроченные временные расы")
+        
+        self._last_temp_race_cleanup = now
 
     def mark_real_voices_received(self) -> None:
         if self.needs_manual_voices or self.virtual_voice_grants or self.next_virtual_grant_ts:
@@ -462,6 +581,7 @@ class TokenManager:
                     "voices": t.voices,
                     "enabled": t.enabled,
                     "races": t.races,
+                    "temp_races": t.temp_races,  # сохраняем временные расы
                     "captcha_until": t.captcha_until,
                     "level": t.level,
                     "needs_manual_voices": t.needs_manual_voices,
@@ -486,6 +606,15 @@ class TokenManager:
         name_n = normalize_text(name)
         for t in self.tokens:
             if normalize_text(t.name) == name_n:
+                return t
+        return None
+
+    def get_token_by_sender_id(self, sender_id: int) -> Optional[TokenHandler]:
+        """Находит токен по ID отправителя (сравнивает owner_vk_id)"""
+        for t in self.tokens:
+            if t.owner_vk_id == 0:
+                t.fetch_owner_id_lazy()
+            if t.owner_vk_id == sender_id:
                 return t
         return None
 
@@ -762,6 +891,7 @@ class Scheduler:
 
             if t.class_type == "apostle" and ability.key in RACE_NAMES:
                 if not t.has_race(ability.key):
+                    # Попробуем добавить временную расу если это апостол и отправитель команды !баф
                     continue
 
             if ability.uses_voices and t.voices <= 0:
@@ -926,6 +1056,23 @@ class ObserverBot:
     def _is_apo_cmd(self, text: str) -> bool:
         return normalize_text(text).startswith("!апо")
 
+    def _parse_doprasa_cmd(self, text: str) -> Optional[Tuple[str, str]]:
+        """Парсит команду /допраса"""
+        t = (text or "").strip()
+        if not normalize_text(t).startswith("/допраса"):
+            return None
+        
+        # Убираем команду и разделяем
+        parts = t.split()
+        if len(parts) != 2:
+            return None
+        
+        race = parts[1].strip().lower()
+        if race not in RACE_NAMES:
+            return None
+        
+        return race, text  # возвращаем расу и оригинальный текст
+
     def _format_apo_status(self) -> str:
         apostles = [t for t in self.tm.all_buffers() if t.class_type == "apostle"]
         warlocks = [t for t in self.tm.all_buffers() if t.class_type == "warlock"]
@@ -935,7 +1082,7 @@ class ObserverBot:
         if apostles:
             lines.append("Апостолы:")
             for t in apostles:
-                races = "/".join(t.races) if t.races else "-"
+                races = t.get_all_races_display()
                 extra = " (manual)" if t.needs_manual_voices else ""
                 lines.append(f"{t.name}({races}) 🗣Голосов: {t.voices}{extra}")
             lines.append("")
@@ -980,6 +1127,35 @@ class ObserverBot:
             return f"❌ Токен с именем '{name}' не найден."
         token.update_voices_manual(n)
         return f"✅ {token.name}: голоса выставлены = {n}"
+
+    def _apply_doprasa_by_sender(self, sender_id: int, race_key: str, original_text: str) -> str:
+        """Добавляет временную расу для апостола по ID отправителя"""
+        # Находим токен по sender_id
+        token = self.tm.get_token_by_sender_id(sender_id)
+        if not token:
+            return f"❌ Апостол с вашим ID ({sender_id}) не найден в системе."
+        
+        if token.class_type != "apostle":
+            return f"❌ Токен {token.name} не является апостолом."
+        
+        # Проверяем что такая раса существует
+        if race_key not in RACE_NAMES:
+            return f"❌ Неизвестная раса '{race_key}'. Доступные: {', '.join(RACE_NAMES.keys())}"
+        
+        # Проверяем что такой расы еще нет
+        if token.has_race(race_key):
+            race_name = RACE_NAMES.get(race_key, race_key)
+            return f"⚠️ У {token.name} уже есть раса '{race_name}'."
+        
+        # Добавляем временную расу на 2 часа
+        success = token.add_temporary_race(race_key, duration_hours=2)
+        if success:
+            race_name = RACE_NAMES.get(race_key, race_key)
+            expires_at = token.temp_races[-1]["expires"]
+            expires_time = datetime.fromtimestamp(expires_at).strftime('%H:%M')
+            return f"✅ {token.name}: добавлена временная раса '{race_name}' до {expires_time}"
+        else:
+            return f"❌ Не удалось добавить расу для {token.name}."
 
     def _lp_get_server(self) -> bool:
         data = {
@@ -1043,6 +1219,14 @@ class ObserverBot:
             self.observer.send_to_peer(self.observer.source_peer_id, status, None)
             return
 
+        # /допраса <раса> - добавление временной расы
+        doprasa = self._parse_doprasa_cmd(text)
+        if doprasa is not None:
+            race_key, original_text = doprasa
+            response = self._apply_doprasa_by_sender(from_id, race_key, original_text)
+            self.observer.send_to_peer(self.observer.source_peer_id, response, None)
+            return
+
         # !голоса <name> <N>
         parsed = self._parse_golosa_cmd(text)
         if parsed is not None:
@@ -1069,6 +1253,18 @@ class ObserverBot:
         # !баф
         letters = self._parse_baf_letters(text)
         if letters:
+            # Проверяем, не нужно ли добавить временные расы для расовых баффов
+            for letter in letters:
+                if letter in RACE_NAMES:
+                    # Находим апостола по ID отправителя
+                    token = self.tm.get_token_by_sender_id(from_id)
+                    if token and token.class_type == "apostle":
+                        # Если у апостола нет такой расы, добавляем временную
+                        if not token.has_race(letter):
+                            token.add_temporary_race(letter, duration_hours=2)
+                            race_name = RACE_NAMES.get(letter, letter)
+                            logging.info(f"🎯 Автоматически добавлена временная раса '{race_name}' для {token.name} по команде !баф")
+            
             job = Job(
                 sender_id=from_id,
                 trigger_text=text,
@@ -1177,6 +1373,7 @@ def main():
                             "voices": 0,
                             "enabled": True,
                             "races": [],
+                            "temp_races": [],
                             "captcha_until": 0
                         }
                     ]
