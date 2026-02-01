@@ -3,6 +3,7 @@ import asyncio
 import aiohttp
 import json
 import logging
+import os
 import random
 import re
 import threading
@@ -51,7 +52,6 @@ RACE_NAMES = {
     "о": "орк",
 }
 
-# warlock: убрано полностью "р": "расы" и "с": "судьбы"
 CLASS_ABILITIES: Dict[str, Dict[str, Any]] = {
     "apostle": {
         "name": "Апостол",
@@ -106,14 +106,11 @@ CLASS_ABILITIES: Dict[str, Dict[str, Any]] = {
 
 # ===== RESULT REGEX =====
 RE_SUCCESS = re.compile(r"(на вас наложено|на Вас наложено|наложено благословение)", re.IGNORECASE)
-
 RE_ALREADY = re.compile(
-    r"(уже действует такое благословение|нельзя наложить благословение уже имеющейся у цели расы)",
+    r"(на эту цель уже действует такое благословение|нельзя наложить благословение уже имеющейся у цели расы)",
     re.IGNORECASE,
 )
-
 RE_NO_VOICES = re.compile(r"(требуется голос|голос древних|нет голосов)", re.IGNORECASE)
-
 RE_COOLDOWN = re.compile(
     r"(социальные эффекты можно накладывать только через определенное время|Оставшееся время:\s*\d+\s*сек)",
     re.IGNORECASE,
@@ -160,19 +157,25 @@ class VKAsyncClient:
         self._loop.run_forever()
 
     async def _init(self):
-        timeout = aiohttp.ClientTimeout(total=15)
-        connector = aiohttp.TCPConnector(limit=100, ttl_dns_cache=300)
+        timeout = aiohttp.ClientTimeout(total=20)
+        connector = aiohttp.TCPConnector(limit=150, ttl_dns_cache=300)
         self._session = aiohttp.ClientSession(timeout=timeout, connector=connector)
 
     def call(self, coro):
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return fut.result(timeout=25)
+        return fut.result(timeout=30)
 
     async def post(self, method: str, data: Dict[str, Any]) -> Dict[str, Any]:
         if not self._session:
             raise RuntimeError("VK session not ready")
         url = f"{VK_API_BASE}/{method}"
         async with self._session.post(url, data=data) as resp:
+            return await resp.json()
+
+    async def get(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        if not self._session:
+            raise RuntimeError("VK session not ready")
+        async with self._session.get(url, params=params) as resp:
             return await resp.json()
 
 
@@ -203,6 +206,12 @@ class TokenHandler:
         self.class_type: str = cfg.get("class", "apostle")
         self.access_token: str = cfg.get("access_token", "")
 
+        self._vk = vk
+        self._manager = manager
+
+        # owner_vk_id: лениво (НЕ автодетектим на старте)
+        self.owner_vk_id: int = int(cfg.get("owner_vk_id", 0))
+
         self.source_chat_id: int = int(cfg.get("source_chat_id", 0))
         self.target_peer_id: int = int(cfg.get("target_peer_id", 0))
         self.source_peer_id: int = 2000000000 + self.source_chat_id if self.source_chat_id else 0
@@ -212,19 +221,33 @@ class TokenHandler:
         self.races: List[str] = list(cfg.get("races", []))
 
         self.captcha_until: int = int(cfg.get("captcha_until", 0))
-
-        # paladin extra
         self.level: int = int(cfg.get("level", 0))
 
-        # авто/виртуальное восстановление
         self.needs_manual_voices: bool = bool(cfg.get("needs_manual_voices", False))
         self.virtual_voice_grants: int = int(cfg.get("virtual_voice_grants", 0))
         self.next_virtual_grant_ts: int = int(cfg.get("next_virtual_grant_ts", 0))
 
         self._ability_cd: Dict[str, float] = {}
 
-        self._vk = vk
-        self._manager = manager
+    def fetch_owner_id_lazy(self) -> int:
+        """Лениво определяем owner_vk_id через users.get (делаем это только по необходимости)."""
+        if self.owner_vk_id != 0:
+            return self.owner_vk_id
+        if not self.access_token:
+            logging.warning(f"⚠️ {self.name}: cannot detect owner_vk_id - access_token empty")
+            return 0
+        try:
+            data = {"access_token": self.access_token, "v": VK_API_VERSION}
+            ret = self._vk.call(self._vk.post("users.get", data))
+            if "response" in ret and ret["response"]:
+                uid = int(ret["response"][0]["id"])
+                self.owner_vk_id = uid
+                self._manager.save()
+                logging.info(f"📌 {self.name}: lazy owner_vk_id={uid}")
+                return uid
+        except Exception as e:
+            logging.error(f"❌ {self.name}: lazy owner_vk_id failed: {e}")
+        return 0
 
     def class_name(self) -> str:
         return CLASS_ABILITIES.get(self.class_type, {}).get("name", self.class_type)
@@ -290,7 +313,6 @@ class TokenHandler:
             self._manager.save()
             logging.info(f"💀 {self.name}: level {old} → {lvl}")
 
-    # ---- VK ----
     async def _messages_get_history(self, peer_id: int, count: int = 20) -> Dict[str, Any]:
         data = {
             "access_token": self.access_token,
@@ -310,6 +332,26 @@ class TokenHandler:
             return ret.get("response", {}).get("items", []) or []
         except Exception as e:
             logging.error(f"❌ {self.name}: getHistory exception {e}")
+            return []
+
+    async def _messages_get_by_id(self, message_ids: List[int]) -> Dict[str, Any]:
+        data = {
+            "access_token": self.access_token,
+            "v": VK_API_VERSION,
+            "message_ids": ",".join(str(int(x)) for x in message_ids),
+        }
+        return await self._vk.post("messages.getById", data)
+
+    def get_by_id(self, message_ids: List[int]) -> List[Dict[str, Any]]:
+        try:
+            ret = self._vk.call(self._messages_get_by_id(message_ids))
+            if "error" in ret:
+                err = ret["error"]
+                logging.error(f"❌ {self.name}: getById error {err.get('error_code')} {err.get('error_msg')}")
+                return []
+            return ret.get("response", {}).get("items", []) or []
+        except Exception as e:
+            logging.error(f"❌ {self.name}: getById exception {e}")
             return []
 
     async def _messages_send(self, peer_id: int, text: str, forward_msg_id: Optional[int] = None) -> Dict[str, Any]:
@@ -413,6 +455,7 @@ class TokenManager:
                     "name": t.name,
                     "class": t.class_type,
                     "access_token": t.access_token,
+                    "owner_vk_id": t.owner_vk_id,
                     "source_chat_id": t.source_chat_id,
                     "target_peer_id": t.target_peer_id,
                     "voices": t.voices,
@@ -489,7 +532,9 @@ class AbilityExecutor:
         if not want_text:
             return None, None
 
-        msgs = token.get_history(token.source_peer_id, count=60)
+        # ИЗМЕНЕНО: было 60, стало 30 (это 30 последних сообщений)
+        msgs = token.get_history(token.source_peer_id, count=30)
+
         for m in msgs:
             from_id = int(m.get("from_id", 0))
             if from_id != job.sender_id:
@@ -833,7 +878,7 @@ class AutoVoicesRestorer:
                 time.sleep(5)
 
 
-# ===== Observer Bot =====
+# ===== Observer Bot (LONG POLL) =====
 class ObserverBot:
     def __init__(self, tm: TokenManager, executor: AbilityExecutor):
         self.tm = tm
@@ -843,16 +888,23 @@ class ObserverBot:
         self.observer = tm.get_observer()
         if not self.observer.access_token:
             raise RuntimeError("Observer token has empty access_token")
+        if not self.observer.source_peer_id:
+            raise RuntimeError("Observer source_chat_id is missing")
 
+        # Эти настройки остаются для target polling
         self.poll_interval = float(tm.settings.get("poll_interval", 2.0))
         self.poll_count = int(tm.settings.get("poll_count", 20))
 
-        self._last_seen: int = 0
-
-        logging.info("🤖 MultiTokenBot STARTED")
-        logging.info(f"🛰️ Poll interval: {self.poll_interval}s, poll_count={self.poll_count}")
+        logging.info("🤖 MultiTokenBot STARTED (Observer=LongPoll)")
+        logging.info(f"📋 Tokens: {len(tm.tokens)}")
+        logging.info(f"🛰️ Target poll: interval={self.poll_interval}s, count={self.poll_count}")
 
         AutoVoicesRestorer(tm, executor)
+
+        # LongPoll state
+        self._lp_server: str = ""
+        self._lp_key: str = ""
+        self._lp_ts: str = ""
 
     def _parse_baf_letters(self, text: str) -> str:
         text_n = normalize_text(text)
@@ -861,7 +913,7 @@ class ObserverBot:
         s = text_n[4:].strip()
         if not s:
             return ""
-        s = s[:4]  # строго 4 буквы
+        s = s[:4]
 
         allowed = set()
         for cls in CLASS_ABILITIES.values():
@@ -906,24 +958,17 @@ class ObserverBot:
         return "\n".join(lines).strip()
 
     def _parse_golosa_cmd(self, text: str) -> Optional[Tuple[str, int]]:
-        """
-        !голоса <name> <N>
-        пример: !голоса Lina 15
-        """
         t = (text or "").strip()
         if not normalize_text(t).startswith("!голоса"):
             return None
-
         parts = t.split()
         if len(parts) != 3:
             return None
-
         name = parts[1].strip()
         try:
             n = int(parts[2].strip())
         except Exception:
             return None
-
         if not name:
             return None
         return name, max(0, n)
@@ -931,71 +976,209 @@ class ObserverBot:
     def _apply_manual_voices_by_name(self, name: str, n: int) -> str:
         token = self.tm.get_token_by_name(name)
         if not token:
-            return f"❌ Токен с именем '{name}' не найден в config.json"
-
+            return f"❌ Токен с именем '{name}' не найден."
         token.update_voices_manual(n)
         return f"✅ {token.name}: голоса выставлены = {n}"
 
-    def run(self):
-        if not self.observer.source_peer_id:
-            raise RuntimeError("Observer source_chat_id is missing")
+    def _lp_get_server(self) -> bool:
+        data = {
+            "access_token": self.observer.access_token,
+            "v": VK_API_VERSION,
+            "lp_version": 3,
+        }
+        ret = self.observer._vk.call(self.observer._vk.post("messages.getLongPollServer", data))
+        if "error" in ret:
+            err = ret["error"]
+            logging.error(f"❌ LongPollServer error {err.get('error_code')} {err.get('error_msg')}")
+            return False
+        resp = ret.get("response", {})
+        self._lp_server = str(resp.get("server", "")).strip()
+        self._lp_key = str(resp.get("key", "")).strip()
+        self._lp_ts = str(resp.get("ts", "")).strip()
+        if not self._lp_server or not self._lp_key or not self._lp_ts:
+            logging.error("❌ LongPollServer: missing server/key/ts")
+            return False
+        return True
 
-        init = self.observer.get_history(self.observer.source_peer_id, count=1)
-        self._last_seen = init[0]["id"] if init else 0
+    def _lp_check(self) -> Optional[Dict[str, Any]]:
+        server = self._lp_server
+        if not server.startswith("http"):
+            server = "https://" + server.lstrip("/")
+
+        params = {
+            "act": "a_check",
+            "key": self._lp_key,
+            "ts": self._lp_ts,
+            "wait": 25,
+            "mode": 2,
+            "version": 3,
+        }
+        try:
+            ret = self.observer._vk.call(self.observer._vk.get(server, params))
+            return ret
+        except Exception as e:
+            logging.error(f"❌ LongPoll a_check exception: {e}")
+            return None
+
+    def _handle_new_message(self, msg_item: Dict[str, Any]) -> None:
+        text = (msg_item.get("text") or "").strip()
+        from_id = int(msg_item.get("from_id", 0))
+        peer_id = int(msg_item.get("peer_id", 0))
+        mid = int(msg_item.get("id", 0))
+
+        if peer_id != self.observer.source_peer_id:
+            return
+        if from_id <= 0:
+            return
+        if not text:
+            return
+
+        # !апо
+        if self._is_apo_cmd(text):
+            status = self._format_apo_status()
+            self.observer.send_to_peer(self.observer.source_peer_id, status, None)
+            return
+
+        # !голоса <name> <N>
+        parsed = self._parse_golosa_cmd(text)
+        if parsed is not None:
+            name, n = parsed
+            token = self.tm.get_token_by_name(name)
+            if not token:
+                self.observer.send_to_peer(self.observer.source_peer_id, f"❌ Токен с именем '{name}' не найден.", None)
+                return
+
+            # ленивый автодетект owner_vk_id
+            if token.owner_vk_id == 0:
+                token.fetch_owner_id_lazy()
+
+            if token.owner_vk_id != 0 and token.owner_vk_id != from_id:
+                logging.warning(
+                    f"⚠️ Unauthorized !голоса by {from_id} for token {token.name} (owner={token.owner_vk_id})"
+                )
+                return
+
+            reply = self._apply_manual_voices_by_name(name, n)
+            self.observer.send_to_peer(self.observer.source_peer_id, reply, None)
+            return
+
+        # !баф
+        letters = self._parse_baf_letters(text)
+        if letters:
+            job = Job(
+                sender_id=from_id,
+                trigger_text=text,
+                letters=letters,
+                created_ts=time.time(),
+            )
+            logging.info(f"🎯 !баф from {from_id}: {letters} [observer={self.observer.name}]")
+            self.scheduler.enqueue_letters(job, letters)
+
+    def run(self):
+        if not self._lp_get_server():
+            raise RuntimeError("Failed to init long poll server")
 
         while True:
             try:
-                msgs = self.observer.get_history(self.observer.source_peer_id, count=30)
-                for msg in reversed(msgs):
-                    mid = int(msg.get("id", 0))
-                    if mid <= self._last_seen:
+                lp = self._lp_check()
+                if not lp:
+                    time.sleep(2)
+                    continue
+
+                # возможные ответы: {"ts": "...", "updates": [...]}
+                # или {"failed": 1/2/3, ...}
+                if "failed" in lp:
+                    failed = int(lp.get("failed", 0))
+                    if failed in (1, 2):
+                        # 1: ts out of date, 2: key expired
+                        logging.warning(f"⚠️ LongPoll failed={failed}, re-init server")
+                        self._lp_get_server()
                         continue
-                    self._last_seen = mid
+                    if failed == 3:
+                        logging.warning("⚠️ LongPoll failed=3, full re-init")
+                        self._lp_get_server()
+                        continue
+                    logging.warning(f"⚠️ LongPoll unknown failed={failed}, re-init")
+                    self._lp_get_server()
+                    continue
 
-                    text = (msg.get("text") or "").strip()
-                    from_id = int(msg.get("from_id", 0))
-                    if from_id <= 0:
+                new_ts = lp.get("ts")
+                if new_ts is not None:
+                    self._lp_ts = str(new_ts)
+
+                updates = lp.get("updates", []) or []
+                if not updates:
+                    continue
+
+                # LP v3: new message event is type=4
+                # update: [4, msg_id, flags, peer_id, ts, text, ...]
+                msg_ids: List[int] = []
+                for u in updates:
+                    if not isinstance(u, list) or not u:
+                        continue
+                    if int(u[0]) != 4:
+                        continue
+                    try:
+                        msg_id = int(u[1])
+                        peer_id = int(u[3])
+                    except Exception:
                         continue
 
-                    # !апо
-                    if self._is_apo_cmd(text):
-                        status = self._format_apo_status()
-                        self.observer.send_to_peer(self.observer.source_peer_id, status, None)
-                        continue
+                    if peer_id == self.observer.source_peer_id:
+                        msg_ids.append(msg_id)
 
-                    # !голоса <name> <N>
-                    parsed = self._parse_golosa_cmd(text)
-                    if parsed is not None:
-                        name, n = parsed
-                        reply = self._apply_manual_voices_by_name(name, n)
-                        self.observer.send_to_peer(self.observer.source_peer_id, reply, None)
-                        continue
+                if not msg_ids:
+                    continue
 
-                    # !баф
-                    letters = self._parse_baf_letters(text)
-                    if letters:
-                        job = Job(
-                            sender_id=from_id,
-                            trigger_text=text,
-                            letters=letters,
-                            created_ts=time.time(),
-                        )
-                        logging.info(f"🎯 !баф from {from_id}: {letters} [observer={self.observer.name}]")
-                        self.scheduler.enqueue_letters(job, letters)
-
-                time.sleep(self.poll_interval)
+                # ВАЖНО: LP не даёт from_id, поэтому берём точные данные через getById
+                items = self.observer.get_by_id(msg_ids)
+                for it in items:
+                    self._handle_new_message(it)
 
             except Exception as e:
-                logging.error(f"❌ Observer loop error: {e}")
-                time.sleep(3)
+                logging.error(f"❌ Observer longpoll loop error: {e}", exc_info=True)
+                time.sleep(2)
 
 
 # ===== main =====
 def main():
-    vk = VKAsyncClient()
-    tm = TokenManager("config.json", vk)
-    executor = AbilityExecutor(tm)
-    ObserverBot(tm, executor).run()
+    try:
+        vk = VKAsyncClient()
+        tm = TokenManager("config.json", vk)
+        executor = AbilityExecutor(tm)
+        ObserverBot(tm, executor).run()
+
+    except (FileNotFoundError, json.JSONDecodeError):
+        logging.error("❌ config.json не найден или содержит ошибку. Пожалуйста, создайте/исправьте файл.")
+        if not os.path.exists("config.json"):
+            with open("config.json", "w", encoding="utf-8") as f:
+                template = {
+                    "observer_token_id": "main_observer",
+                    "settings": {
+                        "poll_interval": 2.0,
+                        "poll_count": 20
+                    },
+                    "tokens": [
+                        {
+                            "id": "main_observer",
+                            "name": "Observer",
+                            "class": "observer",
+                            "access_token": "vk1.a.YOUR_TOKEN",
+                            "owner_vk_id": 0,
+                            "source_chat_id": 12345,
+                            "target_peer_id": -183040898,
+                            "voices": 0,
+                            "enabled": True,
+                            "races": [],
+                            "captcha_until": 0
+                        }
+                    ]
+                }
+                json.dump(template, f, ensure_ascii=False, indent=2)
+            logging.info("📄 Создан шаблон config.json. Заполните токены и observer_token_id.")
+
+    except Exception as e:
+        logging.critical(f"💥 Критическая ошибка при запуске: {e}", exc_info=True)
 
 
 if __name__ == "__main__":
