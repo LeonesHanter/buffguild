@@ -116,6 +116,7 @@ RE_COOLDOWN = re.compile(
     r"(социальные эффекты можно накладывать только через определенное время|Оставшееся время:\s*\d+\s*сек)",
     re.IGNORECASE,
 )
+RE_NOT_APOSTLE = re.compile(r"не являетесь апостолом этой расы", re.IGNORECASE)
 RE_REMAINING_SEC = re.compile(r"Оставшееся время:\s*(\d+)\s*сек", re.IGNORECASE)
 
 # голоса из системных сообщений
@@ -124,7 +125,7 @@ RE_VOICES_WAR = re.compile(r"Голос у проклинающего:\s*(\d+)",
 RE_VOICES_PAL = re.compile(r"Голос у Паладина:\s*(\d+)", re.IGNORECASE)
 
 # профиль
-RE_PROFILE_VOICES = re.compile(r"👤Класс:\s*([а-яA-Za-z_]+)\s*\((\d+)\)\s*,\s*(.+)", re.IGNORECASE)
+RE_PROFILE_VOICES = re.compile(r"👤Класс:\s*([а-яА-Я\s]+?)\s*\((\d+)\)\s*[,\-]\s*(.+)", re.IGNORECASE)
 RE_PROFILE_LEVEL = re.compile(r"💀Уровень:\s*(\d+)", re.IGNORECASE)
 
 # ===== UTILS =====
@@ -566,6 +567,12 @@ class TokenManager:
 
         logging.info(f"📋 Tokens: {len(self.tokens)}")
 
+    def reload(self) -> None:
+        """Перезагрузить конфигурацию на лету"""
+        with self._lock:
+            self.load()
+            logging.info("🔄 TokenManager: конфигурация перезагружена")
+
     def save(self) -> None:
         with self._lock:
             payload_tokens = []
@@ -701,6 +708,11 @@ class AbilityExecutor:
 
         for m in msgs:
             text = str(m.get("text", "")).strip()
+            
+            # Сначала проверяем NOT_APOSTLE
+            if RE_NOT_APOSTLE.search(text):
+                return "NOT_APOSTLE", remaining, voices_val
+            
             if RE_SUCCESS.search(text):
                 return "SUCCESS", remaining, voices_val
             if RE_ALREADY.search(text):
@@ -759,6 +771,22 @@ class AbilityExecutor:
                 if voices_val is not None:
                     token.update_voices_from_system(voices_val)
 
+                if status == "NOT_APOSTLE":
+                    # Удаляем ТОЛЬКО временную расу у этого апостола
+                    if ability.key in RACE_NAMES:
+                        # Удаляем из временных рас
+                        original_count = len(token.temp_races)
+                        token.temp_races = [tr for tr in token.temp_races if tr["race"] != ability.key]
+                        if len(token.temp_races) != original_count:
+                            token._manager.save()
+                            logging.warning(f"🗑️ {token.name}: удалена временная раса '{ability.key}' (NOT_APOSTLE)")
+                    
+                    # НЕ удаляем из основных рас! Основные расы остаются
+                    
+                    # Устанавливаем кулдаун, чтобы не пытаться снова сразу
+                    token.set_ability_cooldown(ability.key, 300)  # 5 минут кулдаун
+                    return False, "NOT_APOSTLE"
+
                 if status == "SUCCESS":
                     ability.processed = True
                     token.set_ability_cooldown(ability.key, ability.cooldown)
@@ -789,48 +817,63 @@ class AbilityExecutor:
             return False, "UNKNOWN"
 
     def refresh_profile(self, token: TokenHandler) -> bool:
+        """Отправляет 'Мой профиль' и парсит ответ для апостолов"""
         if not token.enabled or token.is_captcha_paused() or token.needs_manual_voices:
             return False
 
+        # Сохраняем текущий ID последнего сообщения
+        history_before = token.get_history(token.target_peer_id, count=1)
+        last_id_before = history_before[0]["id"] if history_before else 0
+
+        # Отправляем "Мой профиль"
         ok, _ = token.send_to_peer(token.target_peer_id, "Мой профиль", None)
         if not ok:
             return False
 
-        time.sleep(2.5)
+        # Ждем ответа
+        time.sleep(3.0)
+        
+        # Получаем новые сообщения
         history = token.get_history(token.target_peer_id, count=25)
-        if not history:
+        new_msgs = [m for m in history if int(m.get("id", 0)) > last_id_before]
+        
+        if not new_msgs:
             return False
 
+        # Парсим голоса из профиля
         got_voices = False
-
-        for m in history:
+        for m in reversed(new_msgs):  # Читаем с конца
             text = str(m.get("text", "")).strip()
-
+            
+            # Парсим строку типа: "👤Класс: Апостол (22) , человек/эльф"
             pm = RE_PROFILE_VOICES.search(text)
             if pm:
                 try:
-                    v = int(pm.group(2))
-                    token.update_voices_from_system(v)
-                    got_voices = (v > 0)
-                except Exception:
-                    pass
-
-                races_part = (pm.group(3) or "").strip().lower()
-                found = []
-                for k, name in RACE_NAMES.items():
-                    if name in races_part:
-                        found.append(k)
-                if found and token.class_type == "apostle":
-                    token.races = sorted(list(set(found)))
-                    token._manager.save()
-
-            lm = RE_PROFILE_LEVEL.search(text)
-            if lm and token.class_type in ("crusader", "light_incarnation"):
-                try:
-                    token.update_level(int(lm.group(1)))
-                except Exception:
-                    pass
-
+                    class_name = pm.group(1)  # "Апостол"
+                    voices = int(pm.group(2))  # 22
+                    races_str = pm.group(3)    # "человек/эльф"
+                    
+                    token.update_voices_from_system(voices)
+                    got_voices = (voices > 0)
+                    
+                    # Обновляем расы для апостола
+                    if token.class_type == "apostle":
+                        found_races = []
+                        for key, name in RACE_NAMES.items():
+                            if name in races_str.lower():
+                                found_races.append(key)
+                        
+                        if found_races:
+                            token.races = sorted(list(set(found_races)))
+                            token._manager.save()
+                            logging.info(f"🎯 {token.name}: обновлены расы: {token.races}")
+                    
+                    logging.info(f"📊 {token.name}: профиль - {class_name}({voices}), расы: {races_str}")
+                    break  # Нашли профиль, дальше не ищем
+                    
+                except Exception as e:
+                    logging.error(f"❌ {token.name}: ошибка парсинга профиля: {e}")
+        
         return got_voices
 
 
@@ -873,8 +916,10 @@ class Scheduler:
                 return ParsedAbility(letter, txt, cd, cls, uses_voices)
         return None
 
-    def _candidates_for_ability(self, ability: ParsedAbility) -> List[TokenHandler]:
-        out: List[TokenHandler] = []
+    def _candidates_for_ability(self, ability: ParsedAbility, job: Optional[Job] = None) -> List[TokenHandler]:
+        candidates: List[TokenHandler] = []
+        
+        # 1. Фильтр по классу и способности
         for t in self.tm.all_buffers():
             if not t.enabled:
                 continue
@@ -883,28 +928,45 @@ class Scheduler:
             if t.needs_manual_voices:
                 continue
 
+            # Фильтр по классу
             class_data = CLASS_ABILITIES.get(t.class_type)
             if not class_data:
                 continue
             if ability.key not in class_data["abilities"]:
                 continue
 
-            if t.class_type == "apostle" and ability.key in RACE_NAMES:
-                if not t.has_race(ability.key):
-                    # Попробуем добавить временную расу если это апостол и отправитель команды !баф
-                    continue
-
+            # Фильтр по голосам (для способностей, требующих голоса)
             if ability.uses_voices and t.voices <= 0:
                 continue
 
+            # Фильтр по локальному КД
             can, _ = t.can_use_ability(ability.key)
             if not can:
                 continue
 
-            out.append(t)
+            # Фильтр по расам для апостолов
+            if t.class_type == "apostle" and ability.key in RACE_NAMES:
+                if not t.has_race(ability.key):
+                    # Если у апостола нет такой расы, проверяем, можно ли добавить
+                    if job and t.owner_vk_id == 0:
+                        t.fetch_owner_id_lazy()
+                    
+                    if job and t.owner_vk_id == job.sender_id:
+                        # Это владелец токена - добавляем временную расу
+                        success = t.add_temporary_race(ability.key, duration_hours=2)
+                        if success:
+                            logging.info(f"🎯 Добавлена временная раса '{ability.key}' для {t.name}")
+                        else:
+                            # Не удалось добавить - пропускаем
+                            continue
+                    else:
+                        # Не владелец и нет расы - пропускаем
+                        continue
 
-        random.shuffle(out)
-        return out
+            # Все фильтры пройдены - добавляем в кандидаты
+            candidates.append(t)
+        
+        return candidates
 
     def _run_loop(self):
         while True:
@@ -919,35 +981,45 @@ class Scheduler:
                 logging.warning(f"⚠️ Unknown letter '{letter}'")
                 continue
 
-            candidates = self._candidates_for_ability(ability)
-            if not candidates:
-                self._reschedule(time.time() + 5.0, job, letter)
-                continue
-
-            processed = False
-            last_status = "UNKNOWN"
-
-            for token in candidates:
-                ok, status = self.executor.execute_one(token, ability, job)
-                last_status = status
-
-                if status in ("SUCCESS", "ALREADY"):
-                    processed = True
-                    break
-
-                if status == "TRIGGER_NOT_FOUND_IN_SOURCE":
+            # Пытаемся найти кандидатов для этой буквы
+            success = False
+            
+            for attempt in range(3):  # 3 попытки найти доступного бафера
+                candidates = self._candidates_for_ability(ability, job)
+                
+                if not candidates:
+                    # Нет кандидатов вообще - ждем и пробуем снова
+                    wait_time = 30 * (attempt + 1)  # 30, 60, 90 секунд
+                    logging.info(f"⏳ Нет кандидатов для '{letter}', попытка {attempt+1}/3 через {wait_time}с")
+                    time.sleep(wait_time)
                     continue
-
-            if not processed:
-                delay = 10.0
-                m = re.search(r"\((\d+)s\)", last_status)
-                if m:
-                    try:
-                        sec = int(m.group(1))
-                        delay = max(10.0, float(sec))
-                    except Exception:
-                        pass
-                self._reschedule(time.time() + delay, job, letter)
+                
+                # Выбираем случайного кандидата из прошедших фильтры
+                token = random.choice(candidates)
+                
+                ok, status = self.executor.execute_one(token, ability, job)
+                
+                if ok or status in ("SUCCESS", "ALREADY"):
+                    # Успешно обработали
+                    success = True
+                    break
+                elif status == "NOT_APOSTLE":
+                    # Этот апостол не подходит - удаляем из кандидатов и пробуем снова
+                    logging.warning(f"⚠️ {token.name} не является апостолом расы '{letter}', ищем другого")
+                    continue
+                elif status.startswith("COOLDOWN") or status == "NO_VOICES":
+                    # У этого токена проблемы - пробуем другого кандидата
+                    continue
+                else:
+                    # Другая ошибка - ждем и пробуем снова
+                    wait_time = 10 * (attempt + 1)
+                    logging.warning(f"⚠️ Ошибка для '{letter}': {status}, ждем {wait_time}с")
+                    time.sleep(wait_time)
+            
+            if not success:
+                # Если после 3 попыток не удалось, ставим в очередь на повтор
+                self._reschedule(time.time() + 60.0, job, letter)
+                logging.info(f"⏳ Не удалось обработать '{letter}' после 3 попыток, следующая через 60с")
 
 
 # ===== Auto Voices Restorer =====
@@ -970,35 +1042,48 @@ class AutoVoicesRestorer:
                     if t.needs_manual_voices:
                         continue
 
+                    # ✅ ПРОВЕРЯЕМ ТОЛЬКО ЕСЛИ ГОЛОСОВ 0!
                     if t.voices > 0:
-                        if t.virtual_voice_grants or t.next_virtual_grant_ts:
+                        # Если есть голоса, сбрасываем счетчик виртуальных выдач
+                        if t.virtual_voice_grants > 0 or t.next_virtual_grant_ts > 0:
                             t.virtual_voice_grants = 0
                             t.next_virtual_grant_ts = 0
                             t._manager.save()
                         continue
 
+                    # Проверяем таймер
                     if t.next_virtual_grant_ts and now < t.next_virtual_grant_ts:
                         continue
 
-                    if t.virtual_voice_grants >= 4:
-                        t.needs_manual_voices = True
-                        t._manager.save()
-                        logging.warning(f"🛑 {t.name}: needs_manual_voices=True (auto attempts exhausted)")
-                        continue
-
-                    if t.class_type == "apostle" or t.class_type in ("crusader", "light_incarnation"):
+                    # ЛОГИКА ВОССТАНОВЛЕНИЯ ТОЛЬКО ПРИ 0 ГОЛОСОВ:
+                    if t.class_type == "apostle":
+                        # Для апостолов - "Мой профиль" в target_peer_id (каждые 2 часа)
                         ok = self.executor.refresh_profile(t)
+                        
+                        # Обновляем таймер на 2 часа вперед
+                        t.next_virtual_grant_ts = now + 2 * 60 * 60  # 2 часа
+                        
+                        # Увеличиваем счетчик попыток для статистики
                         t.virtual_voice_grants += 1
-                        t.next_virtual_grant_ts = now + 2 * 60 * 60
                         t._manager.save()
 
                         if ok and t.voices > 0:
                             logging.info(f"✅ {t.name}: voices restored via profile ({t.voices})")
+                            t.virtual_voice_grants = 0  # Сбрасываем счетчик при успехе
+                            t._manager.save()
                         else:
-                            logging.info(f"⏳ {t.name}: profile check done, voices still 0 (attempt {t.virtual_voice_grants}/4)")
+                            logging.info(f"⏳ {t.name}: profile check (attempt {t.virtual_voice_grants}), next in 2h")
+                            
                     else:
+                        # Для проклинающих и паладинов - виртуальные голоса каждые 6 часов (макс 4 раза)
+                        if t.virtual_voice_grants >= 4:
+                            t.needs_manual_voices = True
+                            t._manager.save()
+                            logging.warning(f"🛑 {t.name}: needs_manual_voices=True (auto attempts exhausted)")
+                            continue
+                        
                         t.virtual_voice_grants += 1
-                        t.next_virtual_grant_ts = now + 6 * 60 * 60
+                        t.next_virtual_grant_ts = now + 6 * 60 * 60  # 6 часов
                         t.voices = 1
                         t._manager.save()
                         logging.info(f"🧪 {t.name}: virtual voices grant +1 (attempt {t.virtual_voice_grants}/4)")
@@ -1253,17 +1338,8 @@ class ObserverBot:
         # !баф
         letters = self._parse_baf_letters(text)
         if letters:
-            # Проверяем, не нужно ли добавить временные расы для расовых баффов
-            for letter in letters:
-                if letter in RACE_NAMES:
-                    # Находим апостола по ID отправителя
-                    token = self.tm.get_token_by_sender_id(from_id)
-                    if token and token.class_type == "apostle":
-                        # Если у апостола нет такой расы, добавляем временную
-                        if not token.has_race(letter):
-                            token.add_temporary_race(letter, duration_hours=2)
-                            race_name = RACE_NAMES.get(letter, letter)
-                            logging.info(f"🎯 Автоматически добавлена временная раса '{race_name}' для {token.name} по команде !баф")
+            # УБИРАЕМ автоматическое добавление расы здесь!
+            # Раса будет добавляться только выбранному апостолу в _candidates_for_ability
             
             job = Job(
                 sender_id=from_id,
@@ -1272,7 +1348,9 @@ class ObserverBot:
                 created_ts=time.time(),
             )
             logging.info(f"🎯 !баф from {from_id}: {letters} [observer={self.observer.name}]")
-            self.scheduler.enqueue_letters(job, letters)
+            # Для каждой буквы создаем отдельную задачу
+            for letter in letters:
+                self.scheduler.enqueue_letters(job, letter)
 
     def run(self):
         if not self._lp_get_server():
@@ -1349,7 +1427,34 @@ def main():
         vk = VKAsyncClient()
         tm = TokenManager("config.json", vk)
         executor = AbilityExecutor(tm)
-        ObserverBot(tm, executor).run()
+        observer_bot = ObserverBot(tm, executor)  # ← сохраняем ссылку
+        
+        # Запускаем TG админ-бота в отдельном потоке
+        import threading
+        from telegram_admin import TelegramAdmin
+        
+        def run_telegram_bot():
+            tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+            admin_ids_str = os.getenv("ADMIN_USER_IDS", "")
+            admin_ids = [int(x.strip()) for x in admin_ids_str.split(",") if x.strip()]
+            
+            if tg_token and admin_ids:
+                TelegramAdmin(
+                    telegram_token=tg_token,
+                    admin_ids=admin_ids,
+                    config_path="config.json",
+                    bot_instance=observer_bot  # ← передаем ссылку
+                ).run()
+            else:
+                logging.warning("⚠️ TG бот не запущен: отсутствуют TELEGRAM_BOT_TOKEN или ADMIN_USER_IDS")
+        
+        if os.getenv("TELEGRAM_BOT_TOKEN"):
+            tg_thread = threading.Thread(target=run_telegram_bot, daemon=True)
+            tg_thread.start()
+            logging.info("🤖 Telegram админ-бот запущен в отдельном потоке")
+        
+        # Запускаем основной бот
+        observer_bot.run()
 
     except (FileNotFoundError, json.JSONDecodeError):
         logging.error("❌ config.json не найден или содержит ошибку. Пожалуйста, создайте/исправьте файл.")
@@ -1374,7 +1479,11 @@ def main():
                             "enabled": True,
                             "races": [],
                             "temp_races": [],
-                            "captcha_until": 0
+                            "captcha_until": 0,
+                            "level": 0,
+                            "needs_manual_voices": False,
+                            "virtual_voice_grants": 0,
+                            "next_virtual_grant_ts": 0
                         }
                     ]
                 }
