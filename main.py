@@ -157,7 +157,7 @@ class VKAsyncClient:
         self._loop.run_forever()
 
     async def _init(self):
-        timeout = aiohttp.ClientTimeout(total=20)
+        timeout = aiohttp.ClientTimeout(total=30)
         connector = aiohttp.TCPConnector(limit=150, ttl_dns_cache=300)
         self._session = aiohttp.ClientSession(timeout=timeout, connector=connector)
 
@@ -172,10 +172,11 @@ class VKAsyncClient:
         async with self._session.post(url, data=data) as resp:
             return await resp.json()
 
-    async def get(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    async def raw_post(self, url: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Для LongPoll запросов к отдельным серверам"""
         if not self._session:
             raise RuntimeError("VK session not ready")
-        async with self._session.get(url, params=params) as resp:
+        async with self._session.post(url, data=data) as resp:
             return await resp.json()
 
 
@@ -998,6 +999,7 @@ class ObserverBot:
         if not self._lp_server or not self._lp_key or not self._lp_ts:
             logging.error("❌ LongPollServer: missing server/key/ts")
             return False
+        logging.info(f"✅ LongPoll initialized: server={self._lp_server}, ts={self._lp_ts}")
         return True
 
     def _lp_check(self) -> Optional[Dict[str, Any]]:
@@ -1005,7 +1007,8 @@ class ObserverBot:
         if not server.startswith("http"):
             server = "https://" + server.lstrip("/")
 
-        params = {
+        # Используем raw_post для LongPoll запросов
+        data = {
             "act": "a_check",
             "key": self._lp_key,
             "ts": self._lp_ts,
@@ -1014,10 +1017,11 @@ class ObserverBot:
             "version": 3,
         }
         try:
-            ret = self.observer._vk.call(self.observer._vk.get(server, params))
+            # Используем raw_post вместо post
+            ret = self.observer._vk.call(self.observer._vk.raw_post(server, data))
             return ret
         except Exception as e:
-            logging.error(f"❌ LongPoll a_check exception: {e}")
+            logging.error(f"❌ LongPoll a_check exception: {e}", exc_info=True)
             return None
 
     def _handle_new_message(self, msg_item: Dict[str, Any]) -> None:
@@ -1078,10 +1082,13 @@ class ObserverBot:
         if not self._lp_get_server():
             raise RuntimeError("Failed to init long poll server")
 
+        logging.info(f"✅ LongPoll готов к работе. Начинаю слушать чат {self.observer.source_peer_id}")
+
         while True:
             try:
                 lp = self._lp_check()
                 if not lp:
+                    logging.warning("⚠️ LongPoll check returned None, retrying in 2 seconds...")
                     time.sleep(2)
                     continue
 
