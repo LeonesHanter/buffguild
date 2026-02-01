@@ -36,7 +36,7 @@ logging.basicConfig(
 # Классы персонажей
 CLASS_CHOICES = {
     "apostle": "Апостол",
-    "warlock": "Чернокнижник",
+    "warlock": "Проклинающий",
     "crusader": "Крестоносец",
     "light_incarnation": "Воплощение света",
 }
@@ -61,7 +61,7 @@ class TelegramAdmin:
         self.telegram_token = telegram_token
         self.admin_ids = set(admin_ids)
         self.config_path = config_path
-        self.bot_instance = bot_instance  # Ссылка на MultiTokenBot (опционально)
+        self.bot_instance = bot_instance  # Ссылка на ObserverBot
         self.tmp: Dict[int, Dict[str, Any]] = {}
 
     def is_admin(self, uid: int) -> bool:
@@ -232,12 +232,19 @@ class TelegramAdmin:
             "name": data["name"],
             "class": data["class"],
             "access_token": data["access_token"],
-            "user_id": 0,
+            "owner_vk_id": 0,  # ← ИЗМЕНЕНО: было "user_id": 0
             "source_chat_id": data["source_chat_id"],
             "target_peer_id": target_peer,
-            "voices": 5,
+            "voices": 0,  # ← ИЗМЕНЕНО: было 5
             "enabled": True,
-            "last_check": 0,
+            "races": [],  # ← ДОБАВЛЕНО
+            "temp_races": [],  # ← ДОБАВЛЕНО
+            "captcha_until": 0,  # ← ДОБАВЛЕНО
+            "level": 0,  # ← ДОБАВЛЕНО
+            "needs_manual_voices": False,  # ← ДОБАВЛЕНО
+            "virtual_voice_grants": 0,  # ← ДОБАВЛЕНО
+            "next_virtual_grant_ts": 0,  # ← ДОБАВЛЕНО
+            # УБИРАЕМ "last_check": 0
         }
 
         cfg = self._load()
@@ -245,7 +252,7 @@ class TelegramAdmin:
         cfg.setdefault("settings", {}).setdefault("delay", 2)
         self._save(cfg)
 
-        if self.bot_instance:
+        if self.bot_instance and hasattr(self.bot_instance, 'tm'):
             self.bot_instance.tm.reload()
 
         self.tmp.pop(uid, None)
@@ -259,7 +266,7 @@ class TelegramAdmin:
             f"🆔 ID: `{token_id}`\n"
             f"📁 Chat: `{new_token['source_chat_id']}`\n"
             f"🎯 Target: `{target_peer}`\n"
-            f"🔊 Голосов: *5*\n"
+            f"🔊 Голосов: *0*\n"
             f"✅ Статус: *Активен*",
             parse_mode="MarkdownV2"
         )
@@ -294,13 +301,42 @@ class TelegramAdmin:
             cls = t.get("class", "apostle")
             cls_name = CLASS_CHOICES.get(cls, cls)
             status = "✅" if t.get("enabled", True) else "🚫"
-            voices = t.get("voices", "?")
-            voices_emoji = "🔊" if isinstance(voices, int) and voices > 0 else "🔇"
+            voices = t.get("voices", 0)
+            races = t.get("races", [])
+            temp_races = t.get("temp_races", [])
+            
+            # Показываем расы для апостолов
+            races_info = ""
+            if cls == "apostle":
+                main_races = "/".join(races) if races else ""
+                temp_races_list = []
+                for tr in temp_races:
+                    if isinstance(tr, dict):
+                        race = tr.get("race", "")
+                        expires = tr.get("expires", 0)
+                        if race and expires:
+                            remaining = expires - int(time.time())
+                            if remaining > 0:
+                                if remaining >= 3600:
+                                    hours = remaining // 3600
+                                    minutes = (remaining % 3600) // 60
+                                    time_str = f"{hours}ч{minutes}м"
+                                else:
+                                    minutes = remaining // 60
+                                    seconds = remaining % 60
+                                    time_str = f"{minutes}м{seconds}с"
+                                temp_races_list.append(f"{race}-({time_str})")
+                
+                if temp_races_list:
+                    races_info = f"\n   🎭 Расы: {main_races} {'/'.join(temp_races_list) if temp_races_list else ''}"
+                elif main_races:
+                    races_info = f"\n   🎭 Расы: {main_races}"
 
             lines.append(
                 f"{i}\\. *{t.get('name', t['id'])}*\n"
                 f"   🎭 {cls_name}\n"
-                f"   {status} {voices_emoji} Голосов: `{voices}`\n"
+                f"   {status} 🔊 Голосов: `{voices}`"
+                f"{races_info}\n"
                 f"   🆔 `{t['id']}`\n"
             )
 
@@ -320,7 +356,7 @@ class TelegramAdmin:
 
         if changed:
             self._save(cfg)
-            if self.bot_instance:
+            if self.bot_instance and hasattr(self.bot_instance, 'tm'):
                 self.bot_instance.tm.reload()
 
         return changed
@@ -388,7 +424,7 @@ class TelegramAdmin:
 
         if after < before:
             self._save(cfg)
-            if self.bot_instance:
+            if self.bot_instance and hasattr(self.bot_instance, 'tm'):
                 self.bot_instance.tm.reload()
             await update.message.reply_text(f"🗑️ Токен `{ident}` удалён", parse_mode="MarkdownV2")
         else:
@@ -401,7 +437,7 @@ class TelegramAdmin:
             await update.message.reply_text("❌ Нет прав.")
             return
 
-        if self.bot_instance:
+        if self.bot_instance and hasattr(self.bot_instance, 'tm'):
             self.bot_instance.tm.reload()
             await update.message.reply_text("🔄 Конфигурация перезагружена")
         else:
@@ -425,7 +461,7 @@ class TelegramAdmin:
             fallbacks=[CommandHandler("cancel", self.cancel)],
         )
 
-        # Регистрация команд (weights/timing/reset_weights убраны временно)
+        # Регистрация команд
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(conv)
         app.add_handler(CommandHandler("list_tokens", self.list_tokens))
