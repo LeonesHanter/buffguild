@@ -4,8 +4,10 @@ from typing import Any, Dict
 VK_API_BASE = "https://api.vk.com/method"
 VK_API_VERSION = "5.131"
 
+# Порядок перебора классов при подборе бафера
 CLASS_ORDER = ["apostle", "warlock", "crusader", "light_incarnation"]
 
+# Символ → название расы (используется в сообщениях и логике рас)
 RACE_NAMES = {
     "ч": "человек",
     "г": "гоблин",
@@ -16,6 +18,7 @@ RACE_NAMES = {
     "о": "орк",
 }
 
+# Описание классов и их способностей
 CLASS_ABILITIES: Dict[str, Dict[str, Any]] = {
     "apostle": {
         "name": "Апостол",
@@ -67,7 +70,7 @@ CLASS_ABILITIES: Dict[str, Dict[str, Any]] = {
             "с": ("очищение светом", 15 * 60 + 10),
         },
     },
-    # ✅ ДОБАВЛЕНО: класс для Observer (не имеет способностей)
+    # Класс наблюдателя (не имеет боевых способностей)
     "observer": {
         "name": "Наблюдатель",
         "prefix": "",

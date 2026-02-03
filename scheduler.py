@@ -16,10 +16,12 @@ class Scheduler:
     def __init__(self, tm, executor, on_buff_complete: Callable[[Job, Dict], None] = None):
         self.tm = tm
         self.executor = executor
+
         self._q: List[Tuple[float, Job, str]] = []
         self._lock = threading.Lock()
         self._last_cleanup_time: float = 0.0
-        self._on_buff_complete = on_buff_complete  # ✅ Колбэк для уведомлений
+
+        self._on_buff_complete = on_buff_complete
 
         self._thr = threading.Thread(target=self._run_loop, daemon=True)
         self._thr.start()
@@ -32,33 +34,35 @@ class Scheduler:
                 self._q.append((now, job, ch))
 
     def get_queue_size(self) -> int:
-        """Получить текущий размер очереди"""
         with self._lock:
             return len(self._q)
 
     def cancel_user_jobs(self, user_id: int) -> bool:
-        """Отменить все бафы пользователя"""
         with self._lock:
             original_len = len(self._q)
-            self._q = [(ts, job, ch) for ts, job, ch in self._q if job.sender_id != user_id]
+            self._q = [
+                (ts, job, ch) for ts, job, ch in self._q if job.sender_id != user_id
+            ]
             removed = original_len - len(self._q)
             if removed > 0:
-                logging.info(f"🗑️ Отменены бафы пользователя {user_id}: {removed} шт.")
+                logging.info(
+                    f"🗑️ Отменены бафы пользователя {user_id}: {removed} шт."
+                )
                 return True
-        return False
+            return False
 
     def _cleanup_old_jobs(self) -> None:
         now = time.time()
         if now - self._last_cleanup_time < 300:
             return
-
         with self._lock:
             original_len = len(self._q)
             self._q = [(ts, job, ch) for ts, job, ch in self._q if now - ts < 3600]
             if len(self._q) != original_len:
-                logging.info(f"🧹 Очищены старые задачи: {original_len - len(self._q)}")
-
-        self._last_cleanup_time = now
+                logging.info(
+                    f"🧹 Очищены старые задачи: {original_len - len(self._q)}"
+                )
+            self._last_cleanup_time = now
 
     def _pop_ready(self) -> Optional[Tuple[float, Job, str]]:
         now = time.time()
@@ -104,26 +108,21 @@ class Scheduler:
             success_rate = token.successful_buffs / token.total_attempts
             score += success_rate * 5.0
 
-        # ✅ ПРИОРИТЕТ расовых бафов
         if ability.key in RACE_NAMES:
-            score += 50.0  # Большой бонус для расовых бафов
+            score += 50.0
 
         return score
 
     def _candidates_for_ability(self, ability: ParsedAbility) -> List[TokenHandler]:
         candidates_with_scores: List[Tuple[float, TokenHandler]] = []
 
-        # ✅ Получаем ID Observer токена
         observer_token = self.tm.get_observer()
         observer_id = observer_token.id if observer_token else None
 
-        # ✅ ПЕРВЫЙ ПРИОРИТЕТ: расовые апостолы
         if ability.key in RACE_NAMES:
             for t in self.tm.get_apostles_with_race(ability.key):
-                # ✅ Пропускаем Observer токен
                 if observer_id and t.id == observer_id:
                     continue
-
                 if not t.enabled or t.is_captcha_paused() or t.needs_manual_voices:
                     continue
                 if ability.uses_voices and t.voices <= 0:
@@ -132,6 +131,7 @@ class Scheduler:
                 can_social, _ = t.can_use_social()
                 if not can_social:
                     continue
+
                 can, _ = t.can_use_ability(ability.key)
                 if not can:
                     continue
@@ -140,18 +140,13 @@ class Scheduler:
                     continue
 
                 score = self._calculate_token_score(t, ability)
-                # ✅ ДОПОЛНИТЕЛЬНЫЙ бонус для расовых бафов
-                if ability.key in RACE_NAMES:
-                    score += 100.0  # Очень высокий приоритет
+                score += 100.0
                 candidates_with_scores.append((score, t))
 
-        # ✅ ВТОРОЙ ПРИОРИТЕТ: обычные по классу (только если нет расовых кандидатов)
         if not candidates_with_scores:
             for t in self.tm.all_buffers():
-                # ✅ Пропускаем Observer токен
                 if observer_id and t.id == observer_id:
                     continue
-
                 if not t.enabled or t.is_captcha_paused() or t.needs_manual_voices:
                     continue
 
@@ -160,6 +155,7 @@ class Scheduler:
                     continue
                 if ability.key not in class_data["abilities"]:
                     continue
+
                 if ability.uses_voices and t.voices <= 0:
                     continue
 
@@ -197,19 +193,17 @@ class Scheduler:
                     logging.warning(f"⚠️ Unknown letter '{letter}'")
                     continue
 
-                # ✅ НЕМЕДЛЕННО проверяем кандидатов
                 candidates = self._candidates_for_ability(ability)
-
                 if not candidates:
-                    # ✅ НЕТ кандидатов - ПРОПУСКАЕМ букву, НЕ ЖДЕМ!
-                    logging.warning(f"🚫 Нет кандидатов для '{letter}', пропускаем")
-                    continue  # ❌ НЕ засыпаем!
+                    logging.warning(
+                        f"🚫 Нет кандидатов для '{letter}', пропускаем задачу"
+                    )
+                    continue
 
                 success = False
                 attempt_status = ""
                 buff_info = None
 
-                # Только 1 попытка если есть кандидаты
                 token = candidates[0]
                 ok, status, info = self.executor.execute_one(token, ability, job)
                 attempt_status = status
@@ -217,31 +211,38 @@ class Scheduler:
 
                 if ok or status in ("SUCCESS", "ALREADY"):
                     success = True
-                    # ✅ Вызываем колбэк при успешном бафе
                     if success and buff_info and self._on_buff_complete:
                         try:
                             self._on_buff_complete(job, buff_info)
                         except Exception as e:
-                            logging.error(f"❌ Ошибка в колбэке on_buff_complete: {e}")
+                            logging.error(
+                                f"❌ Ошибка в колбэке on_buff_complete: {e}"
+                            )
                 else:
-                    # Только при ошибках пробуем еще раз с другим токеном
                     if len(candidates) > 1:
-                        # Попробуем со вторым кандидатом
                         token = candidates[1]
-                        ok, status, info = self.executor.execute_one(token, ability, job)
+                        ok, status, info = self.executor.execute_one(
+                            token, ability, job
+                        )
+                        attempt_status = status
+                        buff_info = info
+
                         if ok or status in ("SUCCESS", "ALREADY"):
                             success = True
-                            buff_info = info
                             if success and buff_info and self._on_buff_complete:
                                 try:
                                     self._on_buff_complete(job, buff_info)
                                 except Exception as e:
-                                    logging.error(f"❌ Ошибка в колбэке on_buff_complete: {e}")
+                                    logging.error(
+                                        f"❌ Ошибка в колбэке on_buff_complete: {e}"
+                                    )
 
                 if not success:
-                    # ✅ При ошибке планируем через 30 секунд, НЕ 60
                     self._reschedule(time.time() + 30.0, job, letter)
-                    logging.info(f"⏳ Не удалось обработать '{letter}' (статус: {attempt_status}), следующая через 30с")
+                    logging.info(
+                        f"⏳ Не удалось обработать '{letter}' "
+                        f"(статус: {attempt_status}), повтор через 30с"
+                    )
 
             except Exception as e:
                 logging.error(f"❌ Ошибка в Scheduler: {e}", exc_info=True)

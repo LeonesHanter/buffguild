@@ -6,11 +6,17 @@ from typing import Any, Dict, Optional
 
 from .constants import VK_API_VERSION
 
+logger = logging.getLogger(__name__)
+
+
 class TokenHealthMonitor:
     def __init__(self, token_manager):
         self.tm = token_manager
         self.health_data: Dict[str, Dict] = {}
-        self._monitor_thread = threading.Thread(target=self._monitoring_loop, daemon=True)
+
+        self._monitor_thread = threading.Thread(
+            target=self._monitoring_loop, daemon=True
+        )
         self._last_report_time = 0
 
         self.thresholds = {
@@ -21,7 +27,7 @@ class TokenHealthMonitor:
         }
 
         self._monitor_thread.start()
-        logging.info("🏥 Health Monitor запущен")
+        logger.info("🏥 Health Monitor запущен")
 
     def _check_single_token(self, token) -> Dict[str, Any]:
         health = {
@@ -56,18 +62,15 @@ class TokenHealthMonitor:
                 "user_ids": "1",
                 "fields": "online",
             }
-
             start_time = time.time()
             response = token._vk.call(token._vk.post("users.get", test_data))
             api_time = time.time() - start_time
-
             health["metrics"]["api_response_time"] = api_time
 
             if "error" in response:
                 error = response["error"]
                 error_code = error.get("error_code")
                 error_msg = error.get("error_msg", "")
-
                 health["status"] = "api_error"
                 health["issues"].append(f"API ошибка {error_code}: {error_msg}")
 
@@ -77,14 +80,14 @@ class TokenHealthMonitor:
                     health["issues"].append("Превышен лимит запросов")
                 elif error_code == 9:
                     health["issues"].append("Флуд-контроль")
-
             else:
                 if health["status"] == "unknown":
                     health["status"] = "healthy"
                 health["details"]["api_available"] = True
                 if api_time > self.thresholds["api_timeout"]:
-                    health["issues"].append(f"Медленный ответ API ({api_time:.1f}с)")
-
+                    health["issues"].append(
+                        f"Медленный ответ API ({api_time:.1f}с)"
+                    )
         except Exception as e:
             health["status"] = "connection_error"
             health["issues"].append(f"Ошибка соединения: {str(e)}")
@@ -100,7 +103,9 @@ class TokenHealthMonitor:
             success_rate = token.successful_buffs / token.total_attempts
             health["metrics"]["success_rate"] = success_rate
             if success_rate < (1 - self.thresholds["max_error_rate"]):
-                health["issues"].append(f"Низкая успешность ({success_rate*100:.0f}%)")
+                health["issues"].append(
+                    f"Низкая успешность ({success_rate*100:.0f}%)"
+                )
 
         if token.voices < self.thresholds["min_voices"]:
             if token.voices == 0:
@@ -109,29 +114,25 @@ class TokenHealthMonitor:
             else:
                 health["issues"].append(f"Мало голосов ({token.voices})")
 
-        # cleanup temp races
-        token._cleanup_expired_temp_races(force=True)
+        changed = token._cleanup_expired_temp_races(force=True)
+        if changed and token.class_type == "apostle":
+            self.tm.update_race_index(token)
 
         return health
 
-    def _take_auto_actions(self, token, health_info: Dict):
+    def _take_auto_actions(self, token, health_info: Dict) -> None:
         status = health_info.get("status", "")
         issues = health_info.get("issues", [])
 
         if status in ["api_error", "connection_error"]:
             if "Невалидный или устаревший токен" in str(issues):
-                logging.warning(f"🚨 Отключаю токен {token.name} (невалидный токен)")
+                logger.warning(
+                    f"🚨 Отключаю токен {token.name} (невалидный токен)"
+                )
                 token.enabled = False
-                self.tm.save()
+                token.mark_for_save()
 
-        # ✅ FIX: если после cleanup что-то изменилось — обновляем индекс
-        if token.class_type == "apostle":
-            # принудительно чистим и если были изменения — sync index
-            changed = token._cleanup_expired_temp_races(force=True)
-            if changed:
-                self.tm.update_race_index(token)
-
-    def _generate_health_report(self):
+    def _generate_health_report(self) -> None:
         if not self.health_data:
             return
 
@@ -139,8 +140,7 @@ class TokenHealthMonitor:
         healthy_tokens = 0
         warning_tokens = 0
         error_tokens = 0
-
-        issues_summary = {}
+        issues_summary: Dict[str, int] = {}
 
         for health in self.health_data.values():
             status = health.get("status", "unknown")
@@ -155,34 +155,48 @@ class TokenHealthMonitor:
                 key = issue.split(":")[0] if ":" in issue else issue
                 issues_summary[key] = issues_summary.get(key, 0) + 1
 
-        logging.info("=" * 50)
-        logging.info("📊 ОТЧЕТ СОСТОЯНИЯ СИСТЕМЫ")
-        logging.info(f"🏥 СТАТУС ТОКЕНОВ:")
-        logging.info(f"  ✅ Здоровые: {healthy_tokens}/{total_tokens}")
-        logging.info(f"  ⚠️  Предупреждения: {warning_tokens}/{total_tokens}")
-        logging.info(f"  ❌ Ошибки: {error_tokens}/{total_tokens}")
+        logger.info("=" * 50)
+        logger.info("📊 ОТЧЕТ СОСТОЯНИЯ СИСТЕМЫ")
+        logger.info("🏥 СТАТУС ТОКЕНОВ:")
+        logger.info(f" ✅ Здоровые: {healthy_tokens}/{total_tokens}")
+        logger.info(f" ⚠️ Предупреждения: {warning_tokens}/{total_tokens}")
+        logger.info(f" ❌ Ошибки: {error_tokens}/{total_tokens}")
 
         if issues_summary:
-            logging.info("📋 ОСНОВНЫЕ ПРОБЛЕМЫ:")
-            for issue, count in sorted(issues_summary.items(), key=lambda x: x[1], reverse=True)[:3]:
-                logging.info(f"  • {issue}: {count} токенов")
+            logger.info("📋 ОСНОВНЫЕ ПРОБЛЕМЫ:")
+            for issue, count in sorted(
+                issues_summary.items(), key=lambda x: x[1], reverse=True
+            )[:3]:
+                logger.info(f" • {issue}: {count} токенов")
 
-        total_buffs = sum(h.get("metrics", {}).get("successful_buffs", 0) for h in self.health_data.values())
-        total_attempts = sum(h.get("metrics", {}).get("total_attempts", 0) for h in self.health_data.values())
+        total_buffs = sum(
+            h.get("metrics", {}).get("successful_buffs", 0)
+            for h in self.health_data.values()
+        )
+        total_attempts = sum(
+            h.get("metrics", {}).get("total_attempts", 0)
+            for h in self.health_data.values()
+        )
+
         if total_attempts > 0:
             rate = total_buffs / total_attempts * 100
-            logging.info(f"📈 УСПЕШНОСТЬ: {rate:.1f}% ({total_buffs}/{total_attempts})")
+            logger.info(
+                f"📈 УСПЕШНОСТЬ: {rate:.1f}% ({total_buffs}/{total_attempts})"
+            )
+        logger.info("=" * 50)
 
-        logging.info("=" * 50)
-
-    def _cleanup_old_data(self):
+    def _cleanup_old_data(self) -> None:
         now = time.time()
         max_age = 3600
-        to_delete = [tid for tid, h in self.health_data.items() if now - h.get("timestamp", 0) > max_age]
+        to_delete = [
+            tid
+            for tid, h in self.health_data.items()
+            if now - h.get("timestamp", 0) > max_age
+        ]
         for tid in to_delete:
             del self.health_data[tid]
 
-    def _monitoring_loop(self):
+    def _monitoring_loop(self) -> None:
         while True:
             try:
                 for token in self.tm.tokens:
@@ -191,16 +205,20 @@ class TokenHealthMonitor:
                         self.health_data[token.id] = health_info
                         self._take_auto_actions(token, health_info)
                     except Exception as e:
-                        logging.error(f"❌ Ошибка проверки токена {token.name}: {e}")
+                        logger.error(
+                            f"❌ Ошибка проверки токена {token.name}: {e}"
+                        )
 
                 if time.time() - self._last_report_time > 300:
                     self._generate_health_report()
                     self._last_report_time = time.time()
+                    self._cleanup_old_data()
 
-                self._cleanup_old_data()
                 time.sleep(60)
             except Exception as e:
-                logging.error(f"❌ Критическая ошибка в мониторинге: {e}")
+                logger.error(
+                    f"❌ Критическая ошибка в мониторинге: {e}", exc_info=True
+                )
                 time.sleep(30)
 
     def get_detailed_report(self, token_name: Optional[str] = None) -> str:
@@ -208,10 +226,13 @@ class TokenHealthMonitor:
             token = self.tm.get_token_by_name(token_name)
             if not token:
                 return f"❌ Токен '{token_name}' не найден"
+
             health = self.health_data.get(token.id)
             if not health:
                 return f"ℹ️ Нет данных о токене '{token_name}'"
+
             return self._format_token_details(health)
+
         return self._generate_health_report_text()
 
     def _format_token_details(self, health: Dict) -> str:
@@ -222,36 +243,46 @@ class TokenHealthMonitor:
             f"⚙️ Включен: {'✅' if health.get('enabled') else '❌'}",
             "",
         ]
+
         metrics = health.get("metrics", {})
         if metrics:
             lines.append("📈 МЕТРИКИ:")
             if "voices" in metrics:
-                lines.append(f"  🗣️ Голоса: {metrics['voices']}")
+                lines.append(f" 🗣️ Голоса: {metrics['voices']}")
             if "level" in metrics:
-                lines.append(f"  💀 Уровень: {metrics['level']}")
+                lines.append(f" 💀 Уровень: {metrics['level']}")
             if "temp_races_count" in metrics:
-                lines.append(f"  🎯 Временные расы: {metrics['temp_races_count']}")
+                lines.append(
+                    f" 🎯 Временные расы: {metrics['temp_races_count']}"
+                )
             if "success_rate" in metrics:
-                lines.append(f"  📊 Успешность: {metrics['success_rate']*100:.1f}%")
+                lines.append(
+                    f" 📊 Успешность: {metrics['success_rate']*100:.1f}%"
+                )
             lines.append("")
 
         issues = health.get("issues", [])
         if issues:
             lines.append("⚠️ ПРОБЛЕМЫ:")
             for issue in issues[:5]:
-                lines.append(f"  • {issue}")
+                lines.append(f" • {issue}")
             lines.append("")
+
         return "\n".join(lines)
 
     def _generate_health_report_text(self) -> str:
         if not self.health_data:
             return "Нет данных мониторинга"
+
         report_lines = ["🏥 ОТЧЕТ ЗДОРОВЬЯ СИСТЕМЫ"]
-        status_counts = {}
+        status_counts: Dict[str, int] = {}
+
         for h in self.health_data.values():
             status = h.get("status", "unknown")
             status_counts[status] = status_counts.get(status, 0) + 1
+
         report_lines.append("\n📊 СТАТУС ТОКЕНОВ:")
         for status, count in sorted(status_counts.items()):
             report_lines.append(f"• {status}: {count}")
+
         return "\n".join(report_lines)

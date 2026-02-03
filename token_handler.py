@@ -26,15 +26,15 @@ class TokenHandler:
 
         self._vk = vk
         self._manager = manager
-        self._needs_save = False  # ✅ Флаг что нужна запись
-
+        self._needs_save = False
         self._lock = threading.RLock()
 
         self.owner_vk_id: int = int(cfg.get("owner_vk_id", 0))
-
         self.source_chat_id: int = int(cfg.get("source_chat_id", 0))
         self.target_peer_id: int = int(cfg.get("target_peer_id", 0))
-        self.source_peer_id: int = 2000000000 + self.source_chat_id if self.source_chat_id else 0
+        self.source_peer_id: int = (
+            2000000000 + self.source_chat_id if self.source_chat_id else 0
+        )
 
         self.voices: int = int(cfg.get("voices", 0))
         self.enabled: bool = bool(cfg.get("enabled", True))
@@ -46,38 +46,41 @@ class TokenHandler:
         self.temp_races: List[Dict[str, Any]] = []
         for tr in cfg.get("temp_races", []) or []:
             if isinstance(tr, dict) and "race" in tr and "expires" in tr:
-                self.temp_races.append({"race": tr["race"], "expires": int(tr["expires"])})
+                self.temp_races.append(
+                    {"race": tr["race"], "expires": int(tr["expires"])}
+                )
 
         self.captcha_until: int = int(cfg.get("captcha_until", 0))
         self.level: int = int(cfg.get("level", 0))
+        self.needs_manual_voices: bool = bool(
+            cfg.get("needs_manual_voices", False)
+        )
+        self.virtual_voice_grants: int = int(
+            cfg.get("virtual_voice_grants", 0)
+        )
+        self.next_virtual_grant_ts: int = int(
+            cfg.get("next_virtual_grant_ts", 0)
+        )
 
-        self.needs_manual_voices: bool = bool(cfg.get("needs_manual_voices", False))
-        self.virtual_voice_grants: int = int(cfg.get("virtual_voice_grants", 0))
-        self.next_virtual_grant_ts: int = int(cfg.get("next_virtual_grant_ts", 0))
-
-        # Локальный КД по "букве"/способности
         self._ability_cd: Dict[str, float] = {}
-
-        # ✅ Глобальный КД "социальных эффектов" (один на все бафы)
         self._social_cd_until: float = 0.0
-
         self._last_temp_race_cleanup: float = 0.0
 
-        # Кэш истории (опционально)
         self._history_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
         self._cache_ttl = 3
         self._cache_lock = threading.Lock()
 
-    def mark_for_save(self):
-        """Пометить что нужна запись конфигурации"""
+    def mark_for_save(self) -> None:
         self._needs_save = True
+        self._manager.mark_for_save()
 
-    # ---------- Owner id ----------
     def fetch_owner_id_lazy(self) -> int:
         if self.owner_vk_id != 0:
             return self.owner_vk_id
         if not self.access_token:
-            logging.warning(f"⚠️ {self.name}: cannot detect owner_vk_id - access_token empty")
+            logging.warning(
+                f"⚠️ {self.name}: cannot detect owner_vk_id - access_token empty"
+            )
             return 0
 
         try:
@@ -86,23 +89,23 @@ class TokenHandler:
             if "response" in ret and ret["response"]:
                 uid = int(ret["response"][0]["id"])
                 self.owner_vk_id = uid
-                self.mark_for_save()  # ✅ Только помечаем
+                self.mark_for_save()
                 logging.info(f"📌 {self.name}: lazy owner_vk_id={uid}")
                 return uid
         except Exception as e:
             logging.error(f"❌ {self.name}: lazy owner_vk_id failed: {e}")
         return 0
 
-    # ---------- Captcha ----------
     def is_captcha_paused(self) -> bool:
         return time.time() < float(self.captcha_until)
 
     def set_captcha_pause(self, seconds: int = 60) -> None:
         self.captcha_until = int(time.time() + seconds)
-        self.mark_for_save()  # ✅ Только помечаем
-        logging.error(f"⛔ {self.name}: captcha pause {seconds}s (until={self.captcha_until})")
+        self.mark_for_save()
+        logging.error(
+            f"⛔ {self.name}: captcha pause {seconds}s (until={self.captcha_until})"
+        )
 
-    # ---------- Cooldowns ----------
     def can_use_ability(self, ability_key: str) -> Tuple[bool, float]:
         ts = self._ability_cd.get(ability_key, 0.0)
         rem = ts - time.time()
@@ -116,11 +119,9 @@ class TokenHandler:
             return
         until = time.time() + sec
         cur = self._ability_cd.get(ability_key, 0.0)
-        # ставим максимум, чтобы не укоротить
         if until > cur:
             self._ability_cd[ability_key] = until
 
-    # ✅ Глобальный соц-КД
     def can_use_social(self) -> Tuple[bool, float]:
         rem = self._social_cd_until - time.time()
         if rem > 0:
@@ -147,14 +148,12 @@ class TokenHandler:
         s = int(rem % 60)
         return f"{m}м{s:02d}с"
 
-    # ---------- Stats ----------
     def increment_buff_stats(self, success: bool = True) -> None:
         self.total_attempts += 1
         if success:
             self.successful_buffs += 1
-        self.mark_for_save()  # ✅ Только помечаем
+        self.mark_for_save()
 
-    # ---------- Races ----------
     def _cleanup_expired_temp_races(self, force: bool = False) -> bool:
         now = time.time()
         if not force and (now - self._last_temp_race_cleanup < 300):
@@ -163,14 +162,20 @@ class TokenHandler:
         changed = False
         with self._lock:
             before = len(self.temp_races)
-            self.temp_races = [tr for tr in self.temp_races if int(tr.get("expires", 0)) > now]
+            self.temp_races = [
+                tr for tr in self.temp_races if int(tr.get("expires", 0)) > now
+            ]
             after = len(self.temp_races)
+
             if after != before:
                 changed = True
-                self.mark_for_save()  # ✅ Только помечаем
-                logging.info(f"🧹 {self.name}: очищены просроченные временные расы")
+                self.mark_for_save()
+                logging.info(
+                    f"🧹 {self.name}: очищены просроченные временные расы"
+                )
 
-        self._last_temp_race_cleanup = now
+            self._last_temp_race_cleanup = now
+
         return changed
 
     def has_race(self, race_key: str) -> bool:
@@ -190,7 +195,7 @@ class TokenHandler:
         self,
         race_key: str,
         duration_hours: int = 2,
-        expires_at: Optional[int] = None
+        expires_at: Optional[int] = None,
     ) -> bool:
         with self._lock:
             if race_key not in RACE_NAMES:
@@ -198,22 +203,27 @@ class TokenHandler:
 
             self._cleanup_expired_temp_races(force=True)
 
-            # already have
             if self.has_race(race_key):
                 return False
 
-            # only 1 temp race allowed
             if self.get_temp_race_count() >= 1:
                 return False
 
             if expires_at is None:
                 expires_at = round(time.time() + duration_hours * 3600)
 
-            self.temp_races.append({"race": race_key, "expires": int(expires_at)})
-            self.mark_for_save()  # ✅ Только помечаем
+            self.temp_races.append(
+                {"race": race_key, "expires": int(expires_at)}
+            )
+            self.mark_for_save()
 
-            expires_time = format_moscow_time(timestamp_to_moscow(int(expires_at)))
-            logging.info(f"🎯 {self.name}: добавлена временная раса '{race_key}' до {expires_time}")
+            expires_time = format_moscow_time(
+                timestamp_to_moscow(int(expires_at))
+            )
+            logging.info(
+                f"🎯 {self.name}: добавлена временная раса "
+                f"'{race_key}' до {expires_time}"
+            )
             return True
 
     def update_temp_race_expiry(self, race_key: str, new_expires_at: int) -> bool:
@@ -221,54 +231,64 @@ class TokenHandler:
             for tr in self.temp_races:
                 if tr.get("race") == race_key:
                     tr["expires"] = int(new_expires_at)
-                    self.mark_for_save()  # ✅ Только помечаем
-                    expires_time = format_moscow_time(timestamp_to_moscow(int(new_expires_at)))
-                    logging.info(f"🔄 {self.name}: обновлена временная раса '{race_key}' до {expires_time}")
+                    self.mark_for_save()
+                    expires_time = format_moscow_time(
+                        timestamp_to_moscow(int(new_expires_at))
+                    )
+                    logging.info(
+                        f"🔄 {self.name}: обновлена временная раса "
+                        f"'{race_key}' до {expires_time}"
+                    )
                     return True
         return False
 
-    # ---------- Voices / Level ----------
     def mark_real_voices_received(self) -> None:
-        if self.needs_manual_voices or self.virtual_voice_grants or self.next_virtual_grant_ts:
+        if (
+            self.needs_manual_voices
+            or self.virtual_voice_grants
+            or self.next_virtual_grant_ts
+        ):
             self.needs_manual_voices = False
             self.virtual_voice_grants = 0
             self.next_virtual_grant_ts = 0
-            self.mark_for_save()  # ✅ Только помечаем
+            self.mark_for_save()
 
     def update_voices_from_system(self, new_voices: int) -> None:
         new_voices = int(new_voices)
         if new_voices < 0:
             new_voices = 0
+
         if self.voices != new_voices:
             old = self.voices
             self.voices = new_voices
-            self.mark_for_save()  # ✅ Только помечаем
+            self.mark_for_save()
             logging.info(f"🗣 {self.name}: voices {old} → {new_voices}")
-        self.mark_real_voices_received()
+            self.mark_real_voices_received()
 
     def update_voices_manual(self, new_voices: int) -> None:
         new_voices = int(new_voices)
         if new_voices < 0:
             new_voices = 0
+
         old = self.voices
         self.voices = new_voices
         self.needs_manual_voices = False
         self.virtual_voice_grants = 0
         self.next_virtual_grant_ts = 0
-        self.mark_for_save()  # ✅ Только помечаем
+        self.mark_for_save()
         logging.info(f"🛠 {self.name}: manual voices {old} → {new_voices}")
 
     def update_level(self, lvl: int) -> None:
         lvl = int(lvl)
         if lvl < 0:
             lvl = 0
+
         if self.level != lvl:
             old = self.level
             self.level = lvl
-            self.mark_for_save()  # ✅ Только помечаем
+            self.mark_for_save()
             logging.info(f"💀 {self.name}: level {old} → {lvl}")
 
-    # ---------- VK messages ----------
     async def _messages_get_history(self, peer_id: int, count: int = 20) -> Dict[str, Any]:
         data = {
             "access_token": self.access_token,
@@ -283,7 +303,10 @@ class TokenHandler:
             ret = self._vk.call(self._messages_get_history(peer_id, count))
             if "error" in ret:
                 err = ret["error"]
-                logging.error(f"❌ {self.name}: getHistory error {err.get('error_code')} {err.get('error_msg')}")
+                logging.error(
+                    f"❌ {self.name}: getHistory error "
+                    f"{err.get('error_code')} {err.get('error_msg')}"
+                )
                 return []
             return ret.get("response", {}).get("items", []) or []
         except Exception as e:
@@ -293,7 +316,6 @@ class TokenHandler:
     def get_history_cached(self, peer_id: int, count: int = 20) -> List[Dict[str, Any]]:
         cache_key = f"history_{peer_id}_{count}"
         now = time.time()
-
         with self._cache_lock:
             if cache_key in self._history_cache:
                 cached_time, cached_data = self._history_cache[cache_key]
@@ -301,10 +323,8 @@ class TokenHandler:
                     return cached_data.copy()
 
         fresh_data = self.get_history(peer_id, count)
-
         with self._cache_lock:
             self._history_cache[cache_key] = (now, fresh_data.copy())
-
         return fresh_data
 
     def invalidate_cache(self, peer_id: Optional[int] = None) -> None:
@@ -312,7 +332,10 @@ class TokenHandler:
             if peer_id is None:
                 self._history_cache.clear()
                 return
-            keys_to_delete = [k for k in self._history_cache.keys() if k.startswith(f"history_{peer_id}_")]
+            keys_to_delete = [
+                k for k in self._history_cache.keys()
+                if k.startswith(f"history_{peer_id}_")
+            ]
             for k in keys_to_delete:
                 del self._history_cache[k]
 
@@ -329,14 +352,23 @@ class TokenHandler:
             ret = self._vk.call(self._messages_get_by_id(message_ids))
             if "error" in ret:
                 err = ret["error"]
-                logging.error(f"❌ {self.name}: getById error {err.get('error_code')} {err.get('error_msg')}")
+                logging.error(
+                    f"❌ {self.name}: getById error "
+                    f"{err.get('error_code')} {err.get('error_msg')}"
+                )
                 return []
             return ret.get("response", {}).get("items", []) or []
         except Exception as e:
             logging.error(f"❌ {self.name}: getById exception {e}")
             return []
 
-    async def _messages_send(self, peer_id: int, text: str, forward_msg_id: Optional[int] = None, reply_to_cmid: Optional[int] = None) -> Dict[str, Any]:
+    async def _messages_send(
+        self,
+        peer_id: int,
+        text: str,
+        forward_msg_id: Optional[int] = None,
+        reply_to_cmid: Optional[int] = None,
+    ) -> Dict[str, Any]:
         jitter_sleep()
         data: Dict[str, Any] = {
             "access_token": self.access_token,
@@ -352,14 +384,22 @@ class TokenHandler:
             data["reply_to"] = str(int(reply_to_cmid))
         return await self._vk.post("messages.send", data)
 
-    def send_to_peer(self, peer_id: int, text: str, forward_msg_id: Optional[int] = None, reply_to_cmid: Optional[int] = None) -> Tuple[bool, str]:
+    def send_to_peer(
+        self,
+        peer_id: int,
+        text: str,
+        forward_msg_id: Optional[int] = None,
+        reply_to_cmid: Optional[int] = None,
+    ) -> Tuple[bool, str]:
         if not self.enabled:
             return False, "DISABLED"
         if self.is_captcha_paused():
             return False, "CAPTCHA_PAUSED"
 
         try:
-            ret = self._vk.call(self._messages_send(peer_id, text, forward_msg_id, reply_to_cmid))
+            ret = self._vk.call(
+                self._messages_send(peer_id, text, forward_msg_id, reply_to_cmid)
+            )
             if "error" in ret:
                 err = ret["error"]
                 code = int(err.get("error_code", 0))
@@ -373,18 +413,19 @@ class TokenHandler:
                 if code in (4, 5):
                     return False, "AUTH"
 
-                logging.error(f"❌ {self.name}: send error {code} {msg}")
+                logging.error(
+                    f"❌ {self.name}: send error {code} {msg}"
+                )
                 return False, "ERROR"
 
-            # Возвращаем ID отправленного сообщения
             message_id = ret.get("response", 0)
             return True, f"OK:{message_id}"
+
         except Exception as e:
             logging.error(f"❌ {self.name}: send exception {e}")
             return False, "ERROR"
 
     def delete_message(self, peer_id: int, message_id: int) -> bool:
-        """Удалить сообщение"""
         if not self.enabled:
             return False
         if self.is_captcha_paused():
@@ -399,14 +440,14 @@ class TokenHandler:
                 "cmids": str(int(message_id)),
                 "delete_for_all": 1,
             }
-
             ret = self._vk.call(self._vk.post("messages.delete", data))
-
             if "error" in ret:
                 err = ret["error"]
-                logging.error(f"❌ {self.name}: delete error {err.get('error_code')} {err.get('error_msg')}")
+                logging.error(
+                    f"❌ {self.name}: delete error "
+                    f"{err.get('error_code')} {err.get('error_msg')}"
+                )
                 return False
-
             return True
         except Exception as e:
             logging.error(f"❌ {self.name}: delete exception {e}")
@@ -415,8 +456,8 @@ class TokenHandler:
     def send_reaction_success(self, peer_id: int, cmid: int) -> bool:
         if cmid is None:
             return False
-        jitter_sleep()
 
+        jitter_sleep()
         data = {
             "access_token": self.access_token,
             "v": VK_API_VERSION,
@@ -428,9 +469,16 @@ class TokenHandler:
             ret = self._vk.call(self._vk.post("messages.sendReaction", data))
             if "error" in ret:
                 err = ret["error"]
-                logging.error(f"❌ {self.name}: sendReaction error {err.get('error_code')} {err.get('error_msg')}")
+                logging.error(
+                    f"❌ {self.name}: sendReaction error "
+                    f"{err.get('error_code')} {err.get('error_msg')}"
+                )
                 return False
-            logging.info(f"🙂 {self.name}: реакция 🎉 поставлена (peer={peer_id} cmid={cmid})")
+
+            logging.info(
+                f"🙂 {self.name}: реакция 🎉 поставлена "
+                f"(peer={peer_id} cmid={cmid})"
+            )
             return True
         except Exception as e:
             logging.error(f"❌ {self.name}: sendReaction exception {e}")
@@ -452,7 +500,11 @@ class TokenHandler:
                 "temp_races_count": self.get_temp_race_count(),
                 "successful_buffs": self.successful_buffs,
                 "total_attempts": self.total_attempts,
-                "success_rate": self.successful_buffs / self.total_attempts if self.total_attempts > 0 else 0.0,
+                "success_rate": (
+                    self.successful_buffs / self.total_attempts
+                    if self.total_attempts > 0
+                    else 0.0
+                ),
                 "owner_vk_id": self.owner_vk_id,
                 "races": self.races,
                 "temp_races": self.temp_races.copy(),

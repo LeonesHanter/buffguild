@@ -4,9 +4,13 @@ import aiohttp
 import logging
 import threading
 from typing import Any, Dict, Optional
+
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from .constants import VK_API_BASE, VK_API_VERSION
+
+logger = logging.getLogger(__name__)
+
 
 class ResilientVKClient:
     """Устойчивый клиент VK с повторными попытками"""
@@ -16,6 +20,8 @@ class ResilientVKClient:
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._ready = threading.Event()
         self._session: Optional[aiohttp.ClientSession] = None
+        self._stopping = False
+
         self._thread.start()
         if not self._ready.wait(timeout=10):
             raise RuntimeError("VK client init timeout")

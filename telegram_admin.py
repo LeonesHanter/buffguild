@@ -3,13 +3,13 @@
 Telegram админ-бот для управления токенами.
 
 Команды:
-- /start - Список команд
-- /add_token - Добавить новый токен (диалог)
-- /list_tokens - Список всех токенов
-- /enable <id|name> - Включить токен
-- /disable <id|name> - Отключить токен
-- /remove <id|name> - Удалить токен
-- /reload - Перезагрузить конфиг (если bot_instance подключен)
+ - /start        - Список команд
+ - /add_token    - Добавить новый токен (диалог)
+ - /list_tokens  - Список всех токенов
+ - /enable       - Включить токен
+ - /disable      - Отключить токен
+ - /remove       - Удалить токен
+ - /reload       - Перезагрузить конфиг (если bot_instance подключен)
 """
 
 import json
@@ -29,8 +29,7 @@ from telegram.ext import (
 )
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
 # Классы персонажей
@@ -51,11 +50,7 @@ class TelegramAdmin:
     WAIT_CHAT = 4
 
     def __init__(
-        self,
-        telegram_token: str,
-        admin_ids: List[int],
-        config_path: str,
-        bot_instance=None
+        self, telegram_token: str, admin_ids: List[int], config_path: str, bot_instance=None
     ):
         self.telegram_token = telegram_token
         self.admin_ids = set(admin_ids)
@@ -71,7 +66,6 @@ class TelegramAdmin:
         """Загрузка config.json"""
         if not os.path.exists(self.config_path):
             return {"tokens": [], "settings": {"delay": 2}}
-
         try:
             with open(self.config_path, "r", encoding="utf-8") as f:
                 return json.load(f)
@@ -98,9 +92,9 @@ class TelegramAdmin:
             "📋 Команды:\n"
             "/add_token — добавить токен\n"
             "/list_tokens — список токенов\n"
-            "/enable <id|name> — включить токен\n"
-            "/disable <id|name> — отключить токен\n"
-            "/remove <id|name> — удалить токен\n"
+            "/enable — включить токен\n"
+            "/disable — отключить токен\n"
+            "/remove — удалить токен\n"
             "/reload — перезагрузить конфиг"
         )
         await update.message.reply_text(msg)  # БЕЗ parse_mode
@@ -126,18 +120,14 @@ class TelegramAdmin:
         """Получение имени"""
         uid = update.effective_user.id
         name = update.message.text.strip()
-
         if len(name) < 2:
             await update.message.reply_text("Слишком короткое имя. Ещё раз:")
             return self.WAIT_NAME
 
         self.tmp[uid]["name"] = name
-
-        classes = "\n".join([
-            f"{k} — {v}"
-            for k, v in CLASS_CHOICES.items()
-        ])
-
+        classes = "\n".join(
+            [f"{k} — {v}" for k, v in CLASS_CHOICES.items()]
+        )
         await update.message.reply_text(
             f"✅ Имя: {name}\n\n"
             f"🎭 Шаг 2/4: Выберите класс\n\n"
@@ -150,7 +140,6 @@ class TelegramAdmin:
         """Получение класса"""
         uid = update.effective_user.id
         cls = update.message.text.strip().lower()
-
         if cls not in CLASS_CHOICES:
             await update.message.reply_text(
                 f"❌ Неизвестный класс: {cls}\n\n"
@@ -160,7 +149,6 @@ class TelegramAdmin:
 
         self.tmp[uid]["class"] = cls
         class_name = CLASS_CHOICES[cls]
-
         await update.message.reply_text(
             f"✅ Класс: {class_name}\n\n"
             f"🔑 Шаг 3/4: Отправьте VK access token\n"
@@ -172,7 +160,6 @@ class TelegramAdmin:
         """Получение токена"""
         uid = update.effective_user.id
         token = update.message.text.strip()
-
         if not token.startswith("vk1.a."):
             await update.message.reply_text(
                 "❌ Неверный формат токена. Должен начинаться с vk1.a."
@@ -180,7 +167,6 @@ class TelegramAdmin:
             return self.WAIT_TOKEN
 
         self.tmp[uid]["access_token"] = token
-
         await update.message.reply_text(
             "✅ Токен сохранён\n\n"
             "📁 Шаг 4/4: ID чата (source_chat_id)\n"
@@ -191,7 +177,6 @@ class TelegramAdmin:
     async def recv_chat(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Получение chat_id и завершение"""
         uid = update.effective_user.id
-
         try:
             chat_id = int(update.message.text.strip())
         except ValueError:
@@ -199,8 +184,6 @@ class TelegramAdmin:
             return self.WAIT_CHAT
 
         self.tmp[uid]["source_chat_id"] = chat_id
-
-        # target_peer_id всегда -183040898
         target_peer = -183040898
 
         data = self.tmp.get(uid, {})
@@ -230,13 +213,12 @@ class TelegramAdmin:
         cfg.setdefault("settings", {}).setdefault("delay", 2)
         self._save(cfg)
 
-        if self.bot_instance and hasattr(self.bot_instance, 'tm'):
+        if self.bot_instance and hasattr(self.bot_instance, "tm"):
             self.bot_instance.tm.reload()
 
         self.tmp.pop(uid, None)
 
         class_name = CLASS_CHOICES[new_token["class"]]
-
         message = (
             "✅ Токен добавлен!\n\n"
             f"📛 Имя: {new_token['name']}\n"
@@ -268,13 +250,11 @@ class TelegramAdmin:
 
         cfg = self._load()
         tokens = cfg.get("tokens", [])
-
         if not tokens:
             await update.message.reply_text("📭 Нет токенов.")
             return
 
         lines = ["📋 Список токенов:"]
-
         for i, t in enumerate(tokens, 1):
             cls = t.get("class", "apostle")
             cls_name = CLASS_CHOICES.get(cls, cls)
@@ -284,9 +264,9 @@ class TelegramAdmin:
 
             lines.append(
                 f"{i}. {t.get('name', t['id'])}\n"
-                f"   🎭 {cls_name}\n"
-                f"   {status} {voices_emoji} Голосов: {voices}\n"
-                f"   🆔 {t['id']}"
+                f" 🎭 {cls_name}\n"
+                f" {status} {voices_emoji} Голосов: {voices}\n"
+                f" 🆔 {t['id']}"
             )
 
         await update.message.reply_text("\n\n".join(lines))
@@ -297,7 +277,6 @@ class TelegramAdmin:
         """Включить/отключить токен по ID или имени"""
         cfg = self._load()
         changed = False
-
         for t in cfg.get("tokens", []):
             if t.get("id") == ident or t.get("name") == ident:
                 t["enabled"] = enabled
@@ -305,7 +284,7 @@ class TelegramAdmin:
 
         if changed:
             self._save(cfg)
-            if self.bot_instance and hasattr(self.bot_instance, 'tm'):
+            if self.bot_instance and hasattr(self.bot_instance, "tm"):
                 self.bot_instance.tm.reload()
 
         return changed
@@ -323,7 +302,6 @@ class TelegramAdmin:
 
         ident = " ".join(context.args)
         ok = self._toggle(ident, True)
-
         await update.message.reply_text(
             f"✅ Токен '{ident}' включён" if ok else f"❌ Не найдено: '{ident}'"
         )
@@ -341,7 +319,6 @@ class TelegramAdmin:
 
         ident = " ".join(context.args)
         ok = self._toggle(ident, False)
-
         await update.message.reply_text(
             f"🚫 Токен '{ident}' отключён" if ok else f"❌ Не найдено: '{ident}'"
         )
@@ -360,18 +337,18 @@ class TelegramAdmin:
             return
 
         ident = " ".join(context.args)
-
         cfg = self._load()
         before = len(cfg.get("tokens", []))
         cfg["tokens"] = [
-            t for t in cfg.get("tokens", [])
+            t
+            for t in cfg.get("tokens", [])
             if t.get("id") != ident and t.get("name") != ident
         ]
         after = len(cfg["tokens"])
 
         if after < before:
             self._save(cfg)
-            if self.bot_instance and hasattr(self.bot_instance, 'tm'):
+            if self.bot_instance and hasattr(self.bot_instance, "tm"):
                 self.bot_instance.tm.reload()
             await update.message.reply_text(f"🗑️ Токен '{ident}' удалён")
         else:
@@ -384,30 +361,45 @@ class TelegramAdmin:
             await update.message.reply_text("❌ Нет прав.")
             return
 
-        if self.bot_instance and hasattr(self.bot_instance, 'tm'):
+        if self.bot_instance and hasattr(self.bot_instance, "tm"):
             self.bot_instance.tm.reload()
             await update.message.reply_text("🔄 Конфигурация перезагружена")
         else:
             await update.message.reply_text("⚠️ Бот не подключён")
 
     # ---- Запуск ----
+
     def run(self):
         """Запуск Telegram бота"""
         app = Application.builder().token(self.telegram_token).build()
 
-        # Диалог добавления токена (4 шага)
         conv = ConversationHandler(
             entry_points=[CommandHandler("add_token", self.add_token)],
             states={
-                self.WAIT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.recv_name)],
-                self.WAIT_CLASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.recv_class)],
-                self.WAIT_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.recv_token)],
-                self.WAIT_CHAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.recv_chat)],
+                self.WAIT_NAME: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND, self.recv_name
+                    )
+                ],
+                self.WAIT_CLASS: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND, self.recv_class
+                    )
+                ],
+                self.WAIT_TOKEN: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND, self.recv_token
+                    )
+                ],
+                self.WAIT_CHAT: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND, self.recv_chat
+                    )
+                ],
             },
             fallbacks=[CommandHandler("cancel", self.cancel)],
         )
 
-        # Регистрация команд
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(conv)
         app.add_handler(CommandHandler("list_tokens", self.list_tokens))
@@ -429,10 +421,11 @@ def main():
         raise SystemExit("❌ Set TELEGRAM_BOT_TOKEN environment variable")
 
     if not admins:
-        raise SystemExit("❌ Set ADMIN_USER_IDS environment variable (comma-separated)")
+        raise SystemExit(
+            "❌ Set ADMIN_USER_IDS environment variable (comma-separated)"
+        )
 
     admin_ids = [int(x.strip()) for x in admins.split(",") if x.strip()]
-
     TelegramAdmin(tg_token, admin_ids, "config.json").run()
 
 
