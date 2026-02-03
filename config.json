@@ -1,0 +1,153 @@
+{
+  "observer_token_id": "token_observer",
+  "settings": {
+    "poll_interval": 2.0,
+    "poll_count": 20,
+    "delay": 2
+  },
+  "tokens": [
+    {
+      "id": "token_observer",
+      "name": "Observer",
+      "class": "apostle",
+      "access_token": "vk1.a.",
+      "owner_vk_id": 92900278,
+      "source_chat_id": 120,
+      "target_peer_id": -183040898,
+      "voices": 4,
+      "enabled": true,
+      "races": [
+        "м",
+        "г"
+      ],
+      "successful_buffs": 1,
+      "total_attempts": 1,
+      "temp_races": [],
+      "captcha_until": 0,
+      "level": 0,
+      "needs_manual_voices": false,
+      "virtual_voice_grants": 0,
+      "next_virtual_grant_ts": 0
+    },
+    {
+      "id": "token_1769812527",
+      "name": "Lina",
+      "class": "apostle",
+      "access_token": "vk1.a.",
+      "owner_vk_id": 438975695,
+      "source_chat_id": 111,
+      "target_peer_id": -183040898,
+      "voices": 27,
+      "enabled": true,
+      "races": [
+        "ч",
+        "г"
+      ],
+      "successful_buffs": 99,
+      "total_attempts": 103,
+      "temp_races": [
+        {
+          "race": "э",
+          "expires": 1770152508
+        }
+      ],
+      "captcha_until": 1770034024,
+      "level": 0,
+      "needs_manual_voices": false,
+      "virtual_voice_grants": 0,
+      "next_virtual_grant_ts": 0
+    },
+    {
+      "id": "token_1769813299",
+      "name": "StasY",
+      "class": "apostle",
+      "access_token": "vk1.a.",
+      "owner_vk_id": 572459970,
+      "source_chat_id": 79,
+      "target_peer_id": -183040898,
+      "voices": 25,
+      "enabled": true,
+      "races": [
+        "ч",
+        "м"
+      ],
+      "successful_buffs": 55,
+      "total_attempts": 60,
+      "temp_races": [],
+      "captcha_until": 0,
+      "level": 0,
+      "needs_manual_voices": false,
+      "virtual_voice_grants": 0,
+      "next_virtual_grant_ts": 0
+    },
+    {
+      "id": "token_1769813427",
+      "name": "AlexK",
+      "class": "apostle",
+      "access_token": "vk1.a.",
+      "owner_vk_id": 16121426,
+      "source_chat_id": 23,
+      "target_peer_id": -183040898,
+      "voices": 37,
+      "enabled": true,
+      "races": [
+        "э",
+        "о"
+      ],
+      "successful_buffs": 148,
+      "total_attempts": 151,
+      "temp_races": [],
+      "captcha_until": 0,
+      "level": 0,
+      "needs_manual_voices": false,
+      "virtual_voice_grants": 0,
+      "next_virtual_grant_ts": 0
+    },
+    {
+      "id": "token_1769818856",
+      "name": "MaxP",
+      "class": "apostle",
+      "access_token": "vk1.a.",
+      "owner_vk_id": 3016092,
+      "source_chat_id": 126,
+      "target_peer_id": -183040898,
+      "voices": 43,
+      "enabled": true,
+      "races": [
+        "г",
+        "н"
+      ],
+      "successful_buffs": 54,
+      "total_attempts": 62,
+      "temp_races": [],
+      "captcha_until": 0,
+      "level": 0,
+      "needs_manual_voices": false,
+      "virtual_voice_grants": 0,
+      "next_virtual_grant_ts": 0
+    },
+    {
+      "id": "token_1769967310",
+      "name": "AlexC",
+      "class": "apostle",
+      "access_token": "vk1.a.",
+      "owner_vk_id": 210414131,
+      "source_chat_id": 18,
+      "target_peer_id": -183040898,
+      "voices": 25,
+      "enabled": true,
+      "races": [
+        "г",
+        "м"
+      ],
+      "successful_buffs": 83,
+      "total_attempts": 83,
+      "temp_races": [],
+      "captcha_until": 0,
+      "level": 0,
+      "needs_manual_voices": false,
+      "virtual_voice_grants": 0,
+      "next_virtual_grant_ts": 0
+    }
+  ]
+}
