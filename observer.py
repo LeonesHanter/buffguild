@@ -12,7 +12,7 @@ from .scheduler import Scheduler
 from .health import TokenHealthMonitor
 from .validators import InputValidator
 from .utils import timestamp_to_moscow, now_moscow, format_moscow_time, normalize_text
-from .job_storage import JobStorage  # НОВОЕ
+from .job_storage import JobStorage
 
 logger = logging.getLogger(__name__)
 
@@ -39,30 +39,95 @@ class ObserverBot:
         self.tm = tm
         self.executor = executor
 
-        # Scheduler с колбэком для уведомлений
         self.scheduler = Scheduler(tm, executor, on_buff_complete=self._handle_buff_completion)
         self.health_monitor = TokenHealthMonitor(tm)
 
-        self.observer = tm.get_observer()
+        self.observer = self.tm.get_observer()
         if not self.observer.access_token:
             raise RuntimeError("Observer token has empty access_token")
         if not self.observer.source_peer_id:
             raise RuntimeError("Observer source_chat_id is missing")
 
-        self.poll_interval = float(tm.settings.get("poll_interval", 2.0))
-        self.poll_count = int(tm.settings.get("poll_count", 20))
+        self.poll_interval = float(self.tm.settings.get("poll_interval", 2.0))
+        self.poll_count = int(self.tm.settings.get("poll_count", 20))
 
-        # Хранилища для уведомлений и отслеживания бафов
         self._active_jobs: Dict[int, ActiveJobInfo] = {}
         self._buff_results: Dict[int, BuffResultInfo] = {}
 
+        self._job_storage = JobStorage(path="jobs.json")
+        self._restore_active_jobs()
+
         logging.info("🤖 MultiTokenBot STARTED (Observer=LongPoll)")
-        logging.info(f"📋 Tokens: {len(tm.tokens)}")
-        logging.info(f"🛰️ Target poll: interval={self.poll_interval}s, count={self.poll_count}")
+        logging.info(f"📋 Tokens: {len(self.tm.tokens)}")
+        logging.info(
+            f"🛰️ Target poll: interval={self.poll_interval}s, count={self.poll_count}"
+        )
 
         self._lp_server: str = ""
         self._lp_key: str = ""
         self._lp_ts: str = ""
+
+        self._race_emojis: Dict[str, str] = {
+            "ч": "🧍",
+            "г": "👹",
+            "м": "🧟",
+            "э": "🧝",
+            "о": "👽",
+            "н": "😈",
+        }
+
+    def _restore_active_jobs(self) -> None:
+        try:
+            stored = self._job_storage.load_all()
+        except Exception as e:
+            logging.error(f"❌ Ошибка восстановления активных бафов: {e}")
+            return
+
+        if not stored:
+            return
+
+        now = time.time()
+        max_age = 3600
+
+        restored = 0
+        for user_id, (job_dict, buff_dict) in stored.items():
+            try:
+                job_payload = job_dict.get("job", {})
+                job = Job(
+                    sender_id=job_payload["sender_id"],
+                    trigger_text=job_payload["trigger_text"],
+                    letters=job_payload["letters"],
+                    created_ts=job_payload["created_ts"],
+                )
+            except Exception:
+                continue
+
+            if now - job.created_ts > max_age:
+                continue
+
+            job_info = ActiveJobInfo(
+                job=job,
+                letters=job_dict.get("letters", job.letters),
+                cmid=job_dict.get("cmid"),
+                message_id=job_dict.get("message_id", 0),
+                registration_time=job_dict.get("registration_time", job.created_ts),
+            )
+            self._active_jobs[user_id] = job_info
+
+            if buff_dict:
+                self._buff_results[user_id] = BuffResultInfo(
+                    tokens_info=buff_dict.get("tokens_info", []),
+                    total_value=buff_dict.get("total_value", 0),
+                    expected_count=buff_dict.get("expected_count", 0),
+                    completed_count=buff_dict.get("completed_count", 0),
+                )
+
+            restored += 1
+
+        if restored:
+            logging.info(
+                f"📦 Восстановлено активных бафов из jobs.json: {restored} пользователей"
+            )
 
     def _parse_baf_letters(self, text: str) -> str:
         text_n = normalize_text(text)
@@ -85,7 +150,6 @@ class ObserverBot:
         return normalize_text(text) == "!баф отмена"
 
     def _parse_golosa_cmd(self, text: str) -> Optional[Tuple[str, int]]:
-        """Парсинг команды !голоса"""
         t = (text or "").strip()
         if not normalize_text(t).startswith("!голоса"):
             return None
@@ -102,16 +166,13 @@ class ObserverBot:
         return name, max(0, n)
 
     def _apply_manual_voices_by_name(self, name: str, n: int) -> str:
-        """Применить ручное обновление голосов"""
         token = self.tm.get_token_by_name(name)
         if not token:
             return f"❌ Токен с именем '{name}' не найден."
         token.update_voices_manual(n)
-        # сохранение через отложенный механизм
         return f"✅ {token.name}: голоса выставлены = {n}"
 
     def _format_races_simple(self, token) -> str:
-        # force cleanup чтобы !апо показывало корректно
         token._cleanup_expired_temp_races(force=True)
         parts = []
         if token.races:
@@ -258,7 +319,6 @@ class ObserverBot:
                 )
                 return
 
-        # защита: токен наблюдателя не может получать расы
         if token.id == self.observer.id:
             self.observer.send_to_peer(
                 self.observer.source_peer_id,
@@ -408,7 +468,6 @@ class ObserverBot:
             return None
 
     def _send_registration_notification(self, from_id: int, letters: str, cmid: int) -> int:
-        """Отправляет уведомление о регистрации бафа и возвращает message_id (или 0)."""
         notification_text = (
             f"✅ Баф зарегистрирован: {letters}\n"
             f"📊 Ожидается бафов: {len(letters)}\n"
@@ -426,25 +485,105 @@ class ObserverBot:
         return 0
 
     def _send_final_notification(self, user_id: int) -> None:
-        """Отправляет финальное уведомление о бафе, когда все бафы выполнены."""
         user_data = self._buff_results.get(user_id)
         if not user_data or not user_data.tokens_info:
             return
 
-        tokens_text = []
-        for token_info in user_data.tokens_info:
-            token_text = f"{token_info['token_name']}({token_info['buff_value']}"
-            if token_info["is_critical"]:
-                token_text += "🍀"
-            token_text += ")"
-            tokens_text.append(token_text)
+        lines: List[str] = []
 
-        notification_text = (
-            "🎉 Баф успешно выдан!\n"
-            f"📈 Начислено: {', '.join(tokens_text)}\n"
-            f"📉 Вычтено: ({user_data.total_value}) баланса"
-        )
+        all_already = True
+        any_success = False
 
+        for info in user_data.tokens_info:
+            status = info.get("status", "SUCCESS")
+            if status == "SUCCESS":
+                any_success = True
+                all_already = False
+            elif status == "ALREADY_BUFF":
+                pass
+            else:
+                all_already = False
+
+        if all_already and not any_success:
+            lines.append("🎉 Баф успешно выдан до этого!")
+        else:
+            lines.append("🎉 Баф успешно выдан!")
+
+        total_spent = 0
+
+        for info in user_data.tokens_info:
+            token_name = info.get("token_name") or ""
+            buff_name = (info.get("buff_name") or "").lower()
+            buff_val = info.get("buff_value", 0)
+            is_critical = info.get("is_critical", False)
+            status = info.get("status", "SUCCESS")
+            full_text = (info.get("full_text") or "")
+            full_text_lower = full_text.lower()
+
+            token = self.tm.get_token_by_name(token_name) if token_name else None
+            owner_id = token.owner_vk_id if token and token.owner_vk_id else None
+
+            # ALREADY_BUFF → всегда упоминаем самого пользователя
+            if status == "ALREADY_BUFF":
+                base_link = f"[id{user_id}|"
+                lines.append(f"{base_link}🚫] Благословений не было")
+                continue
+
+            # для остальных бафов: владелец токена или сам пользователь
+            base_link = f"[id{owner_id}|" if owner_id else f"[id{user_id}|"
+
+            if "удач" in buff_name or "благословение удачи" in full_text_lower:
+                if buff_val >= 150 or is_critical:
+                    core = "Благ. Удачи +9!"
+                    emoji = "🍀🍀"
+                else:
+                    core = "Благ. Удачи +6!"
+                    emoji = "🍀"
+            elif "атак" in buff_name or "благословение атаки" in full_text_lower:
+                if buff_val >= 150 or is_critical:
+                    core = "Благ. Атаки +30%!"
+                    emoji = "🍀🗡️"
+                else:
+                    core = "Благ. Атаки +20%!"
+                    emoji = "🗡️"
+            elif "защит" in buff_name or "благословение защиты" in full_text_lower:
+                if buff_val >= 150 or is_critical:
+                    core = "Благ. Защиты +30%!"
+                    emoji = "🍀🛡️"
+                else:
+                    core = "Благ. Защиты +20%!"
+                    emoji = "🛡️"
+            elif "человек" in buff_name or "благословение человека" in full_text_lower:
+                core = "Благ. Человека!"
+                emoji = "🧍"
+            elif "гоблин" in buff_name or "благословение гоблина" in full_text_lower:
+                core = "Благ. Гоблина!"
+                emoji = "👹"
+            elif "эльф" in buff_name or "благословение эльфа" in full_text_lower:
+                core = "Благ. Эльфа!"
+                emoji = "🧝"
+            elif "орк" in buff_name or "благословение орка" in full_text_lower:
+                core = "Благ. Орка!"
+                emoji = "👽"
+            elif "нежит" in buff_name or "благословение нежити" in full_text_lower:
+                core = "Благ. Нежити!"
+                emoji = "🧟"
+            elif "демон" in buff_name or "благословение демона" in full_text_lower:
+                core = "Благ. Демона!"
+                emoji = "😈"
+            else:
+                core = f"{token_name or 'Благословение'} ({buff_val})"
+                emoji = "✨"
+
+            if status == "SUCCESS":
+                lines.append(f"{base_link}{emoji}] {core}")
+                total_spent += buff_val
+            else:
+                lines.append(f"{base_link}🚫] {core}")
+
+        lines.append(f"[id{user_id}|💰] Списано {total_spent} баллов")
+
+        notification_text = "\n".join(lines)
         sent_ok, send_status = self.observer.send_to_peer(
             self.observer.source_peer_id, notification_text
         )
@@ -454,12 +593,11 @@ class ObserverBot:
             )
             return
 
-        # Очищаем данные пользователя только после успешной отправки
         self._buff_results.pop(user_id, None)
         self._active_jobs.pop(user_id, None)
+        self._job_storage.delete_for_user(user_id)
 
     def _handle_buff_completion(self, job: Job, buff_info: Dict) -> None:
-        """Обработка завершения бафа - вызывается из Scheduler."""
         if not job or not buff_info:
             return
 
@@ -471,24 +609,46 @@ class ObserverBot:
 
         buff_value = buff_info.get("buff_value", 0)
         is_critical = buff_info.get("is_critical", False)
-        buff_name = buff_info.get("buff_name", "")
+        buff_name = (buff_info.get("buff_name") or "").lower()
         token_name = buff_info.get("token_name", "")
+        full_text = (buff_info.get("full_text") or "")
+        full_text_lower = full_text.lower().replace("ё", "е")
+        text_norm = full_text_lower.replace(" ", "")
+        status = buff_info.get("status", "SUCCESS")
 
         original_buff_value = buff_value
         original_is_critical = is_critical
 
-        if buff_name and ("30%" in buff_name or "+30%" in buff_name):
-            is_critical = True
-            buff_value = 150
-            logging.info(
-                f"🎯 Observer: ПЕРЕОПРЕДЕЛЕНО как крит по проценту в названии: {buff_name}"
-            )
-        elif buff_name and ("20%" in buff_name or "+20%" in buff_name):
-            is_critical = False
-            buff_value = 100
-            logging.info(
-                f"📊 Observer: ПЕРЕОПРЕДЕЛЕНО как обычный по проценту в названии: {buff_name}"
-            )
+        if "удач" in buff_name or "удач" in full_text_lower:
+            if "удачаповышенана9единицвтечениидвухчасов" in text_norm:
+                is_critical = True
+                buff_value = 150
+                logging.info(
+                    "🎯 Observer: критический баф удачи по строке 'Удача повышена на 9 единиц в течение двух часов' → 150"
+                )
+            elif "удачаповышенана6единиц" in text_norm:
+                is_critical = False
+                buff_value = 100
+                logging.info(
+                    "📊 Observer: обычный баф удачи по строке 'Удача повышена на 6 единиц' → 100"
+                )
+            else:
+                logging.info(
+                    "ℹ️ Observer: баф удачи без 6/9 единиц — оставляем исходное значение, проценты игнорируем"
+                )
+        else:
+            if buff_name and ("30%" in buff_name or "+30%" in buff_name):
+                is_critical = True
+                buff_value = 150
+                logging.info(
+                    f"🎯 Observer: ПЕРЕОПРЕДЕЛЕНО как крит по проценту в названии: {buff_name}"
+                )
+            elif buff_name and ("20%" in buff_name or "+20%" in buff_name):
+                is_critical = False
+                buff_value = 100
+                logging.info(
+                    f"📊 Observer: ПЕРЕОПРЕДЕЛЕНО как обычный по проценту в названии: {buff_name}"
+                )
 
         if (
             original_buff_value != buff_value
@@ -502,7 +662,7 @@ class ObserverBot:
 
         logging.info(
             f"📥 Observer: Получен баф от {token_name}: "
-            f"значение={buff_value}, крит={is_critical}, название='{buff_name}'"
+            f"значение={buff_value}, крит={is_critical}, название='{buff_name}', статус={status}"
         )
 
         if user_id not in self._buff_results:
@@ -520,6 +680,9 @@ class ObserverBot:
                 "token_name": token_name,
                 "buff_value": buff_value,
                 "is_critical": is_critical,
+                "buff_name": buff_name,
+                "full_text": full_text,
+                "status": status,
             }
         )
         user_data.total_value += buff_value
@@ -530,11 +693,32 @@ class ObserverBot:
             f"выполнено {user_data.completed_count}/{user_data.expected_count} бафов"
         )
 
+        job_info = self._active_jobs[user_id]
+        job_dict = {
+            "job": {
+                "sender_id": job_info.job.sender_id,
+                "trigger_text": job_info.job.trigger_text,
+                "letters": job_info.job.letters,
+                "created_ts": job_info.job.created_ts,
+            },
+            "letters": job_info.letters,
+            "cmid": job_info.cmid,
+            "message_id": job_info.message_id,
+            "registration_time": job_info.registration_time,
+        }
+        buff = self._buff_results[user_id]
+        buff_dict = {
+            "tokens_info": buff.tokens_info,
+            "total_value": buff.total_value,
+            "expected_count": buff.expected_count,
+            "completed_count": buff.completed_count,
+        }
+        self._job_storage.save_for_user(user_id, job_dict, buff_dict)
+
         if user_data.completed_count >= user_data.expected_count:
             self._send_final_notification(user_id)
 
     def _handle_baf_cancel_command(self, from_id: int, cmid: int) -> None:
-        """Обработка команды !баф отмена."""
         job_info = self._active_jobs.get(from_id)
         if not job_info:
             self.observer.send_to_peer(
@@ -549,6 +733,7 @@ class ObserverBot:
 
         self._buff_results.pop(from_id, None)
         self._active_jobs.pop(from_id, None)
+        self._job_storage.delete_for_user(from_id)
 
         if cancelled:
             self.observer.send_to_peer(
@@ -651,19 +836,39 @@ class ObserverBot:
             if cmid:
                 message_id = self._send_registration_notification(from_id, letters, cmid)
                 if message_id > 0:
-                    self._active_jobs[from_id] = ActiveJobInfo(
+                    job_info = ActiveJobInfo(
                         job=job,
                         letters=letters,
                         cmid=cmid,
                         message_id=message_id,
                         registration_time=time.time(),
                     )
+                    self._active_jobs[from_id] = job_info
                     self._buff_results[from_id] = BuffResultInfo(
                         tokens_info=[],
                         total_value=0,
                         expected_count=len(letters),
                         completed_count=0,
                     )
+                    job_dict = {
+                        "job": {
+                            "sender_id": job.sender_id,
+                            "trigger_text": job.trigger_text,
+                            "letters": job.letters,
+                            "created_ts": job.created_ts,
+                        },
+                        "letters": letters,
+                        "cmid": cmid,
+                        "message_id": message_id,
+                        "registration_time": job_info.registration_time,
+                    }
+                    buff_dict = {
+                        "tokens_info": [],
+                        "total_value": 0,
+                        "expected_count": len(letters),
+                        "completed_count": 0,
+                    }
+                    self._job_storage.save_for_user(from_id, job_dict, buff_dict)
 
             self.scheduler.enqueue_letters(job, letters)
 

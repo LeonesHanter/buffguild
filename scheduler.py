@@ -177,6 +177,16 @@ class Scheduler:
         candidates_with_scores.sort(key=lambda x: x[0], reverse=True)
         return [t for _, t in candidates_with_scores]
 
+    def _call_on_complete_safe(self, job: Job, buff_info: Dict) -> None:
+        if not self._on_buff_complete or not buff_info:
+            return
+        try:
+            self._on_buff_complete(job, buff_info)
+        except Exception as e:
+            logging.error(
+                f"❌ Ошибка в колбэке on_buff_complete: {e}"
+            )
+
     def _run_loop(self):
         while True:
             try:
@@ -202,47 +212,33 @@ class Scheduler:
 
                 success = False
                 attempt_status = ""
-                buff_info = None
+                buff_info: Optional[Dict[str, Any]] = None
 
-                token = candidates[0]
-                ok, status, info = self.executor.execute_one(token, ability, job)
-                attempt_status = status
-                buff_info = info
+                for token in candidates[:2]:
+                    ok, status, info = self.executor.execute_one(token, ability, job)
+                    attempt_status = status
+                    buff_info = info or {}
 
-                if ok or status in ("SUCCESS", "ALREADY"):
-                    success = True
-                    if success and buff_info and self._on_buff_complete:
-                        try:
-                            self._on_buff_complete(job, buff_info)
-                        except Exception as e:
-                            logging.error(
-                                f"❌ Ошибка в колбэке on_buff_complete: {e}"
-                            )
-                else:
-                    if len(candidates) > 1:
-                        token = candidates[1]
-                        ok, status, info = self.executor.execute_one(
-                            token, ability, job
-                        )
-                        attempt_status = status
-                        buff_info = info
+                    norm_status = (status or "").upper()
+                    if norm_status == "ALREADY":
+                        norm_status = "ALREADY_BUFF"
 
-                        if ok or status in ("SUCCESS", "ALREADY"):
-                            success = True
-                            if success and buff_info and self._on_buff_complete:
-                                try:
-                                    self._on_buff_complete(job, buff_info)
-                                except Exception as e:
-                                    logging.error(
-                                        f"❌ Ошибка в колбэке on_buff_complete: {e}"
-                                    )
+                    buff_info.setdefault("status", norm_status)
+
+                    if ok or norm_status in ("SUCCESS", "ALREADY_BUFF"):
+                        success = True
+                        self._call_on_complete_safe(job, buff_info)
+                        break
 
                 if not success:
-                    self._reschedule(time.time() + 30.0, job, letter)
-                    logging.info(
-                        f"⏳ Не удалось обработать '{letter}' "
-                        f"(статус: {attempt_status}), повтор через 30с"
-                    )
+                    if attempt_status and attempt_status.upper() in ("SUCCESS", "ALREADY", "ALREADY_BUFF"):
+                        self._call_on_complete_safe(job, buff_info or {})
+                    else:
+                        self._reschedule(time.time() + 30.0, job, letter)
+                        logging.info(
+                            f"⏳ Не удалось обработать '{letter}' "
+                            f"(статус: {attempt_status}), повтор через 30с"
+                        )
 
             except Exception as e:
                 logging.error(f"❌ Ошибка в Scheduler: {e}", exc_info=True)
