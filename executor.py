@@ -21,6 +21,7 @@ from .regexes import (
     RE_NOT_APOSTLE_OF_RACE,
     RE_ALREADY_BUFF,
     RE_OTHER_RACE,
+    RE_ALREADY_RACE,
 )
 from .token_handler import TokenHandler
 from .models import ParsedAbility, Job
@@ -54,8 +55,7 @@ class AbilityExecutor:
                 cmid = m.get("conversation_message_id")
                 cmid_int = (
                     int(cmid)
-                    if isinstance(cmid, int)
-                    or (isinstance(cmid, str) and str(cmid).isdigit())
+                    if isinstance(cmid, int) or (isinstance(cmid, str) and str(cmid).isdigit())
                     else None
                 )
                 return mid, cmid_int
@@ -63,7 +63,8 @@ class AbilityExecutor:
         return None, None
 
     def _parse_new_messages(
-        self, msgs: List[Dict[str, Any]]
+        self,
+        msgs: List[Dict[str, Any]]
     ) -> Tuple[str, Optional[int], Optional[int], str]:
         remaining = None
         voices_val = None
@@ -146,6 +147,14 @@ class AbilityExecutor:
                 )
                 return "OTHER_RACE", remaining, voices_val, full_response_text
 
+            if RE_ALREADY_RACE.search(text):
+                matched = RE_ALREADY_RACE.search(text).group(0)
+                logger.info(
+                    f"🔍 Статус: ALREADY_BUFF - "
+                    f"'{RE_ALREADY_RACE.pattern}' сработало на '{matched}'"
+                )
+                return "ALREADY_BUFF", remaining, voices_val, full_response_text
+
             if RE_NOT_APOSTLE.search(text):
                 matched = RE_NOT_APOSTLE.search(text).group(0)
                 logger.info(
@@ -200,32 +209,25 @@ class AbilityExecutor:
         is_critical = False
         buff_value = 100
 
-        percent_patterns = [
-            r"(\+?\d{1,3})\s*%",
-            r"на\s+(\d{1,3})\s*%",
-            r"повышена\s+на\s+(\d{1,3})\s*%",
-            r"увеличена\s+на\s+(\d{1,3})\s*%",
-            r"повышена\s+(\d{1,3})\s*%",
-            r"увеличена\s+(\d{1,3})\s*%",
-            r"Броня повышена на (\d{1,3})%",
-            r"Атака повышена на (\d{1,3})%",
-            r"Удача повышена на (\d{1,3})",
-        ]
+        # 1) Удача в единицах — приоритет
+        luck_match = re.search(r"удача\s+повышена\s+на\s+(\d{1,3})", text_lower)
+        if luck_match:
+            try:
+                luck_val = int(luck_match.group(1))
+                if luck_val == 9:
+                    logger.info("🍀 Баф удачи: 9 единиц = 150 голосов (крит)")
+                    return 150, True
+                if luck_val == 6:
+                    logger.info("🍀 Баф удачи: 6 единиц = 100 голосов (обычный)")
+                    return 100, False
+                logger.info(
+                    f"🍀 Баф удачи: {luck_val} единиц → по умолчанию 100 голосов (обычный)"
+                )
+                return 100, False
+            except Exception as e:
+                logger.debug(f"❌ Ошибка парсинга удачи в единицах: {e}")
 
-        found_percent = None
-        for pattern in percent_patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                try:
-                    found_percent = int(match.group(1))
-                    logger.info(
-                        f"🔍 Найден процент в тексте: {found_percent}% (паттерн: {pattern})"
-                    )
-                    break
-                except Exception as e:
-                    logger.debug(f"❌ Ошибка парсинга процента: {e}")
-                    continue
-
+        # 2) Расовые бафы — фиксированная стоимость
         race_keywords = [
             "человек",
             "гоблин",
@@ -246,6 +248,33 @@ class AbilityExecutor:
             logger.debug(f"📊 Расовый баф: {text[:50]}...")
             return 100, False
 
+        # 3) Общие проценты (атака/защита/прочее)
+        percent_patterns = [
+            r"(\+?\d{1,3})\s*%",
+            r"на\s+(\d{1,3})\s*%",
+            r"повышена\s+на\s+(\d{1,3})\s*%",
+            r"увеличена\s+на\s+(\d{1,3})\s*%",
+            r"повышена\s+(\d{1,3})\s*%",
+            r"увеличена\s+(\d{1,3})\s*%",
+            r"броня повышена на (\d{1,3})%",
+            r"атака повышена на (\d{1,3})%",
+        ]
+
+        found_percent = None
+
+        for pattern in percent_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                try:
+                    found_percent = int(match.group(1))
+                    logger.info(
+                        f"🔍 Найден процент в тексте: {found_percent}% (паттерн: {pattern})"
+                    )
+                    break
+                except Exception as e:
+                    logger.debug(f"❌ Ошибка парсинга процента: {e}")
+                    continue
+
         if found_percent is not None:
             if found_percent == 30:
                 is_critical = True
@@ -259,32 +288,25 @@ class AbilityExecutor:
                 logger.info(
                     f"📊 Обычный баф: {found_percent}% = {buff_value} голосов"
                 )
-            elif found_percent in (6, 9):
-                is_critical = False
-                buff_value = 100
-                logger.info(
-                    f"🍀 Баф удачи: {found_percent} единиц = {buff_value} голосов"
-                )
             else:
                 buff_value = 100
-                is_critical = "критический" in text_lower or "🍀" in text
+                is_critical = "критический" in text_lower or "🍀" in text_lower
                 logger.info(
                     f"📈 Баф {found_percent}%: значение={buff_value}, крит={is_critical}"
                 )
         else:
             logger.debug(f"📝 Процент не найден в тексте: {text[:100]}...")
-            if not is_critical and ("критический баф" in text_lower or "🍀" in text):
-                is_critical = True
-                buff_value = 150
-                logger.info(
-                    "🍀 Определен крит баф по тексту: 'критический' или '🍀'"
-                )
 
-            if any(x in text_lower for x in ["атаки", "защиты"]):
-                buff_value = 150 if is_critical else 100
-                logger.debug(
-                    f"⚔️ Баф атаки/защиты без процента: значение={buff_value}, крит={is_critical}"
-                )
+        if not is_critical and ("критический баф" in text_lower or "🍀" in text_lower):
+            is_critical = True
+            buff_value = 150
+            logger.info("🍀 Определен крит баф по тексту: 'критический' или '🍀'")
+
+        if any(x in text_lower for x in ["атаки", "защиты"]):
+            buff_value = 150 if is_critical else 100
+            logger.debug(
+                f"⚔️ Баф атаки/защиты: значение={buff_value}, крит={is_critical}"
+            )
 
         logger.info(
             f"📊 Итог парсинга бафа: значение={buff_value}, крит={is_critical}, "
@@ -293,7 +315,10 @@ class AbilityExecutor:
         return buff_value, is_critical
 
     def execute_one(
-        self, token: TokenHandler, ability: ParsedAbility, job: Job
+        self,
+        token: TokenHandler,
+        ability: ParsedAbility,
+        job: Job
     ) -> Tuple[bool, str, Optional[Dict]]:
         with token._lock:
             observer_token = self.tm.get_observer()
@@ -347,6 +372,7 @@ class AbilityExecutor:
                     ability.text,
                     forward_msg_id=trigger_mid,
                 )
+
                 if not ok:
                     token.increment_buff_stats(False)
                     return False, send_status, None
@@ -391,17 +417,15 @@ class AbilityExecutor:
                         if ability.key in RACE_NAMES:
                             before_cnt = len(token.temp_races)
                             token.temp_races = [
-                                tr
-                                for tr in token.temp_races
-                                if tr["race"] != ability.key
+                                tr for tr in token.temp_races if tr["race"] != ability.key
                             ]
                             if len(token.temp_races) != before_cnt:
                                 self.tm.mark_for_save()
                                 self.tm.update_race_index(token)
-                                logger.warning(
-                                    f"🗑️ {token.name}: удалена временная раса "
-                                    f"'{ability.key}' (NOT_APOSTLE_OF_RACE)"
-                                )
+                            logger.warning(
+                                f"🗑️ {token.name}: удалена временная раса "
+                                f"'{ability.key}' (NOT_APOSTLE_OF_RACE)"
+                            )
 
                         token.set_ability_cooldown(ability.key, 300)
                         token.set_social_cooldown(300)
@@ -419,17 +443,15 @@ class AbilityExecutor:
                         if ability.key in RACE_NAMES:
                             before_cnt = len(token.temp_races)
                             token.temp_races = [
-                                tr
-                                for tr in token.temp_races
-                                if tr["race"] != ability.key
+                                tr for tr in token.temp_races if tr["race"] != ability.key
                             ]
                             if len(token.temp_races) != before_cnt:
                                 self.tm.mark_for_save()
                                 self.tm.update_race_index(token)
-                                logger.warning(
-                                    f"🗑️ {token.name}: удалена временная раса "
-                                    f"'{ability.key}' (NOT_APOSTLE)"
-                                )
+                            logger.warning(
+                                f"🗑️ {token.name}: удалена временная раса "
+                                f"'{ability.key}' (NOT_APOSTLE)"
+                            )
 
                         token.set_ability_cooldown(ability.key, 300)
                         token.set_social_cooldown(300)
@@ -453,13 +475,13 @@ class AbilityExecutor:
                                     now_ts = time.time()
                                     expires_at = round(now_ts + 2 * 60 * 60)
                                     updated = owner.update_temp_race_expiry(
-                                        ability.key, expires_at
+                                        ability.key,
+                                        expires_at,
                                     )
-                                    if not updated and not owner.has_race(
-                                        ability.key
-                                    ):
+                                    if not updated and not owner.has_race(ability.key):
                                         added = owner.add_temporary_race(
-                                            ability.key, expires_at=expires_at
+                                            ability.key,
+                                            expires_at=expires_at,
                                         )
                                         if added:
                                             logger.info(
@@ -490,9 +512,11 @@ class AbilityExecutor:
                         logger.debug(
                             f"📋 Текст ответа для анализа: {buff_response_text[:200]}..."
                         )
+
                         buff_value, is_critical = self._parse_buff_value(
                             buff_response_text
                         )
+
                         logger.info(
                             f"📊 Результат: {token.name}: {ability.text} "
                             f"(значение: {buff_value}, крит: {is_critical})"
@@ -547,7 +571,6 @@ class AbilityExecutor:
                 return False, "UNKNOWN", None
 
     def refresh_profile(self, token: TokenHandler) -> bool:
-        """Обновление профиля (голоса, уровень) через команду 'Мой профиль'."""
         if not token.enabled or token.is_captcha_paused() or token.needs_manual_voices:
             return False
 
@@ -559,6 +582,7 @@ class AbilityExecutor:
             return False
 
         time.sleep(3.0)
+
         history = token.get_history_cached(token.target_peer_id, count=25)
         new_msgs = [m for m in history if int(m.get("id", 0)) > last_id_before]
         if not new_msgs:

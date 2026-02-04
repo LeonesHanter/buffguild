@@ -16,13 +16,10 @@ class Scheduler:
     def __init__(self, tm, executor, on_buff_complete: Callable[[Job, Dict], None] = None):
         self.tm = tm
         self.executor = executor
-
         self._q: List[Tuple[float, Job, str]] = []
         self._lock = threading.Lock()
         self._last_cleanup_time: float = 0.0
-
         self._on_buff_complete = on_buff_complete
-
         self._thr = threading.Thread(target=self._run_loop, daemon=True)
         self._thr.start()
 
@@ -41,7 +38,8 @@ class Scheduler:
         with self._lock:
             original_len = len(self._q)
             self._q = [
-                (ts, job, ch) for ts, job, ch in self._q if job.sender_id != user_id
+                (ts, job, ch) for ts, job, ch in self._q
+                if job.sender_id != user_id
             ]
             removed = original_len - len(self._q)
             if removed > 0:
@@ -49,15 +47,19 @@ class Scheduler:
                     f"🗑️ Отменены бафы пользователя {user_id}: {removed} шт."
                 )
                 return True
-            return False
+        return False
 
     def _cleanup_old_jobs(self) -> None:
         now = time.time()
         if now - self._last_cleanup_time < 300:
             return
+
         with self._lock:
             original_len = len(self._q)
-            self._q = [(ts, job, ch) for ts, job, ch in self._q if now - ts < 3600]
+            self._q = [
+                (ts, job, ch) for ts, job, ch in self._q
+                if now - ts < 3600
+            ]
             if len(self._q) != original_len:
                 logging.info(
                     f"🧹 Очищены старые задачи: {original_len - len(self._q)}"
@@ -208,6 +210,18 @@ class Scheduler:
                     logging.warning(
                         f"🚫 Нет кандидатов для '{letter}', пропускаем задачу"
                     )
+                    # ВАЖНО: уведомляем Observer, что баф не выдан
+                    if self._on_buff_complete:
+                        dummy_buff_info: Dict[str, Any] = {
+                            "token_name": "",
+                            "buff_value": 0,
+                            "is_critical": False,
+                            "ability_key": ability.key,
+                            "buff_name": ability.text,
+                            "full_text": "",
+                            "status": "NO_CANDIDATES",
+                        }
+                        self._call_on_complete_safe(job, dummy_buff_info)
                     continue
 
                 success = False
@@ -218,11 +232,9 @@ class Scheduler:
                     ok, status, info = self.executor.execute_one(token, ability, job)
                     attempt_status = status
                     buff_info = info or {}
-
                     norm_status = (status or "").upper()
                     if norm_status == "ALREADY":
                         norm_status = "ALREADY_BUFF"
-
                     buff_info.setdefault("status", norm_status)
 
                     if ok or norm_status in ("SUCCESS", "ALREADY_BUFF"):

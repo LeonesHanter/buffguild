@@ -38,11 +38,10 @@ class ObserverBot:
     def __init__(self, tm, executor):
         self.tm = tm
         self.executor = executor
-
         self.scheduler = Scheduler(tm, executor, on_buff_complete=self._handle_buff_completion)
         self.health_monitor = TokenHealthMonitor(tm)
-
         self.observer = self.tm.get_observer()
+
         if not self.observer.access_token:
             raise RuntimeError("Observer token has empty access_token")
         if not self.observer.source_peer_id:
@@ -53,7 +52,6 @@ class ObserverBot:
 
         self._active_jobs: Dict[int, ActiveJobInfo] = {}
         self._buff_results: Dict[int, BuffResultInfo] = {}
-
         self._job_storage = JobStorage(path="jobs.json")
         self._restore_active_jobs()
 
@@ -88,8 +86,8 @@ class ObserverBot:
 
         now = time.time()
         max_age = 3600
-
         restored = 0
+
         for user_id, (job_dict, buff_dict) in stored.items():
             try:
                 job_payload = job_dict.get("job", {})
@@ -121,8 +119,7 @@ class ObserverBot:
                     expected_count=buff_dict.get("expected_count", 0),
                     completed_count=buff_dict.get("completed_count", 0),
                 )
-
-            restored += 1
+                restored += 1
 
         if restored:
             logging.info(
@@ -133,13 +130,17 @@ class ObserverBot:
         text_n = normalize_text(text)
         if not text_n.startswith("!баф"):
             return ""
+
         s = text_n[4:].strip()
         if not s:
             return ""
+
         s = s[:4]
+
         allowed = set()
         for cls in CLASS_ABILITIES.values():
             allowed.update(cls["abilities"].keys())
+
         out = "".join([ch for ch in s if ch in allowed])
         return out[:4]
 
@@ -153,28 +154,35 @@ class ObserverBot:
         t = (text or "").strip()
         if not normalize_text(t).startswith("!голоса"):
             return None
+
         parts = t.split()
         if len(parts) != 3:
             return None
+
         name = parts[1].strip()
         try:
             n = int(parts[2].strip())
         except Exception:
             return None
+
         if not name:
             return None
+
         return name, max(0, n)
 
     def _apply_manual_voices_by_name(self, name: str, n: int) -> str:
         token = self.tm.get_token_by_name(name)
         if not token:
             return f"❌ Токен с именем '{name}' не найден."
+
         token.update_voices_manual(n)
         return f"✅ {token.name}: голоса выставлены = {n}"
 
     def _format_races_simple(self, token) -> str:
         token._cleanup_expired_temp_races(force=True)
+
         parts = []
+
         if token.races:
             parts.append("/".join(sorted(token.races)))
 
@@ -238,7 +246,9 @@ class ObserverBot:
         return "\n".join(lines).strip()
 
     def _parse_doprasa_cmd(
-        self, text: str, msg_item: Dict[str, Any]
+        self,
+        text: str,
+        msg_item: Dict[str, Any]
     ) -> Optional[Tuple[str, Optional[str], Optional[int], str]]:
         t = InputValidator.sanitize_text(text, max_length=50)
         if not normalize_text(t).startswith("/допраса"):
@@ -271,7 +281,10 @@ class ObserverBot:
         return race, token_name, original_timestamp, text
 
     def _handle_doprasa_command(
-        self, from_id: int, text: str, msg_item: Dict[str, Any]
+        self,
+        from_id: int,
+        text: str,
+        msg_item: Dict[str, Any]
     ) -> None:
         parsed = self._parse_doprasa_cmd(text, msg_item)
         if not parsed:
@@ -299,7 +312,6 @@ class ObserverBot:
                     None,
                 )
                 return
-
             if token.owner_vk_id == 0:
                 token.fetch_owner_id_lazy()
             if token.owner_vk_id != 0 and token.owner_vk_id != from_id:
@@ -382,9 +394,9 @@ class ObserverBot:
             return
 
         success = token.add_temporary_race(
-            race_key, expires_at=original_timestamp + 2 * 3600
+            race_key,
+            expires_at=original_timestamp + 2 * 3600
         )
-
         if success:
             self.tm.update_race_index(token)
             self.observer.send_to_peer(
@@ -430,6 +442,7 @@ class ObserverBot:
         ret = self.observer._vk.call(
             self.observer._vk.post("messages.getLongPollServer", data)
         )
+
         if "error" in ret:
             err = ret["error"]
             logging.error(
@@ -441,6 +454,7 @@ class ObserverBot:
         self._lp_server = str(resp.get("server", "")).strip()
         self._lp_key = str(resp.get("key", "")).strip()
         self._lp_ts = str(resp.get("ts", "")).strip()
+
         if not self._lp_server or not self._lp_key or not self._lp_ts:
             logging.error("❌ LongPollServer: missing server/key/ts")
             return False
@@ -458,6 +472,7 @@ class ObserverBot:
             "mode": 2,
             "version": 3,
         }
+
         try:
             return self.observer._vk.call(self.observer._vk.raw_post(server, data))
         except aiohttp.ClientError as e:
@@ -523,13 +538,11 @@ class ObserverBot:
             token = self.tm.get_token_by_name(token_name) if token_name else None
             owner_id = token.owner_vk_id if token and token.owner_vk_id else None
 
-            # ALREADY_BUFF → всегда упоминаем самого пользователя
             if status == "ALREADY_BUFF":
                 base_link = f"[id{user_id}|"
                 lines.append(f"{base_link}🚫] Благословений не было")
                 continue
 
-            # для остальных бафов: владелец токена или сам пользователь
             base_link = f"[id{owner_id}|" if owner_id else f"[id{user_id}|"
 
             if "удач" in buff_name or "благословение удачи" in full_text_lower:
@@ -571,6 +584,9 @@ class ObserverBot:
             elif "демон" in buff_name or "благословение демона" in full_text_lower:
                 core = "Благ. Демона!"
                 emoji = "😈"
+            elif "гном" in buff_name or "благословение гнома" in full_text_lower:
+                core = "Благ. Гнома!"
+                emoji = "🎅"
             else:
                 core = f"{token_name or 'Благословение'} ({buff_val})"
                 emoji = "✨"
@@ -581,7 +597,7 @@ class ObserverBot:
             else:
                 lines.append(f"{base_link}🚫] {core}")
 
-        lines.append(f"[id{user_id}|💰] Списано {total_spent} баллов")
+        lines.append(f"[id{user_id}|💰] Пока тест не Списано {total_spent} баллов")
 
         notification_text = "\n".join(lines)
         sent_ok, send_status = self.observer.send_to_peer(
@@ -602,7 +618,6 @@ class ObserverBot:
             return
 
         user_id = job.sender_id
-
         if user_id not in self._active_jobs:
             logging.warning(f"⚠️ Получен баф для неактивного пользователя {user_id}")
             return
@@ -613,29 +628,16 @@ class ObserverBot:
         token_name = buff_info.get("token_name", "")
         full_text = (buff_info.get("full_text") or "")
         full_text_lower = full_text.lower().replace("ё", "е")
-        text_norm = full_text_lower.replace(" ", "")
         status = buff_info.get("status", "SUCCESS")
 
         original_buff_value = buff_value
         original_is_critical = is_critical
 
         if "удач" in buff_name or "удач" in full_text_lower:
-            if "удачаповышенана9единицвтечениидвухчасов" in text_norm:
-                is_critical = True
-                buff_value = 150
-                logging.info(
-                    "🎯 Observer: критический баф удачи по строке 'Удача повышена на 9 единиц в течение двух часов' → 150"
-                )
-            elif "удачаповышенана6единиц" in text_norm:
-                is_critical = False
-                buff_value = 100
-                logging.info(
-                    "📊 Observer: обычный баф удачи по строке 'Удача повышена на 6 единиц' → 100"
-                )
-            else:
-                logging.info(
-                    "ℹ️ Observer: баф удачи без 6/9 единиц — оставляем исходное значение, проценты игнорируем"
-                )
+            logging.debug(
+                "ℹ️ Observer: баф удачи — используем значения из executor "
+                f"(value={buff_value}, crit={is_critical})"
+            )
         else:
             if buff_name and ("30%" in buff_name or "+30%" in buff_name):
                 is_critical = True
@@ -730,7 +732,6 @@ class ObserverBot:
 
         letters = job_info.letters
         cancelled = self.scheduler.cancel_user_jobs(from_id)
-
         self._buff_results.pop(from_id, None)
         self._active_jobs.pop(from_id, None)
         self._job_storage.delete_for_user(from_id)
@@ -756,6 +757,7 @@ class ObserverBot:
 
         if peer_id != self.observer.source_peer_id:
             return
+
         if from_id <= 0 or not text:
             return
 
@@ -787,6 +789,7 @@ class ObserverBot:
 
             if token.owner_vk_id == 0:
                 token.fetch_owner_id_lazy()
+
             if token.owner_vk_id != 0 and token.owner_vk_id != from_id:
                 logging.warning(
                     f"⚠️ Неавторизованная команда !голоса от {from_id} "
@@ -850,6 +853,7 @@ class ObserverBot:
                         expected_count=len(letters),
                         completed_count=0,
                     )
+
                     job_dict = {
                         "job": {
                             "sender_id": job.sender_id,
@@ -890,6 +894,7 @@ class ObserverBot:
                             "💥 Превышено максимальное количество попыток получения LongPoll сервера"
                         )
                         break
+
                     time.sleep(min(retry_delay * retry_count, 300))
                     continue
 
@@ -910,6 +915,7 @@ class ObserverBot:
                             logging.warning(
                                 f"⚠️ LongPoll failed with code: {error_code}"
                             )
+
                             if error_code == 1:
                                 new_ts = lp.get("ts")
                                 if new_ts:
@@ -954,16 +960,19 @@ class ObserverBot:
                             continue
 
                         msg_ids: List[int] = []
+
                         for u in updates:
                             if not isinstance(u, list) or not u:
                                 continue
                             if int(u[0]) != 4:
                                 continue
+
                             try:
                                 msg_id = int(u[1])
                                 p_id = int(u[3])
                             except Exception:
                                 continue
+
                             if p_id == self.observer.source_peer_id:
                                 msg_ids.append(msg_id)
 
@@ -980,14 +989,16 @@ class ObserverBot:
                         continue
                     except Exception as e:
                         logging.error(
-                            f"❌ Ошибка в LongPoll цикле: {e}", exc_info=True
+                            f"❌ Ошибка в LongPoll цикле: {e}",
+                            exc_info=True
                         )
                         time.sleep(5)
                         continue
 
             except Exception as e:
                 logging.error(
-                    f"❌ Критическая ошибка в Observer: {e}", exc_info=True
+                    f"❌ Критическая ошибка в Observer: {e}",
+                    exc_info=True
                 )
                 retry_count += 1
                 if retry_count >= max_retries:
