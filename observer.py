@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 
-from .constants import CLASS_ABILITIES, RACE_NAMES
+from .constants import CLASS_ABILITIES, RACE_NAMES, RACE_EMOJIS
 from .models import Job
 from .scheduler import Scheduler
 from .health import TokenHealthMonitor
@@ -64,15 +64,6 @@ class ObserverBot:
         self._lp_server: str = ""
         self._lp_key: str = ""
         self._lp_ts: str = ""
-
-        self._race_emojis: Dict[str, str] = {
-            "ч": "🧍",
-            "г": "👹",
-            "м": "🧟",
-            "э": "🧝",
-            "о": "👽",
-            "н": "😈",
-        }
 
     def _restore_active_jobs(self) -> None:
         try:
