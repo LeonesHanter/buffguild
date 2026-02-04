@@ -1,0 +1,95 @@
+# -*- coding: utf-8 -*-
+"""
+Command parsing & normalization helpers.
+
+Goal: keep ObserverBot slim and make command parsing stable and testable.
+"""
+from __future__ import annotations
+
+from typing import Any, Dict, Optional, Tuple
+
+from .constants import CLASS_ABILITIES
+from .validators import InputValidator
+from .utils import normalize_text
+
+
+def parse_baf_letters(text: str) -> str:
+    """Parse '!баф ...' and return up to 4 valid ability letters, or ''."""
+    text_n = normalize_text(text or "")
+    if not text_n.startswith("!баф"):
+        return ""
+
+    s = text_n[4:].strip()
+    if not s:
+        return ""
+
+    s = s[:4]
+
+    allowed = set()
+    for cls in CLASS_ABILITIES.values():
+        allowed.update(cls["abilities"].keys())
+
+    out = "".join(ch for ch in s if ch in allowed)
+    return out[:4]
+
+
+def is_apo_cmd(text: str) -> bool:
+    return normalize_text(text or "").startswith("!апо")
+
+
+def is_baf_cancel_cmd(text: str) -> bool:
+    return normalize_text(text or "") == "!баф отмена"
+
+
+def parse_golosa_cmd(text: str) -> Optional[Tuple[str, int]]:
+    """Parse '!голоса NAME N' -> (name, n) or None."""
+    t = (text or "").strip()
+    if not normalize_text(t).startswith("!голоса"):
+        return None
+
+    parts = t.split()
+    if len(parts) != 3:
+        return None
+
+    name = parts[1].strip()
+    try:
+        n = int(parts[2].strip())
+    except Exception:
+        return None
+
+    if not name:
+        return None
+
+    return name, max(0, n)
+
+
+def parse_doprasa_cmd(text: str, msg_item: Dict[str, Any]) -> Optional[Tuple[str, Optional[str], Optional[int], str]]:
+    """
+    Parse '/допраса [race] [token_name?]' and extract timestamp from reply/fwd.
+    Returns (race_key, token_name, original_timestamp, original_text) or None.
+    """
+    t = InputValidator.sanitize_text(text or "", max_length=50)
+    if not normalize_text(t).startswith("/допраса"):
+        return None
+
+    parts = t.split()
+    if len(parts) < 2 or len(parts) > 3:
+        return None
+
+    race = parts[1].strip().lower()
+    if not InputValidator.validate_race_key(race):
+        return None
+
+    token_name = None
+    if len(parts) == 3:
+        token_name = parts[2].strip()
+        if not InputValidator.validate_token_name(token_name):
+            return None
+
+    original_timestamp = None
+    if "reply_message" in msg_item:
+        original_timestamp = InputValidator.validate_timestamp(msg_item["reply_message"].get("date"))
+    elif "fwd_messages" in msg_item and msg_item["fwd_messages"]:
+        original_timestamp = InputValidator.validate_timestamp(msg_item["fwd_messages"][0].get("date"))
+
+    return race, token_name, original_timestamp, (text or "")

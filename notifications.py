@@ -1,0 +1,114 @@
+# -*- coding: utf-8 -*-
+"""
+Pure message builders (no network, no state mutations).
+
+This file should be stable: changes here only affect texts/formatting.
+"""
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+
+from .constants import RACE_NAMES, RACE_EMOJIS
+
+
+def build_registration_text(letters: str) -> str:
+    return (
+        f"✅ Баф зарегистрирован: {letters}\n"
+        f"📊 Ожидается бафов: {len(letters)}\n"
+        f"📌 Для отмены напишите: !баф отмена"
+    )
+
+
+def _format_buff_line(user_id: int, info: Dict[str, Any], tm) -> Optional[str]:
+    """
+    Format one line for final notification.
+    tm is used only to resolve token -> owner_vk_id for proper mentions.
+    """
+    token_name = info.get("token_name") or ""
+    buff_name = (info.get("buff_name") or "").lower()
+    buff_val = info.get("buff_value", 0)
+    is_critical = info.get("is_critical", False)
+    status = info.get("status", "SUCCESS")
+    full_text = (info.get("full_text") or "")
+    full_text_lower = full_text.lower()
+
+    token = tm.get_token_by_name(token_name) if token_name else None
+    owner_id = token.owner_vk_id if token and token.owner_vk_id else None
+
+    # Mentions: prefer owner, else requester
+    base_link = f"[id{owner_id}|" if owner_id else f"[id{user_id}|"
+
+    if status == "ALREADY_BUFF":
+        return f"{base_link}🚫] Благословений не было"
+
+    # Non-race buffs (kept as in your current logic)
+    if "удач" in buff_name or "благословение удачи" in full_text_lower:
+        if buff_val >= 150 or is_critical:
+            core, emoji = "Благ. Удачи +9!", "🍀🍀"
+        else:
+            core, emoji = "Благ. Удачи +6!", "🍀"
+    elif "атак" in buff_name or "благословение атаки" in full_text_lower:
+        if buff_val >= 150 or is_critical:
+            core, emoji = "Благ. Атаки +30%!", "🍀🗡️"
+        else:
+            core, emoji = "Благ. Атаки +20%!", "🗡️"
+    elif "защит" in buff_name or "благословение защиты" in full_text_lower:
+        if buff_val >= 150 or is_critical:
+            core, emoji = "Благ. Защиты +30%!", "🍀🛡️"
+        else:
+            core, emoji = "Благ. Защиты +20%!", "🛡️"
+    else:
+        # Races (unified table)
+        found_race_key = None
+        for rk, rn in RACE_NAMES.items():
+            if rn in buff_name or f"благословение {rn}" in full_text_lower:
+                found_race_key = rk
+                break
+
+        if found_race_key:
+            core = f"Благ. {RACE_NAMES.get(found_race_key, found_race_key).capitalize()}!"
+            emoji = RACE_EMOJIS.get(found_race_key, "✨")
+        else:
+            core = f"{token_name or 'Благословение'} ({buff_val})"
+            emoji = "✨"
+
+    if status == "SUCCESS":
+        return f"{base_link}{emoji}] {core}"
+    return f"{base_link}🚫] {core}"
+
+
+def build_final_text(user_id: int, tokens_info: List[Dict[str, Any]], tm) -> str:
+    """
+    Build the final notification text from collected token results.
+    """
+    if not tokens_info:
+        return ""
+
+    all_already = True
+    any_success = False
+    for info in tokens_info:
+        status = info.get("status", "SUCCESS")
+        if status == "SUCCESS":
+            any_success = True
+            all_already = False
+        elif status == "ALREADY_BUFF":
+            pass
+        else:
+            all_already = False
+
+    lines: List[str] = []
+    lines.append("🎉 Баф успешно выдан до этого!" if all_already and not any_success else "🎉 Баф успешно выдан!")
+
+    total_spent = 0
+    for info in tokens_info:
+        line = _format_buff_line(user_id, info, tm)
+        if line:
+            lines.append(line)
+        if info.get("status", "SUCCESS") == "SUCCESS":
+            try:
+                total_spent += int(info.get("buff_value", 0) or 0)
+            except Exception:
+                pass
+
+    lines.append(f"[id{user_id}|💰] Пока тест не Списано {total_spent} баллов")
+    return "\n".join(lines).strip()

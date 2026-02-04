@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import logging
+import random
 import threading
 import time
 from typing import List, Optional, Tuple, Callable, Any, Dict
@@ -13,9 +14,15 @@ logger = logging.getLogger(__name__)
 
 
 class Scheduler:
-    def __init__(self, tm, executor, on_buff_complete: Callable[[Job, Dict], None] = None):
+    def __init__(
+        self,
+        tm,
+        executor,
+        on_buff_complete: Callable[[Job, Dict], None] = None,
+    ):
         self.tm = tm
         self.executor = executor
+        # очередь: (when_ts, job, letter)
         self._q: List[Tuple[float, Job, str]] = []
         self._lock = threading.Lock()
         self._last_cleanup_time: float = 0.0
@@ -37,15 +44,10 @@ class Scheduler:
     def cancel_user_jobs(self, user_id: int) -> bool:
         with self._lock:
             original_len = len(self._q)
-            self._q = [
-                (ts, job, ch) for ts, job, ch in self._q
-                if job.sender_id != user_id
-            ]
+            self._q = [(ts, job, ch) for ts, job, ch in self._q if job.sender_id != user_id]
             removed = original_len - len(self._q)
             if removed > 0:
-                logging.info(
-                    f"🗑️ Отменены бафы пользователя {user_id}: {removed} шт."
-                )
+                logging.info(f"🗑️ Отменены бафы пользователя {user_id}: {removed} шт.")
                 return True
         return False
 
@@ -56,14 +58,9 @@ class Scheduler:
 
         with self._lock:
             original_len = len(self._q)
-            self._q = [
-                (ts, job, ch) for ts, job, ch in self._q
-                if now - ts < 3600
-            ]
+            self._q = [(ts, job, ch) for ts, job, ch in self._q if now - ts < 3600]
             if len(self._q) != original_len:
-                logging.info(
-                    f"🧹 Очищены старые задачи: {original_len - len(self._q)}"
-                )
+                logging.info(f"🧹 Очищены старые задачи: {original_len - len(self._q)}")
             self._last_cleanup_time = now
 
     def _pop_ready(self) -> Optional[Tuple[float, Job, str]]:
@@ -88,96 +85,95 @@ class Scheduler:
                 return ParsedAbility(letter, txt, cd, cls, uses_voices)
         return None
 
-    def _calculate_token_score(self, token: TokenHandler, ability: ParsedAbility) -> float:
-        score = 0.0
+    # -------------------------
+    # Candidate selection policy (as requested):
+    # - No score.
+    # - For race letters: ONLY apostles with that race; if none ready -> skip.
+    # - For non-race letters: random among ready; if none ready due to cooldown -> reschedule to earliest.
+    # -------------------------
 
-        if ability.uses_voices:
-            score += token.voices * 0.1
+    def _is_token_basic_ok(self, t: TokenHandler, ability: ParsedAbility) -> bool:
+        if not t.enabled:
+            return False
+        if t.is_captcha_paused():
+            return False
+        if t.needs_manual_voices:
+            return False
+        if ability.uses_voices and t.voices <= 0:
+            return False
+        return True
 
-        can_social, rem_social = token.can_use_social()
-        if can_social:
-            score += 10.0
-        else:
-            score -= rem_social
+    def _supports_ability(self, t: TokenHandler, ability: ParsedAbility) -> bool:
+        class_data = CLASS_ABILITIES.get(t.class_type)
+        if not class_data:
+            return False
+        return ability.key in class_data["abilities"]
 
-        can, rem = token.can_use_ability(ability.key)
-        if can:
-            score += 5.0
-        else:
-            score -= rem
+    def _cooldown_wait_seconds(self, t: TokenHandler, ability: ParsedAbility) -> float:
+        # How many seconds until the token can be used for this ability,
+        # considering BOTH social and ability cooldowns.
+        can_social, rem_social = t.can_use_social()
+        can_ability, rem_ability = t.can_use_ability(ability.key)
 
-        if token.total_attempts > 10:
-            success_rate = token.successful_buffs / token.total_attempts
-            score += success_rate * 5.0
+        rs = 0.0 if can_social else float(rem_social)
+        ra = 0.0 if can_ability else float(rem_ability)
 
-        if ability.key in RACE_NAMES:
-            score += 50.0
+        # Need both available => wait until both have expired
+        return max(rs, ra)
 
-        return score
-
-    def _candidates_for_ability(self, ability: ParsedAbility) -> List[TokenHandler]:
-        candidates_with_scores: List[Tuple[float, TokenHandler]] = []
-
+    def _candidates_and_wait(self, ability: ParsedAbility) -> Tuple[List[TokenHandler], float]:
+        """
+        Returns:
+            candidates: ready-to-use tokens in RANDOM order
+            wait_s: if no ready candidates for NON-RACE ability, minimal time to wait
+                    until any eligible token becomes available (0 if no wait / not applicable).
+        """
         observer_token = self.tm.get_observer()
         observer_id = observer_token.id if observer_token else None
 
+        # 1) Race ability: ONLY apostles with the race. No fallback.
         if ability.key in RACE_NAMES:
+            ready: List[TokenHandler] = []
             for t in self.tm.get_apostles_with_race(ability.key):
                 if observer_id and t.id == observer_id:
                     continue
-                if not t.enabled or t.is_captcha_paused() or t.needs_manual_voices:
+                if not self._is_token_basic_ok(t, ability):
                     continue
-                if ability.uses_voices and t.voices <= 0:
+                # For race letters we additionally require the token to actually have the race
+                # (index includes temp_races, but keep safety check)
+                if t.class_type != "apostle" or not t.has_race(ability.key):
                     continue
-
-                can_social, _ = t.can_use_social()
-                if not can_social:
+                if not self._supports_ability(t, ability):
                     continue
-
-                can, _ = t.can_use_ability(ability.key)
-                if not can:
+                # Must be ready NOW (no cooldown)
+                if self._cooldown_wait_seconds(t, ability) > 0:
                     continue
+                ready.append(t)
 
-                if t.class_type == "apostle" and not t.has_race(ability.key):
-                    continue
+            random.shuffle(ready)
+            return ready, 0.0  # if empty -> skip in run loop (no reschedule)
 
-                score = self._calculate_token_score(t, ability)
-                score += 100.0
-                candidates_with_scores.append((score, t))
+        # 2) Non-race ability: random among ready; if none, compute earliest wait.
+        ready2: List[TokenHandler] = []
+        min_wait: Optional[float] = None
 
-        if not candidates_with_scores:
-            for t in self.tm.all_buffers():
-                if observer_id and t.id == observer_id:
-                    continue
-                if not t.enabled or t.is_captcha_paused() or t.needs_manual_voices:
-                    continue
+        for t in self.tm.all_buffers():
+            if observer_id and t.id == observer_id:
+                continue
+            if not self._is_token_basic_ok(t, ability):
+                continue
+            if not self._supports_ability(t, ability):
+                continue
 
-                class_data = CLASS_ABILITIES.get(t.class_type)
-                if not class_data:
-                    continue
-                if ability.key not in class_data["abilities"]:
-                    continue
+            wait_s = self._cooldown_wait_seconds(t, ability)
+            if wait_s <= 0:
+                ready2.append(t)
+            else:
+                if min_wait is None or wait_s < min_wait:
+                    min_wait = wait_s
 
-                if ability.uses_voices and t.voices <= 0:
-                    continue
-
-                can_social, _ = t.can_use_social()
-                if not can_social:
-                    continue
-
-                can, _ = t.can_use_ability(ability.key)
-                if not can:
-                    continue
-
-                if t.class_type == "apostle" and ability.key in RACE_NAMES:
-                    if not t.has_race(ability.key):
-                        continue
-
-                score = self._calculate_token_score(t, ability)
-                candidates_with_scores.append((score, t))
-
-        candidates_with_scores.sort(key=lambda x: x[0], reverse=True)
-        return [t for _, t in candidates_with_scores]
+        random.shuffle(ready2)
+        return ready2, float(min_wait or 0.0)
 
     def _call_on_complete_safe(self, job: Job, buff_info: Dict) -> None:
         if not self._on_buff_complete or not buff_info:
@@ -185,9 +181,7 @@ class Scheduler:
         try:
             self._on_buff_complete(job, buff_info)
         except Exception as e:
-            logging.error(
-                f"❌ Ошибка в колбэке on_buff_complete: {e}"
-            )
+            logging.error(f"❌ Ошибка в колбэке on_buff_complete: {e}")
 
     def _run_loop(self):
         while True:
@@ -205,12 +199,11 @@ class Scheduler:
                     logging.warning(f"⚠️ Unknown letter '{letter}'")
                     continue
 
-                candidates = self._candidates_for_ability(ability)
-                if not candidates:
-                    logging.warning(
-                        f"🚫 Нет кандидатов для '{letter}', пропускаем задачу"
-                    )
-                    # ВАЖНО: уведомляем Observer, что баф не выдан
+                candidates, wait_s = self._candidates_and_wait(ability)
+
+                # If race letter and no candidates -> skip (no fallback, no reschedule)
+                if not candidates and ability.key in RACE_NAMES:
+                    logging.warning(f"🚫 Нет кандидатов по расе для '{letter}', пропускаем задачу")
                     if self._on_buff_complete:
                         dummy_buff_info: Dict[str, Any] = {
                             "token_name": "",
@@ -219,15 +212,39 @@ class Scheduler:
                             "ability_key": ability.key,
                             "buff_name": ability.text,
                             "full_text": "",
-                            "status": "NO_CANDIDATES",
+                            "status": "NO_RACE_CANDIDATES",
                         }
                         self._call_on_complete_safe(job, dummy_buff_info)
+                    continue
+
+                # Non-race: if no candidates but there is a cooldown wait -> reschedule to earliest moment
+                if not candidates and wait_s > 0:
+                    when = time.time() + wait_s + 0.5  # small buffer
+                    self._reschedule(when, job, letter)
+                    logging.info(f"⏳ Все токены в КД для '{letter}', повтор через {int(wait_s)}с")
+                    continue
+
+                # No candidates at all (disabled/captcha/no voices/etc.)
+                if not candidates:
+                    logging.warning(f"🚫 Нет кандидатов для '{letter}', пропускаем задачу")
+                    if self._on_buff_complete:
+                        dummy_buff_info2: Dict[str, Any] = {
+                            "token_name": "",
+                            "buff_value": 0,
+                            "is_critical": False,
+                            "ability_key": ability.key,
+                            "buff_name": ability.text,
+                            "full_text": "",
+                            "status": "NO_CANDIDATES",
+                        }
+                        self._call_on_complete_safe(job, dummy_buff_info2)
                     continue
 
                 success = False
                 attempt_status = ""
                 buff_info: Optional[Dict[str, Any]] = None
 
+                # Try up to 2 random candidates (already shuffled)
                 for token in candidates[:2]:
                     ok, status, info = self.executor.execute_one(token, ability, job)
                     attempt_status = status
@@ -248,9 +265,9 @@ class Scheduler:
                     else:
                         self._reschedule(time.time() + 30.0, job, letter)
                         logging.info(
-                            f"⏳ Не удалось обработать '{letter}' "
-                            f"(статус: {attempt_status}), повтор через 30с"
+                            f"⏳ Не удалось обработать '{letter}' (статус: {attempt_status}), повтор через 30с"
                         )
 
             except Exception as e:
                 logging.error(f"❌ Ошибка в Scheduler: {e}", exc_info=True)
+
