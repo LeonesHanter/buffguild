@@ -11,14 +11,13 @@ CLASS_ORDER = ["apostle", "warlock", "crusader", "light_incarnation"]
 RACE_NAMES = {
     "ч": "человек",
     "г": "гоблин",
-    "н": "нежить",
+    "н": "нежити",
     "э": "эльф",
     "м": "гном",
     "д": "демон",
     "о": "орк",
 }
 
-<<<<<<< HEAD
 # Символ → эмодзи расы (единый источник истины)
 RACE_EMOJIS = {
     "ч": "🧍",  # человек
@@ -30,7 +29,6 @@ RACE_EMOJIS = {
     "о": "🧟",  # орк
 }
 
-=======
 RACE_EMOJIS = {
     "ч": "🧍",
     "г": "👹",
@@ -42,7 +40,7 @@ RACE_EMOJIS = {
 }
 
 
->>>>>>> 85294cd (Refactor observer: split logic into commands, state store, notifications + thread safety)
+
 # Описание классов и их способностей
 CLASS_ABILITIES: Dict[str, Dict[str, Any]] = {
     "apostle": {

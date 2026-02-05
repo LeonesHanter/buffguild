@@ -33,8 +33,15 @@ class Scheduler:
     def enqueue_letters(self, job: Job, letters: str) -> None:
         letters = (letters or "")[:4]
         now = time.time()
+
+        # Приоритет рас: сначала расовые буквы, потом остальные
+        race_keys = set(RACE_NAMES.keys())
+        race_letters = [ch for ch in letters if ch in race_keys]
+        non_race_letters = [ch for ch in letters if ch not in race_keys]
+        ordered = race_letters + non_race_letters
+
         with self._lock:
-            for ch in letters:
+            for ch in ordered:
                 self._q.append((now, job, ch))
 
     def get_queue_size(self) -> int:
@@ -86,10 +93,9 @@ class Scheduler:
         return None
 
     # -------------------------
-    # Candidate selection policy (as requested):
-    # - No score.
-    # - For race letters: ONLY apostles with that race; if none ready -> skip.
-    # - For non-race letters: random among ready; if none ready due to cooldown -> reschedule to earliest.
+    # Candidate selection policy:
+    # - Race letters: ONLY apostles with that race; if none ready -> skip.
+    # - Non-race letters: random among ready; if none ready due to cooldown -> reschedule to earliest.
     # -------------------------
 
     def _is_token_basic_ok(self, t: TokenHandler, ability: ParsedAbility) -> bool:
@@ -139,8 +145,7 @@ class Scheduler:
                     continue
                 if not self._is_token_basic_ok(t, ability):
                     continue
-                # For race letters we additionally require the token to actually have the race
-                # (index includes temp_races, but keep safety check)
+                # Safety: ensure it really has this race
                 if t.class_type != "apostle" or not t.has_race(ability.key):
                     continue
                 if not self._supports_ability(t, ability):
@@ -270,4 +275,3 @@ class Scheduler:
 
             except Exception as e:
                 logging.error(f"❌ Ошибка в Scheduler: {e}", exc_info=True)
-

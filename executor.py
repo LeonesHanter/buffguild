@@ -34,6 +34,13 @@ class AbilityExecutor:
         self.tm = tm
         self._target_lock: Dict[int, threading.Lock] = {}
 
+        # Фоновый цикл: раз в 2 часа проверяет апостолов с 0 голосов через "Мой профиль"
+        self._profile_thread = threading.Thread(
+            target=self._profile_refresher_loop,
+            daemon=True,
+        )
+        self._profile_thread.start()
+
     def _lock_for_target(self, peer_id: int) -> threading.Lock:
         if peer_id not in self._target_lock:
             self._target_lock[peer_id] = threading.Lock()
@@ -210,7 +217,7 @@ class AbilityExecutor:
         buff_value = 100
 
         # 1) Удача в единицах — приоритет
-        luck_match = re.search(r"удача\s+повышена\s+на\s+(\d{1,3})", text_lower)
+        luck_match = re.search(r"удача\\s+повышена\\s+на\\s+(\\d{1,3})", text_lower)
         if luck_match:
             try:
                 luck_val = int(luck_match.group(1))
@@ -250,14 +257,14 @@ class AbilityExecutor:
 
         # 3) Общие проценты (атака/защита/прочее)
         percent_patterns = [
-            r"(\+?\d{1,3})\s*%",
-            r"на\s+(\d{1,3})\s*%",
-            r"повышена\s+на\s+(\d{1,3})\s*%",
-            r"увеличена\s+на\s+(\d{1,3})\s*%",
-            r"повышена\s+(\d{1,3})\s*%",
-            r"увеличена\s+(\d{1,3})\s*%",
-            r"броня повышена на (\d{1,3})%",
-            r"атака повышена на (\d{1,3})%",
+            r"(\\+?\\d{1,3})\\s*%",
+            r"на\\s+(\\d{1,3})\\s*%",
+            r"повышена\\s+на\\s+(\\d{1,3})\\s*%",
+            r"увеличена\\s+на\\s+(\\d{1,3})\\s*%",
+            r"повышена\\s+(\\d{1,3})\\s*%",
+            r"увеличена\\s+(\\d{1,3})\\s*%",
+            r"броня повышена на (\\d{1,3})%",
+            r"атака повышена на (\\d{1,3})%",
         ]
 
         found_percent = None
@@ -343,9 +350,14 @@ class AbilityExecutor:
                 token.increment_buff_stats(False)
                 return False, "NEEDS_MANUAL_VOICES", None
 
+            # Автообновление профиля, если способность тратит голоса и локально 0
             if ability.uses_voices and token.voices <= 0:
-                token.increment_buff_stats(False)
-                return False, "NO_VOICES_LOCAL", None
+                logger.info(f"🔄 {token.name}: voices=0, пробуем refresh_profile перед бафом")
+                if self.refresh_profile(token) and token.voices > 0:
+                    logger.info(f"✅ {token.name}: после refresh_profile голосов стало {token.voices}")
+                else:
+                    token.increment_buff_stats(False)
+                    return False, "NO_VOICES_LOCAL", None
 
             can_social, rem_social = token.can_use_social()
             if not can_social:
@@ -647,3 +659,41 @@ class AbilityExecutor:
                     )
 
         return got_voices
+
+    def _profile_refresher_loop(self) -> None:
+        """
+        Периодически проверяет апостолов с 0 голосов:
+        - если голосов 0 -> раз в 2 часа шлём 'Мой профиль';
+        - как только голоса > 0, перестаём трогать этого апостола.
+        """
+        CHECK_INTERVAL = 2 * 60 * 60  # 2 часа
+
+        while True:
+            try:
+                apostles = [t for t in self.tm.all_buffers() if t.class_type == "apostle"]
+
+                for token in apostles:
+                    try:
+                        if not token.enabled or token.is_captcha_paused() or token.needs_manual_voices:
+                            continue
+
+                        if token.voices > 0:
+                            continue
+
+                        logger.info(f"🔄 Профиль-чек для апостола {token.name} (voices=0)")
+                        got = self.refresh_profile(token)
+                        if got:
+                            logger.info(
+                                f"✅ Профиль обновлён для {token.name}, теперь голосов: {token.voices}"
+                            )
+                        else:
+                            logger.info(
+                                f"ℹ️ Профиль апостола {token.name} не дал новых голосов (осталось {token.voices})"
+                            )
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка в профиль-чеке для {token.name}: {e}", exc_info=True)
+
+                time.sleep(CHECK_INTERVAL)
+            except Exception as e:
+                logger.error(f"❌ Ошибка в цикле _profile_refresher_loop: {e}", exc_info=True)
+                time.sleep(60)

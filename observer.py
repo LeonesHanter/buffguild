@@ -5,11 +5,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 
-<<<<<<< HEAD
+
 from .constants import CLASS_ABILITIES, RACE_NAMES, RACE_EMOJIS
-=======
+
 from .constants import RACE_NAMES
->>>>>>> 85294cd (Refactor observer: split logic into commands, state store, notifications + thread safety)
 from .models import Job
 from .scheduler import Scheduler
 from .health import TokenHealthMonitor
@@ -56,13 +55,13 @@ class ObserverBot:
         self._lp_key: str = ""
         self._lp_ts: str = ""
 
-<<<<<<< HEAD
+
     def _restore_active_jobs(self) -> None:
         try:
             stored = self._job_storage.load_all()
         except Exception as e:
             logging.error(f"❌ Ошибка восстановления активных бафов: {e}")
-=======
+
     # -------------------- Commands --------------------
 
     def _handle_health_command(self, from_id: int, text: str) -> None:
@@ -79,7 +78,6 @@ class ObserverBot:
                 "❌ Укажите имя токена: !диагностика [имя_токена]",
                 None,
             )
->>>>>>> 85294cd (Refactor observer: split logic into commands, state store, notifications + thread safety)
             return
 
         token_name = parts[1].strip()
