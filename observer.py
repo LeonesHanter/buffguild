@@ -5,10 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 
-
 from .constants import CLASS_ABILITIES, RACE_NAMES, RACE_EMOJIS
-
-from .constants import RACE_NAMES
 from .models import Job
 from .scheduler import Scheduler
 from .health import TokenHealthMonitor
@@ -86,11 +83,11 @@ class ObserverBot:
 
     def _format_races_simple(self, token) -> str:
         token._cleanup_expired_temp_races(force=True)
-        parts = []
+        parts: List[str] = []
         if token.races:
             parts.append("/".join(sorted(token.races)))
 
-        temp_parts = []
+        temp_parts: List[str] = []
         for tr in token.temp_races:
             race_key = tr["race"]
             expires = tr["expires"]
@@ -176,7 +173,11 @@ class ObserverBot:
         else:
             token = self.tm.get_token_by_sender_id(from_id)
             if not token:
-                self.observer.send_to_peer(self.observer.source_peer_id, f"❌ Апостол с вашим ID ({from_id}) не найден.", None)
+                self.observer.send_to_peer(
+                    self.observer.source_peer_id,
+                    f"❌ Апостол с вашим ID ({from_id}) не найден.",
+                    None,
+                )
                 return
 
         if token.id == self.observer.id:
@@ -240,7 +241,11 @@ class ObserverBot:
                 None,
             )
         else:
-            self.observer.send_to_peer(self.observer.source_peer_id, f"❌ Не удалось добавить временную расу для {token.name}.", None)
+            self.observer.send_to_peer(
+                self.observer.source_peer_id,
+                f"❌ Не удалось добавить временную расу для {token.name}.",
+                None,
+            )
 
     # -------------------- LongPoll --------------------
 
@@ -288,7 +293,9 @@ class ObserverBot:
             if txt:
                 sent_ok, send_status = self.observer.send_to_peer(self.observer.source_peer_id, txt)
                 if not sent_ok:
-                    logging.error(f"❌ Не удалось отправить финальное уведомление {job.sender_id}: {send_status}")
+                    logging.error(
+                        f"❌ Не удалось отправить финальное уведомление {job.sender_id}: {send_status}"
+                    )
 
     # -------------------- Message dispatch --------------------
 
@@ -308,12 +315,20 @@ class ObserverBot:
         if is_baf_cancel_cmd(norm):
             had_job, letters = self.state.cancel_and_clear(from_id)
             if not had_job:
-                self.observer.send_to_peer(self.observer.source_peer_id, "❌ У вас нет активных бафов для отмены.", None)
+                self.observer.send_to_peer(
+                    self.observer.source_peer_id,
+                    "❌ У вас нет активных бафов для отмены.",
+                    None,
+                )
                 return
             cancelled = self.scheduler.cancel_user_jobs(from_id)
             self.observer.send_to_peer(
                 self.observer.source_peer_id,
-                (f"✅ Все ваши бафы ({letters}) отменены." if cancelled else "⚠️ Не удалось найти ваши бафы в очереди."),
+                (
+                    f"✅ Все ваши бафы ({letters}) отменены."
+                    if cancelled
+                    else "⚠️ Не удалось найти ваши бафы в очереди."
+                ),
                 None,
             )
             return
@@ -328,24 +343,17 @@ class ObserverBot:
 
         parsed_g = parse_golosa_cmd(text)
         if parsed_g is not None:
-            name, n = parsed_g
-            token = self.tm.get_token_by_name(name)
+            _, n = parsed_g
+            token = self.tm.get_token_by_sender_id(from_id)
             if not token:
-                self.observer.send_to_peer(self.observer.source_peer_id, f"❌ Токен с именем '{name}' не найден.", None)
-                return
-
-            if token.owner_vk_id == 0:
-                token.fetch_owner_id_lazy()
-
-            if token.owner_vk_id != 0 and token.owner_vk_id != from_id:
-                logging.warning(
-                    f"⚠️ Неавторизованная команда !голоса от {from_id} "
-                    f"для токена {token.name} (владелец={token.owner_vk_id})"
+                self.observer.send_to_peer(
+                    self.observer.source_peer_id,
+                    f"❌ Апостол с вашим ID ({from_id}) не найден в конфиге.",
+                    None,
                 )
-                self.observer.send_to_peer(self.observer.source_peer_id, f"❌ У вас нет прав на токен '{name}'.", None)
                 return
 
-            reply = self._apply_manual_voices_by_name(name, n)
+            reply = self._apply_manual_voices_by_name(token.name, n)
             self.observer.send_to_peer(self.observer.source_peer_id, reply, None)
             return
 
@@ -491,5 +499,7 @@ class ObserverBot:
                     break
 
                 delay = min(retry_delay * (2**retry_count), 300)
-                logging.info(f"🔄 Переподключение через {delay} секунд (попытка {retry_count}/{max_retries})")
+                logging.info(
+                    f"🔄 Переподключение через {delay} секунд (попытка {retry_count}/{max_retries})"
+                )
                 time.sleep(delay)
