@@ -41,29 +41,33 @@ def is_baf_cancel_cmd(text: str) -> bool:
     return normalize_text(text or "") == "!баф отмена"
 
 
-def parse_golosa_cmd(text: str) -> Optional[Tuple[str, int]]:
-    """Parse '!голоса NAME N' -> (name, n) or None."""
+def parse_golosa_cmd(text: str) -> Optional[Tuple[None, int]]:
+    """
+    Parse '!голоса N' -> (None, n) or None.
+
+    Имён больше не поддерживаем: команда всегда работает по отправителю.
+    """
     t = (text or "").strip()
     if not normalize_text(t).startswith("!голоса"):
         return None
 
     parts = t.split()
-    if len(parts) != 3:
+    # Ожидаем ровно два элемента: !голоса N
+    if len(parts) != 2:
         return None
 
-    name = parts[1].strip()
     try:
-        n = int(parts[2].strip())
+        n = int(parts[1].strip())
     except Exception:
         return None
 
-    if not name:
-        return None
-
-    return name, max(0, n)
+    return None, max(0, n)
 
 
-def parse_doprasa_cmd(text: str, msg_item: Dict[str, Any]) -> Optional[Tuple[str, Optional[str], Optional[int], str]]:
+def parse_doprasa_cmd(
+    text: str,
+    msg_item: Dict[str, Any],
+) -> Optional[Tuple[str, Optional[str], Optional[int], str]]:
     """
     Parse '/допраса [race] [token_name?]' and extract timestamp from reply/fwd.
     Returns (race_key, token_name, original_timestamp, original_text) or None.
@@ -88,8 +92,12 @@ def parse_doprasa_cmd(text: str, msg_item: Dict[str, Any]) -> Optional[Tuple[str
 
     original_timestamp = None
     if "reply_message" in msg_item:
-        original_timestamp = InputValidator.validate_timestamp(msg_item["reply_message"].get("date"))
+        original_timestamp = InputValidator.validate_timestamp(
+            msg_item["reply_message"].get("date")
+        )
     elif "fwd_messages" in msg_item and msg_item["fwd_messages"]:
-        original_timestamp = InputValidator.validate_timestamp(msg_item["fwd_messages"][0].get("date"))
+        original_timestamp = InputValidator.validate_timestamp(
+            msg_item["fwd_messages"][0].get("date")
+        )
 
     return race, token_name, original_timestamp, (text or "")
