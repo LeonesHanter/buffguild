@@ -5,7 +5,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 
+
 from .constants import CLASS_ABILITIES, RACE_NAMES, RACE_EMOJIS
+
+from .constants import RACE_NAMES
 from .models import Job
 from .scheduler import Scheduler
 from .health import TokenHealthMonitor
@@ -46,15 +49,11 @@ class ObserverBot:
 
         logging.info("🤖 MultiTokenBot STARTED (Observer=LongPoll)")
         logging.info(f"📋 Tokens: {len(self.tm.tokens)}")
-        logging.info(
-            f"🛰️ Target poll: interval={self.poll_interval}s, count={self.poll_count}"
-        )
+        logging.info(f"🛰️ Target poll: interval={self.poll_interval}s, count={self.poll_count}")
 
         self._lp_server: str = ""
         self._lp_key: str = ""
         self._lp_ts: str = ""
-
-        # ... тут пропущен код _lp_get_server, _lp_check, _restore_active_jobs и т.п. ...
 
     # -------------------- Commands --------------------
 
@@ -87,11 +86,11 @@ class ObserverBot:
 
     def _format_races_simple(self, token) -> str:
         token._cleanup_expired_temp_races(force=True)
-        parts: List[str] = []
+        parts = []
         if token.races:
             parts.append("/".join(sorted(token.races)))
 
-        temp_parts: List[str] = []
+        temp_parts = []
         for tr in token.temp_races:
             race_key = tr["race"]
             expires = tr["expires"]
@@ -115,11 +114,7 @@ class ObserverBot:
     def _format_apo_status(self) -> str:
         apostles = [t for t in self.tm.all_buffers() if t.class_type == "apostle"]
         warlocks = [t for t in self.tm.all_buffers() if t.class_type == "warlock"]
-        paladins = [
-            t
-            for t in self.tm.all_buffers()
-            if t.class_type in ("crusader", "light_incarnation")
-        ]
+        paladins = [t for t in self.tm.all_buffers() if t.class_type in ("crusader", "light_incarnation")]
 
         lines: List[str] = []
 
@@ -150,12 +145,7 @@ class ObserverBot:
 
         return "\n".join(lines).strip()
 
-    def _handle_doprasa_command(
-        self,
-        from_id: int,
-        text: str,
-        msg_item: Dict[str, Any],
-    ) -> None:
+    def _handle_doprasa_command(self, from_id: int, text: str, msg_item: Dict[str, Any]) -> None:
         parsed = parse_doprasa_cmd(text, msg_item)
         if not parsed:
             self.observer.send_to_peer(
@@ -176,29 +166,17 @@ class ObserverBot:
         if token_name:
             token = self.tm.get_token_by_name(token_name)
             if not token:
-                self.observer.send_to_peer(
-                    self.observer.source_peer_id,
-                    f"❌ Токен '{token_name}' не найден.",
-                    None,
-                )
+                self.observer.send_to_peer(self.observer.source_peer_id, f"❌ Токен '{token_name}' не найден.", None)
                 return
             if token.owner_vk_id == 0:
                 token.fetch_owner_id_lazy()
             if token.owner_vk_id != 0 and token.owner_vk_id != from_id:
-                self.observer.send_to_peer(
-                    self.observer.source_peer_id,
-                    f"❌ Нет прав на '{token_name}'.",
-                    None,
-                )
+                self.observer.send_to_peer(self.observer.source_peer_id, f"❌ Нет прав на '{token_name}'.", None)
                 return
         else:
             token = self.tm.get_token_by_sender_id(from_id)
             if not token:
-                self.observer.send_to_peer(
-                    self.observer.source_peer_id,
-                    f"❌ Апостол с вашим ID ({from_id}) не найден.",
-                    None,
-                )
+                self.observer.send_to_peer(self.observer.source_peer_id, f"❌ Апостол с вашим ID ({from_id}) не найден.", None)
                 return
 
         if token.id == self.observer.id:
@@ -210,29 +188,17 @@ class ObserverBot:
             return
 
         if token.class_type != "apostle":
-            self.observer.send_to_peer(
-                self.observer.source_peer_id,
-                f"❌ {token.name} не апостол.",
-                None,
-            )
+            self.observer.send_to_peer(self.observer.source_peer_id, f"❌ {token.name} не апостол.", None)
             return
 
         token._cleanup_expired_temp_races(force=True)
 
         if race_key in token.races:
-            self.observer.send_to_peer(
-                self.observer.source_peer_id,
-                f"⚠️ У {token.name} уже есть постоянная раса.",
-                None,
-            )
+            self.observer.send_to_peer(self.observer.source_peer_id, f"⚠️ У {token.name} уже есть постоянная раса.", None)
             return
 
         if any(tr["race"] == race_key for tr in token.temp_races):
-            self.observer.send_to_peer(
-                self.observer.source_peer_id,
-                f"⚠️ У {token.name} уже есть эта временная раса.",
-                None,
-            )
+            self.observer.send_to_peer(self.observer.source_peer_id, f"⚠️ У {token.name} уже есть эта временная раса.", None)
             return
 
         if token.get_temp_race_count() >= 1:
@@ -263,40 +229,66 @@ class ObserverBot:
             )
             return
 
-        success = token.add_temporary_race(
-            race_key, expires_at=original_timestamp + 2 * 3600
-        )
+        success = token.add_temporary_race(race_key, expires_at=original_timestamp + 2 * 3600)
         if success:
             self.tm.update_race_index(token)
             self.observer.send_to_peer(
                 self.observer.source_peer_id,
-                f"✅ {token.name}: добавлена временная раса "
-                f"'{RACE_NAMES.get(race_key, race_key)}'\n"
+                f"✅ {token.name}: добавлена временная раса '{RACE_NAMES.get(race_key, race_key)}'\n"
                 f"⏰ {format_moscow_time(start_moscow)} → {format_moscow_time(end_moscow)}\n"
                 f"📌 Теперь можно использовать !баф{race_key}",
                 None,
             )
         else:
-            self.observer.send_to_peer(
-                self.observer.source_peer_id,
-                f"❌ Не удалось добавить временную расу для {token.name}.",
-                None,
-            )
+            self.observer.send_to_peer(self.observer.source_peer_id, f"❌ Не удалось добавить временную расу для {token.name}.", None)
+
+    # -------------------- LongPoll --------------------
+
+    def _lp_get_server(self) -> bool:
+        data = {"access_token": self.observer.access_token, "v": "5.131", "lp_version": 3}
+        ret = self.observer._vk.call(self.observer._vk.post("messages.getLongPollServer", data))
+
+        if "error" in ret:
+            err = ret["error"]
+            logging.error(f"❌ LongPollServer error {err.get('error_code')} {err.get('error_msg')}")
+            return False
+
+        resp = ret.get("response", {})
+        self._lp_server = str(resp.get("server", "")).strip()
+        self._lp_key = str(resp.get("key", "")).strip()
+        self._lp_ts = str(resp.get("ts", "")).strip()
+
+        if not self._lp_server or not self._lp_key or not self._lp_ts:
+            logging.error("❌ LongPollServer: missing server/key/ts")
+            return False
+
+        logging.info(f"✅ LongPoll initialized: server={self._lp_server}, ts={self._lp_ts}")
+        return True
+
+    def _lp_check(self) -> Optional[Dict[str, Any]]:
+        server = "https://" + self._lp_server
+        data = {"act": "a_check", "key": self._lp_key, "ts": self._lp_ts, "wait": 25, "mode": 2, "version": 3}
+
+        try:
+            return self.observer._vk.call(self.observer._vk.raw_post(server, data))
+        except aiohttp.ClientError as e:
+            logging.error(f"📡 Сетевая ошибка LongPoll: {e}")
+            return None
+        except Exception as e:
+            logging.error(f"❌ LongPoll a_check exception: {e}", exc_info=True)
+            return None
 
     # -------------------- Scheduler callback --------------------
 
     def _handle_buff_completion(self, job: Job, buff_info: Dict[str, Any]) -> None:
+        # Keep this minimal: persist & maybe finalize, then send outside.
         should_finalize, snapshot = self.state.apply_completion(job, buff_info)
         if should_finalize and snapshot:
             txt = build_final_text(job.sender_id, snapshot, self.tm)
             if txt:
-                sent_ok, send_status = self.observer.send_to_peer(
-                    self.observer.source_peer_id, txt
-                )
+                sent_ok, send_status = self.observer.send_to_peer(self.observer.source_peer_id, txt)
                 if not sent_ok:
-                    logging.error(
-                        f"❌ Не удалось отправить финальное уведомление {job.sender_id}: {send_status}"
-                    )
+                    logging.error(f"❌ Не удалось отправить финальное уведомление {job.sender_id}: {send_status}")
 
     # -------------------- Message dispatch --------------------
 
@@ -316,20 +308,12 @@ class ObserverBot:
         if is_baf_cancel_cmd(norm):
             had_job, letters = self.state.cancel_and_clear(from_id)
             if not had_job:
-                self.observer.send_to_peer(
-                    self.observer.source_peer_id,
-                    "❌ У вас нет активных бафов для отмены.",
-                    None,
-                )
+                self.observer.send_to_peer(self.observer.source_peer_id, "❌ У вас нет активных бафов для отмены.", None)
                 return
             cancelled = self.scheduler.cancel_user_jobs(from_id)
             self.observer.send_to_peer(
                 self.observer.source_peer_id,
-                (
-                    f"✅ Все ваши бафы ({letters}) отменены."
-                    if cancelled
-                    else "⚠️ Не удалось найти ваши бафы в очереди."
-                ),
+                (f"✅ Все ваши бафы ({letters}) отменены." if cancelled else "⚠️ Не удалось найти ваши бафы в очереди."),
                 None,
             )
             return
@@ -342,21 +326,26 @@ class ObserverBot:
             self._handle_diagnostic_command(from_id, text)
             return
 
-        # ---- !голоса N: только по отправителю ----
         parsed_g = parse_golosa_cmd(text)
         if parsed_g is not None:
-            _, n = parsed_g
-
-            token = self.tm.get_token_by_sender_id(from_id)
+            name, n = parsed_g
+            token = self.tm.get_token_by_name(name)
             if not token:
-                self.observer.send_to_peer(
-                    self.observer.source_peer_id,
-                    f"❌ Для вашего VK ID ({from_id}) не найден токен.",
-                    None,
-                )
+                self.observer.send_to_peer(self.observer.source_peer_id, f"❌ Токен с именем '{name}' не найден.", None)
                 return
 
-            reply = self._apply_manual_voices_by_name(token.name, n)
+            if token.owner_vk_id == 0:
+                token.fetch_owner_id_lazy()
+
+            if token.owner_vk_id != 0 and token.owner_vk_id != from_id:
+                logging.warning(
+                    f"⚠️ Неавторизованная команда !голоса от {from_id} "
+                    f"для токена {token.name} (владелец={token.owner_vk_id})"
+                )
+                self.observer.send_to_peer(self.observer.source_peer_id, f"❌ У вас нет прав на токен '{name}'.", None)
+                return
+
+            reply = self._apply_manual_voices_by_name(name, n)
             self.observer.send_to_peer(self.observer.source_peer_id, reply, None)
             return
 
@@ -379,14 +368,10 @@ class ObserverBot:
                 )
                 return
 
-            job = Job(
-                sender_id=from_id,
-                trigger_text=text,
-                letters=letters,
-                created_ts=time.time(),
-            )
+            job = Job(sender_id=from_id, trigger_text=text, letters=letters, created_ts=time.time())
             self.state.register_job(from_id, job, letters, cmid)
 
+            # try to send registration notice (outside any locks)
             if cmid:
                 sent_ok, send_status = self.observer.send_to_peer(
                     self.observer.source_peer_id,
@@ -399,4 +384,112 @@ class ObserverBot:
                     except Exception:
                         pass
 
+            # enqueue
             self.scheduler.enqueue_letters(job, letters)
+
+    def run(self) -> None:
+        retry_count = 0
+        max_retries = 10
+        retry_delay = 5
+
+        while True:
+            try:
+                if not self._lp_get_server():
+                    logging.error(
+                        f"❌ Не удалось получить LongPoll сервер (попытка {retry_count + 1}/{max_retries})"
+                    )
+                    retry_count += 1
+                    if retry_count >= max_retries:
+                        logging.critical("💥 Превышено максимальное количество попыток получения LongPoll сервера")
+                        break
+
+                    time.sleep(min(retry_delay * retry_count, 300))
+                    continue
+
+                retry_count = 0
+                logging.info(f"✅ LongPoll готов. Слушаю чат {self.observer.source_peer_id}")
+
+                while True:
+                    try:
+                        lp = self._lp_check()
+                        if not lp:
+                            time.sleep(2)
+                            continue
+
+                        if "failed" in lp:
+                            error_code = lp.get("failed")
+                            logging.warning(f"⚠️ LongPoll failed with code: {error_code}")
+
+                            if error_code == 1:
+                                new_ts = lp.get("ts")
+                                if new_ts:
+                                    self._lp_ts = str(new_ts)
+                                    logging.info(f"🔄 LongPoll: обновлен ts на {new_ts}")
+                                continue
+                            elif error_code == 2:
+                                logging.info("🔄 LongPoll: ключ устарел, обновляю...")
+                                if not self._lp_get_server():
+                                    time.sleep(5)
+                                continue
+                            elif error_code == 3:
+                                logging.info("🔄 LongPoll: информация устарела, обновляю...")
+                                if not self._lp_get_server():
+                                    time.sleep(5)
+                                continue
+                            elif error_code == 4:
+                                logging.error("❌ LongPoll: неверная версия протокола")
+                                time.sleep(60)
+                                continue
+                            else:
+                                logging.error(f"❌ LongPoll: неизвестная ошибка {error_code}")
+                                time.sleep(5)
+                                continue
+
+                        new_ts = lp.get("ts")
+                        if new_ts is not None:
+                            self._lp_ts = str(new_ts)
+
+                        updates = lp.get("updates", []) or []
+                        if not updates:
+                            continue
+
+                        msg_ids: List[int] = []
+                        for u in updates:
+                            if not isinstance(u, list) or not u:
+                                continue
+                            if int(u[0]) != 4:
+                                continue
+                            try:
+                                msg_id = int(u[1])
+                                p_id = int(u[3])
+                            except Exception:
+                                continue
+                            if p_id == self.observer.source_peer_id:
+                                msg_ids.append(msg_id)
+
+                        if not msg_ids:
+                            continue
+
+                        items = self.observer.get_by_id(msg_ids)
+                        for it in items:
+                            self._handle_new_message(it)
+
+                    except aiohttp.ClientError as e:
+                        logging.error(f"📡 Сетевая ошибка LongPoll: {e}")
+                        time.sleep(5)
+                        continue
+                    except Exception as e:
+                        logging.error(f"❌ Ошибка в LongPoll цикле: {e}", exc_info=True)
+                        time.sleep(5)
+                        continue
+
+            except Exception as e:
+                logging.error(f"❌ Критическая ошибка в Observer: {e}", exc_info=True)
+                retry_count += 1
+                if retry_count >= max_retries:
+                    logging.critical("💥 Превышено максимальное количество попыток переподключения")
+                    break
+
+                delay = min(retry_delay * (2**retry_count), 300)
+                logging.info(f"🔄 Переподключение через {delay} секунд (попытка {retry_count}/{max_retries})")
+                time.sleep(delay)
