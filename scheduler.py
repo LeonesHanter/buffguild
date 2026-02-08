@@ -259,6 +259,24 @@ class Scheduler:
                         norm_status = "ALREADY_BUFF"
                     buff_info.setdefault("status", norm_status)
 
+                    # нет голосов у этого токена -> просто пробуем следующего
+                    if norm_status in ("NO_VOICES", "NO_VOICES_LOCAL"):
+                        logging.info(
+                            f"⛔ {token.name}: нет голосов (status={norm_status}), "
+                            f"пробуем следующего кандидата для '{letter}'"
+                        )
+                        continue
+
+                    # на цели уже другое расовое благословение -> считаем попытку завершённой, но с ошибкой
+                    if norm_status == "OTHER_RACE":
+                        logging.info(
+                            f"🚫 OTHER_RACE для '{letter}' у {token.name}: "
+                            f"на цели уже другое расовое благословение, задачу не повторяем"
+                        )
+                        self._call_on_complete_safe(job, buff_info)
+                        success = True
+                        break
+
                     if ok or norm_status in ("SUCCESS", "ALREADY_BUFF"):
                         success = True
                         self._call_on_complete_safe(job, buff_info)

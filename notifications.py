@@ -35,28 +35,34 @@ def _format_buff_line(user_id: int, info: Dict[str, Any], tm) -> Optional[str]:
     token = tm.get_token_by_name(token_name) if token_name else None
     owner_id = token.owner_vk_id if token and token.owner_vk_id else None
 
-    # Mentions: prefer owner, else requester
-    base_link = f"[id{owner_id}|" if owner_id else f"[id{user_id}|"
+    # Mentions: prefer owner (caster), else requester
+    base_link = f"[https://vk.ru/id{owner_id}|" if owner_id else f"[https://vk.ru/id{user_id}|"
 
     if status == "ALREADY_BUFF":
         return f"{base_link}🚫] Благословений не было"
 
-    # Non-race buffs (kept as in your current logic)
+    # Non-race buffs
     if "удач" in buff_name or "благословение удачи" in full_text_lower:
+        # Удача: базовая иконка 🍀, при крите — 🍀 в конце текста
         if buff_val >= 150 or is_critical:
-            core, emoji = "Благ. Удачи +9!", "🍀🍀"
+            core, emoji = "Удача +9!🍀", "🍀"
         else:
-            core, emoji = "Благ. Удачи +6!", "🍀"
+            core, emoji = "Удача +6!", "🍀"
+
     elif "атак" in buff_name or "благословение атаки" in full_text_lower:
+        # Атака: базовая 🗡️, при крите — +30% и хвостовой 🍀
         if buff_val >= 150 or is_critical:
-            core, emoji = "Благ. Атаки +30%!", "🍀🗡️"
+            core, emoji = "Атака +30%!🍀", "🗡️"
         else:
-            core, emoji = "Благ. Атаки +20%!", "🗡️"
+            core, emoji = "Атака +20%!", "🗡️"
+
     elif "защит" in buff_name or "благословение защиты" in full_text_lower:
+        # Защита: базовая 🛡️, при крите — +30% и хвостовой 🍀
         if buff_val >= 150 or is_critical:
-            core, emoji = "Благ. Защиты +30%!", "🍀🛡️"
+            core, emoji = "Защита +30%!🍀", "🛡️"
         else:
-            core, emoji = "Благ. Защиты +20%!", "🛡️"
+            core, emoji = "Защита +20%!", "🛡️"
+
     else:
         # Races (unified table)
         found_race_key = None
@@ -66,15 +72,15 @@ def _format_buff_line(user_id: int, info: Dict[str, Any], tm) -> Optional[str]:
                 break
 
         if found_race_key:
-            core = f"Благ. {RACE_NAMES.get(found_race_key, found_race_key).capitalize()}!"
+            core = f"{RACE_NAMES.get(found_race_key, found_race_key).capitalize()}!"
             emoji = RACE_EMOJIS.get(found_race_key, "✨")
         else:
             core = f"{token_name or 'Благословение'} ({buff_val})"
             emoji = "✨"
 
     if status == "SUCCESS":
-        return f"{base_link}{emoji}] {core}"
-    return f"{base_link}🚫] {core}"
+        return f"{base_link}{emoji}]{core}"
+    return f"{base_link}🚫]{core}"
 
 
 def build_final_text(user_id: int, tokens_info: List[Dict[str, Any]], tm) -> str:
@@ -110,5 +116,5 @@ def build_final_text(user_id: int, tokens_info: List[Dict[str, Any]], tm) -> str
             except Exception:
                 pass
 
-    lines.append(f"[id{user_id}|💰] Пока тест не Списано {total_spent} баллов")
+    lines.append(f"[https://vk.ru/id{user_id}|💰]Пока тест не Списано {total_spent} баллов")
     return "\n".join(lines).strip()
