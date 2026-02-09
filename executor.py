@@ -5,7 +5,6 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-
 from .constants import RACE_NAMES
 from .regexes import (
     RE_SUCCESS,
@@ -30,9 +29,7 @@ from .regexes import (
 from .token_handler import TokenHandler
 from .models import ParsedAbility, Job
 
-
 logger = logging.getLogger(__name__)
-
 
 
 class AbilityExecutor:
@@ -86,6 +83,7 @@ class AbilityExecutor:
 
         logger.debug(f"🔍 Начало парсинга {len(msgs)} сообщений")
 
+        # Первый проход — собираем текст, голоса, remaining
         for m in msgs:
             text = str(m.get("text", "")).strip()
             text_l = text.lower()
@@ -132,36 +130,51 @@ class AbilityExecutor:
                     except Exception as e:
                         logger.error(f"❌ Ошибка парсинга голосов в скобках: {e}")
 
-        for m in msgs:
+        # Второй проход — определяем статус.
+        # Сначала обрабатываем сообщения с 🚫, затем обычные
+        ordered = sorted(
+            msgs,
+            key=lambda mm: 0 if "🚫" in str(mm.get("text", "")) else 1,
+        )
+
+        for m in ordered:
             text = str(m.get("text", "")).strip()
             logger.debug(f"🔍 Проверяем статус в сообщении: {text[:100]}...")
 
-            if RE_NOT_APOSTLE_OF_RACE.search(text):
-                matched = RE_NOT_APOSTLE_OF_RACE.search(text).group(0)
+            # Не апостол этой расы
+            mm = RE_NOT_APOSTLE_OF_RACE.search(text)
+            if mm:
+                matched = mm.group(0)
                 logger.info(
                     f"🔍 Статус: NOT_APOSTLE_OF_RACE - "
                     f"'{RE_NOT_APOSTLE_OF_RACE.pattern}' сработало на '{matched}'"
                 )
                 return "NOT_APOSTLE_OF_RACE", remaining, voices_val, full_response_text
 
-            if RE_ALREADY_BUFF.search(text):
-                matched = RE_ALREADY_BUFF.search(text).group(0)
+            # Уже действует такое благословение (основной кейс)
+            mm = RE_ALREADY_BUFF.search(text)
+            if mm:
+                matched = mm.group(0)
                 logger.info(
                     f"🔍 Статус: ALREADY_BUFF - "
                     f"'{RE_ALREADY_BUFF.pattern}' сработало на '{matched}'"
                 )
                 return "ALREADY_BUFF", remaining, voices_val, full_response_text
 
-            if RE_OTHER_RACE.search(text):
-                matched = RE_OTHER_RACE.search(text).group(0)
+            # Уже наложено другое расовое благословение
+            mm = RE_OTHER_RACE.search(text)
+            if mm:
+                matched = mm.group(0)
                 logger.info(
                     f"🔍 Статус: OTHER_RACE - "
                     f"'{RE_OTHER_RACE.pattern}' сработало на '{matched}'"
                 )
                 return "OTHER_RACE", remaining, voices_val, full_response_text
 
-            if RE_ALREADY_RACE.search(text):
-                matched = RE_ALREADY_RACE.search(text).group(0)
+            # Нельзя наложить благословение уже имеющейся у цели расы
+            mm = RE_ALREADY_RACE.search(text)
+            if mm:
+                matched = mm.group(0)
                 logger.info(
                     f"🔍 Статус: ALREADY_BUFF - "
                     f"'{RE_ALREADY_RACE.pattern}' сработало на '{matched}'"
@@ -169,8 +182,9 @@ class AbilityExecutor:
                 return "ALREADY_BUFF", remaining, voices_val, full_response_text
 
             # Воскрешение: этому персонажу не требуется воскрешение
-            if RE_RES_NO_NEED.search(text):
-                matched = RE_RES_NO_NEED.search(text).group(0)
+            mm = RE_RES_NO_NEED.search(text)
+            if mm:
+                matched = mm.group(0)
                 logger.info(
                     f"🔍 Статус: RES_NO_NEED - "
                     f"'{RE_RES_NO_NEED.pattern}' сработало на '{matched}'"
@@ -178,54 +192,65 @@ class AbilityExecutor:
                 return "RES_NO_NEED", remaining, voices_val, full_response_text
 
             # Воскрешение: цель должна быть уровнем ниже паладина
-            if RE_RES_LEVEL_TOO_HIGH.search(text):
-                matched = RE_RES_LEVEL_TOO_HIGH.search(text).group(0)
+            mm = RE_RES_LEVEL_TOO_HIGH.search(text)
+            if mm:
+                matched = mm.group(0)
                 logger.info(
                     f"🔍 Статус: RES_LEVEL_TOO_HIGH - "
                     f"'{RE_RES_LEVEL_TOO_HIGH.pattern}' сработало на '{matched}'"
                 )
                 return "RES_LEVEL_TOO_HIGH", remaining, voices_val, full_response_text
 
-            if RE_NOT_APOSTLE.search(text):
-                matched = RE_NOT_APOSTLE.search(text).group(0)
+            # Не апостол
+            mm = RE_NOT_APOSTLE.search(text)
+            if mm:
+                matched = mm.group(0)
                 logger.info(
                     f"🔍 Статус: NOT_APOSTLE - "
                     f"'{RE_NOT_APOSTLE.pattern}' сработало на '{matched}'"
                 )
                 return "NOT_APOSTLE", remaining, voices_val, full_response_text
 
-            if RE_SUCCESS.search(text):
-                matched = RE_SUCCESS.search(text).group(0)
-                logger.info(
-                    f"🔍 Статус: SUCCESS - '{RE_SUCCESS.pattern}' сработало на '{matched}'"
-                )
-                return "SUCCESS", remaining, voices_val, full_response_text
-
-            # Уже было / уже есть (старые кейсы)
-            if RE_ALREADY.search(text):
-                matched = RE_ALREADY.search(text).group(0)
-                logger.info(
-                    f"🔍 Статус: ALREADY - '{RE_ALREADY.pattern}' сработало на '{matched}'"
-                )
-                return "ALREADY", remaining, voices_val, full_response_text
-
-            # Новый кейс: "цель уже получала ... за последние ..."
-            if RE_ALREADY_RECENT.search(text):
-                matched = RE_ALREADY_RECENT.search(text).group(0)
+            # Новый кейс: "цель уже получала ... за последние X"
+            mm = RE_ALREADY_RECENT.search(text)
+            if mm:
+                matched = mm.group(0)
                 logger.info(
                     f"🔍 Статус: ALREADY - '{RE_ALREADY_RECENT.pattern}' сработало на '{matched}'"
                 )
                 return "ALREADY", remaining, voices_val, full_response_text
 
-            if RE_NO_VOICES.search(text):
-                matched = RE_NO_VOICES.search(text).group(0)
+            # Общий "уже есть / уже действует"
+            mm = RE_ALREADY.search(text)
+            if mm:
+                matched = mm.group(0)
+                logger.info(
+                    f"🔍 Статус: ALREADY - '{RE_ALREADY.pattern}' сработало на '{matched}'"
+                )
+                return "ALREADY", remaining, voices_val, full_response_text
+
+            # Успех — только после всех ALREADY-кейсов
+            mm = RE_SUCCESS.search(text)
+            if mm:
+                matched = mm.group(0)
+                logger.info(
+                    f"🔍 Статус: SUCCESS - '{RE_SUCCESS.pattern}' сработало на '{matched}'"
+                )
+                return "SUCCESS", remaining, voices_val, full_response_text
+
+            # Нет голосов
+            mm = RE_NO_VOICES.search(text)
+            if mm:
+                matched = mm.group(0)
                 logger.info(
                     f"🔍 Статус: NO_VOICES - '{RE_NO_VOICES.pattern}' сработало на '{matched}'"
                 )
                 return "NO_VOICES", remaining, voices_val, full_response_text
 
-            if RE_COOLDOWN.search(text):
-                matched = RE_COOLDOWN.search(text).group(0)
+            # Социальный КД
+            mm = RE_COOLDOWN.search(text)
+            if mm:
+                matched = mm.group(0)
                 if len(matched) > 50:
                     matched = matched[:50] + "..."
                 logger.info(
@@ -502,7 +527,16 @@ class AbilityExecutor:
 
                     if status == "ALREADY_BUFF":
                         token.set_social_cooldown(62)
-                        return False, "ALREADY_BUFF", None
+                        buff_info = {
+                            "token_name": token.name,
+                            "buff_value": 0,
+                            "is_critical": False,
+                            "ability_key": ability.key,
+                            "buff_name": ability.text,
+                            "full_text": full_response_text,
+                            "status": "ALREADY_BUFF",
+                        }
+                        return False, "ALREADY_BUFF", buff_info
 
                     if status == "OTHER_RACE":
                         token.set_social_cooldown(62)
@@ -602,6 +636,7 @@ class AbilityExecutor:
                             "ability_key": ability.key,
                             "buff_name": ability.text,
                             "full_text": buff_response_text,
+                            "status": "SUCCESS",
                         }
                         return True, "SUCCESS", buff_info
 

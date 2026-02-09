@@ -646,3 +646,4 @@ class ObserverBot:
                     f"🔄 Переподключение через {delay} секунд (попытка {retry_count}/{max_retries})"
                 )
                 time.sleep(delay)
+

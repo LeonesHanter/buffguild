@@ -23,6 +23,9 @@ def _format_buff_line(user_id: int, info: Dict[str, Any], tm) -> Optional[str]:
     """
     Format one line for final notification.
     tm is used only to resolve token -> owner_vk_id for proper mentions.
+
+    user_id трактуем как id того, кто заказывал баф (sender/target),
+    но во всех строках бафа приоритет у owner_id токена.
     """
     token_name = info.get("token_name") or ""
     buff_name = (info.get("buff_name") or "").lower()
@@ -40,37 +43,41 @@ def _format_buff_line(user_id: int, info: Dict[str, Any], tm) -> Optional[str]:
 
     # Глобальный КД по цели: баф пропущен
     if status == "GLOBAL_COOLDOWN":
-        # пример: "баф неудачи пропущен (КД)"
         nice_name = buff_name or "баф"
         return f"{base_link}⏳] баф {nice_name} пропущен (КД)"
 
+    # Уже действует такое благословение
     if status == "ALREADY_BUFF":
         return f"{base_link}🚫] Благословений не было"
 
-    # Non-race buffs (удача/атака/защита)
+    # Любой статус, отличающийся от SUCCESS, не рендерим как баф
+    if status != "SUCCESS":
+        return None
+
+    # ----- Non-race buffs (удача/атака/защита) -----
     if "удач" in buff_name or "благословение удачи" in full_text_lower:
-        # Удача: базовая иконка 🍀, при крите — 🍀 в конце текста
+        # Удача: базовая иконка 🍀, при крите — 9
         if buff_val >= 150 or is_critical:
             core, emoji = "Удача +9!🍀", "🍀"
         else:
             core, emoji = "Удача +6!", "🍀"
 
     elif "атак" in buff_name or "благословение атаки" in full_text_lower:
-        # Атака: базовая 🗡️, при крите — +30% и хвостовой 🍀
+        # Атака: базовая 🗡️, при крите — +30%
         if buff_val >= 150 or is_critical:
             core, emoji = "Атака +30%!🍀", "🗡️"
         else:
             core, emoji = "Атака +20%!", "🗡️"
 
     elif "защит" in buff_name or "благословение защиты" in full_text_lower:
-        # Защита: базовая 🛡️, при крите — +30% и хвостовой 🍀
+        # Защита: базовая 🛡️, при крите — +30%
         if buff_val >= 150 or is_critical:
             core, emoji = "Защита +30%!🍀", "🛡️"
         else:
             core, emoji = "Защита +20%!", "🛡️"
 
     else:
-        # Дополняем проверкой проклятий и паладинских абилок
+        # ----- Warlock / Paladin / Races -----
 
         # 1) Проклятия (warlock)
         if "проклятие добычи" in full_text_lower or "проклятие добычи" in buff_name:
@@ -80,7 +87,6 @@ def _format_buff_line(user_id: int, info: Dict[str, Any], tm) -> Optional[str]:
                 core, emoji = "Проклятие добычи -20%!", "📉"
 
         elif "проклятие неудачи" in full_text_lower or "проклятие неудачи" in buff_name:
-            # меняем ⚠️ на 🌀
             if is_critical or buff_val >= 150:
                 core, emoji = "Проклятие неудачи +30%!🍀", "🌀"
             else:
@@ -100,14 +106,13 @@ def _format_buff_line(user_id: int, info: Dict[str, Any], tm) -> Optional[str]:
             core, emoji = "Очищение светом", "✨"
 
         elif full_text_lower.startswith("очищение") or buff_name == "очищение":
-            # Полное очищение всех проклятий (буква 'и'), без крита
             core, emoji = "Очищение (сняты проклятия)", "☀️"
 
         elif "воскрешение" in full_text_lower or "воскрешение" in buff_name:
             core, emoji = "Воскрешение", "♻️"
 
         else:
-            # Races (unified table)
+            # 3) Races (unified table)
             found_race_key = None
             for rk, rn in RACE_NAMES.items():
                 if rn in buff_name or f"благословение {rn}" in full_text_lower:
@@ -121,14 +126,15 @@ def _format_buff_line(user_id: int, info: Dict[str, Any], tm) -> Optional[str]:
                 core = f"{token_name or 'Благословение'} ({buff_val})"
                 emoji = "✨"
 
-    if status == "SUCCESS":
-        return f"{base_link}{emoji}]{core}"
-    return f"{base_link}🚫]{core}"
+    return f"{base_link}{emoji}]{core}"
 
 
 def build_final_text(user_id: int, tokens_info: List[Dict[str, Any]], tm) -> str:
     """
     Build the final notification text from collected token results.
+
+    user_id – тот, кто заказывал баф (с него считаем "баллы" в конце).
+    Ссылки бафов (_format_buff_line) приоритетно ведут на owner токена.
     """
     if not tokens_info:
         return ""
@@ -146,7 +152,9 @@ def build_final_text(user_id: int, tokens_info: List[Dict[str, Any]], tm) -> str
             all_already = False
 
     lines: List[str] = []
-    lines.append("🎉 Баф успешно выдан до этого!" if all_already and not any_success else "🎉 Баф успешно выдан!")
+    lines.append(
+        "🎉 Баф успешно выдан до этого!" if all_already and not any_success else "🎉 Баф успешно выдан!"
+    )
 
     total_spent = 0
     for info in tokens_info:
@@ -159,5 +167,5 @@ def build_final_text(user_id: int, tokens_info: List[Dict[str, Any]], tm) -> str
             except Exception:
                 pass
 
-    lines.append(f"[https://vk.ru/id{user_id}|💰]Пока тест не Списано {total_spent} баллов")
+    lines.append(f"[https://vk.ru/id{user_id}|💰]Списано {total_spent} баллов")
     return "\n".join(lines).strip()
