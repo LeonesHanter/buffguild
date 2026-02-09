@@ -12,6 +12,30 @@ from .token_handler import TokenHandler
 logger = logging.getLogger(__name__)
 
 
+class AutoSaveThread(threading.Thread):
+    def __init__(self, token_manager, interval=30):
+        super().__init__(daemon=True)
+        self.token_manager = token_manager
+        self.interval = interval
+        self.running = True
+    
+    def run(self):
+        logger.info(f"💾 Автосохранение запущено (интервал: {self.interval}с)")
+        while self.running:
+            try:
+                self.token_manager.periodic_save()
+            except Exception as e:
+                logger.error(f"❌ Ошибка автосохранения: {e}")
+            
+            for _ in range(self.interval):
+                if not self.running:
+                    break
+                time.sleep(1)
+    
+    def stop(self):
+        self.running = False
+
+
 class OptimizedTokenManager:
     def __init__(self, config_path: str, vk):
         self.config_path = config_path
@@ -21,6 +45,8 @@ class OptimizedTokenManager:
         # флаг и время для отложенного сохранения
         self._pending_save = False
         self._last_save_time = 0.0
+        self._save_interval = 30  # секунд между автосохраниями
+        self._auto_save_thread = None
 
         # индексы
         self._by_id_index: Dict[str, TokenHandler] = {}
@@ -64,7 +90,24 @@ class OptimizedTokenManager:
             self._by_class_index.setdefault(t.class_type, []).append(t)
 
             if t.class_type == "apostle" and t.id != obs.id:
-                changed = t._cleanup_expired_temp_races(force=True)
+                # Используем мягкую очистку при загрузке
+                if t.temp_races:
+                    # Логируем перед очисткой
+                    logger.debug(f"🔍 {t.name}: проверка временных рас при загрузке: {t.temp_races}")
+                    
+                    # Очищаем только просроченные
+                    changed = t.cleanup_only_expired()  # ← НОВЫЙ МЕТОД
+                    
+                    # Логируем активные расы
+                    for tr in t.temp_races:
+                        race = tr.get("race", "unknown")
+                        expires = tr.get("expires", 0)
+                        current_time = time.time()
+                        if expires > current_time:
+                            hours_left = (expires - current_time) / 3600
+                            logger.info(f"🕒 {t.name}: активная временная раса '{race}' (осталось {hours_left:.1f} часов)")
+                        else:
+                            logger.warning(f"⚠️ {t.name}: временная раса '{race}' просрочена, но не очищена")
 
                 for race in t.races:
                     if race in self._apostles_by_race_index:
@@ -75,10 +118,6 @@ class OptimizedTokenManager:
                     if race in self._apostles_by_race_index:
                         self._apostles_by_race_index[race].append(t)
 
-                if changed:
-                    # конфигурация уже будет консистентна, индексы построены по очищенному состоянию
-                    pass
-
     def reload(self) -> None:
         with self._lock:
             self.load()
@@ -88,6 +127,17 @@ class OptimizedTokenManager:
     def mark_for_save(self) -> None:
         """Пометить, что нужна запись конфигурации."""
         self._pending_save = True
+
+    def save_all_tokens(self):
+        """Сохраняет все токены (алиас для save())"""
+        self.save(force=True)
+
+    def periodic_save(self):
+        """Периодическое сохранение (вызывается из основного цикла)"""
+        current_time = time.time()
+        if self._pending_save and current_time - self._last_save_time >= self._save_interval:
+            self.save(force=True)
+            logger.debug("💾 Периодическое сохранение конфигурации")
 
     def save(self, force: bool = False) -> None:
         """Сохранить конфигурацию (с отложенной записью)."""
@@ -127,6 +177,11 @@ class OptimizedTokenManager:
                         "next_virtual_grant_ts": t.next_virtual_grant_ts,
                     }
                 )
+            
+            # Логируем временные расы для отладки
+            for token_data in payload_tokens:
+                if token_data.get("temp_races"):
+                    logger.debug(f"💾 Сохранение временных рас для {token_data['name']}: {token_data['temp_races']}")
 
             self.config["observer_token_id"] = self.observer_token_id
             self.config["settings"] = self.settings
@@ -145,6 +200,12 @@ class OptimizedTokenManager:
                     f"💾 Конфигурация сохранена: {self.config_path} "
                     f"(время: {time.strftime('%H:%M:%S')})"
                 )
+                
+                # Логируем успешное сохранение временных рас
+                for token_data in payload_tokens:
+                    if token_data.get("temp_races"):
+                        logger.info(f"✅ Временные расы сохранены для {token_data['name']}")
+
             except Exception as e:
                 logging.error(f"❌ Ошибка сохранения конфигурации: {e}")
                 try:
@@ -153,6 +214,21 @@ class OptimizedTokenManager:
                 except Exception:
                     pass
                 raise
+
+    def start_auto_save(self, interval=30):
+        """Запустить автосохранение в отдельном потоке"""
+        if self._auto_save_thread is None:
+            self._auto_save_thread = AutoSaveThread(self, interval)
+            self._auto_save_thread.start()
+            logger.info(f"💾 Автосохранение запущено (интервал: {interval}с)")
+
+    def stop_auto_save(self):
+        """Остановить автосохранение"""
+        if self._auto_save_thread:
+            self._auto_save_thread.stop()
+            self._auto_save_thread.join(timeout=5)
+            self._auto_save_thread = None
+            logger.info("💾 Автосохранение остановлено")
 
     def get_token_by_id(self, token_id: str) -> Optional[TokenHandler]:
         return self._by_id_index.get(token_id)
@@ -231,7 +307,7 @@ class OptimizedTokenManager:
                     t for t in self._apostles_by_race_index[race] if t.id != token.id
                 ]
 
-        token._cleanup_expired_temp_races(force=True)
+        token.cleanup_only_expired()  # Используем мягкую очистку
 
         for race in token.races:
             if race in self._apostles_by_race_index:

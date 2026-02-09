@@ -73,14 +73,15 @@ class AbilityExecutor:
 
         logger.debug(f"🔍 Начало парсинга {len(msgs)} сообщений")
 
+        # Собираем ВСЕ тексты для анализа
+        all_texts = []
+        
         for m in msgs:
             text = str(m.get("text", "")).strip()
             text_l = text.lower()
             logger.debug(f"📝 Сообщение для парсинга: {text[:100]}...")
-
-            if "✨" in text or "повышена" in text or "увеличена" in text or "удача" in text:
-                full_response_text = text
-                logger.debug(f"📋 Сохранен полный текст ответа: {text[:200]}...")
+            
+            all_texts.append(text)  # Сохраняем все тексты
 
             mm = RE_REMAINING_SEC.search(text)
             if mm:
@@ -119,12 +120,38 @@ class AbilityExecutor:
                     except Exception as e:
                         logger.error(f"❌ Ошибка парсинга голосов в скобках: {e}")
 
-        # 1. Самые специфичные ошибки
+        # ПОСЛЕ парсинга всех сообщений, выбираем лучший текст
+        # Ищем текст с результатом (содержит эмодзи или детали)
+        result_candidates = []
+        
+        for text in all_texts:
+            text_lower = text.lower()
+            # Пропускаем триггеры (короткие или с ...)
+            if len(text) < 20 or "..." in text:
+                continue
+                
+            # Ищем тексты с результатом
+            if ("🌀" in text or "✨" in text or "☀" in text or 
+                "на вас наложено" in text_lower or "на Вас наложено" in text or
+                "уменьшена на" in text_lower or "увеличена на" in text_lower or
+                "повышена на" in text_lower or "🍀" in text):
+                result_candidates.append(text)
+
+        if result_candidates:
+            # Берем самое длинное сообщение (скорее всего это полный результат)
+            full_response_text = max(result_candidates, key=len)
+            logger.debug(f"📋 Выбран текст результата ({len(full_response_text)} chars): {full_response_text[:200]}...")
+        elif all_texts:
+            # Иначе берем последнее сообщение
+            full_response_text = all_texts[-1]
+            logger.debug(f"📋 Взяли последнее сообщение: {full_response_text[:200]}...")
+
+        # Порядок проверки ВАЖЕН: от специфичных ошибок к общим, успех - ближе к концу
         for m in msgs:
             text = str(m.get("text", "")).strip()
             logger.debug(f"🔍 Проверяем статус в сообщении: {text[:100]}...")
 
-            # ПОРЯДОК ВАЖЕН: от специфичных к общим
+            # 1. Самые специфичные ошибки (проверять ПЕРВЫМИ!)
             if RE_NOT_APOSTLE_OF_RACE.search(text):
                 matched = RE_NOT_APOSTLE_OF_RACE.search(text).group(0)
                 logger.info(
@@ -132,7 +159,7 @@ class AbilityExecutor:
                     f"'{RE_NOT_APOSTLE_OF_RACE.pattern}' сработало на '{matched}'"
                 )
                 return "PASS_TO_NEXT_APOSTLE", remaining, voices_val, full_response_text
-            
+
             if RE_ALREADY_BUFF.search(text):
                 matched = RE_ALREADY_BUFF.search(text).group(0)
                 logger.info(
@@ -140,7 +167,7 @@ class AbilityExecutor:
                     f"'{RE_ALREADY_BUFF.pattern}' сработало на '{matched}'"
                 )
                 return "ALREADY_BUFF", remaining, voices_val, full_response_text
-            
+
             if RE_OTHER_RACE.search(text):
                 matched = RE_OTHER_RACE.search(text).group(0)
                 logger.info(
@@ -148,7 +175,7 @@ class AbilityExecutor:
                     f"'{RE_OTHER_RACE.pattern}' сработало на '{matched}'"
                 )
                 return "PASS_TO_NEXT_APOSTLE", remaining, voices_val, full_response_text
-            
+
             if RE_ALREADY_RACE.search(text):
                 matched = RE_ALREADY_RACE.search(text).group(0)
                 logger.info(
@@ -156,44 +183,36 @@ class AbilityExecutor:
                     f"'{RE_ALREADY_RACE.pattern}' сработало на '{matched}'"
                 )
                 return "ALREADY_BUFF", remaining, voices_val, full_response_text
-            
-            # 2. "Требуется Голос Древних"
+
+            # 2. "Требуется Голос Древних" - специфичная ошибка для голосов
             if RE_REQUIRES_ANCIENT_VOICE.search(text):
                 matched = RE_REQUIRES_ANCIENT_VOICE.search(text).group(0)
                 logger.info(f"🔍 Статус: NO_VOICES - требуется Голос Древних")
                 return "NO_VOICES", remaining, voices_val, full_response_text
-            
-            # 3. Общие ошибки
+
+            # 3. Общие ошибки (проверять ПОСЛЕ специфичных)
             if RE_NO_VOICES.search(text):
                 matched = RE_NO_VOICES.search(text).group(0)
                 logger.info(
                     f"🔍 Статус: NO_VOICES - '{RE_NO_VOICES.pattern}' сработало на '{matched}'"
                 )
                 return "NO_VOICES", remaining, voices_val, full_response_text
-            
+
             if RE_NOT_APOSTLE.search(text):
                 matched = RE_NOT_APOSTLE.search(text).group(0)
                 logger.info(
                     f"🔍 Статус: NOT_APOSTLE - '{RE_NOT_APOSTLE.pattern}' сработало на '{matched}'"
                 )
                 return "NOT_APOSTLE", remaining, voices_val, full_response_text
-            
-            # 4. Успех (ТОЛЬКО если есть ✨)
-            if "✨" in text and RE_SUCCESS.search(text):
-                matched = RE_SUCCESS.search(text).group(0)
-                logger.info(
-                    f"🔍 Статус: SUCCESS - '{RE_SUCCESS.pattern}' сработало на '{matched}'"
-                )
-                return "SUCCESS", remaining, voices_val, full_response_text
-            
-            # 5. Уже/КД (после успеха!)
+
+            # 4. Уже/КД (проверять перед успехом, чтобы не спутать)
             if RE_ALREADY.search(text):
                 matched = RE_ALREADY.search(text).group(0)
                 logger.info(
                     f"🔍 Статус: ALREADY - '{RE_ALREADY.pattern}' сработало на '{matched}'"
                 )
                 return "ALREADY", remaining, voices_val, full_response_text
-            
+
             if RE_COOLDOWN.search(text):
                 matched = RE_COOLDOWN.search(text).group(0)
                 if len(matched) > 50:
@@ -203,10 +222,20 @@ class AbilityExecutor:
                 )
                 return "COOLDOWN", remaining, voices_val, full_response_text
 
+            # 5. УСПЕХ (проверять в САМОМ КОНЦЕ, после всех ошибок)
+            if RE_SUCCESS.search(text):
+                matched = RE_SUCCESS.search(text).group(0)
+                logger.info(
+                    f"🔍 Статус: SUCCESS - '{RE_SUCCESS.pattern}' сработало на '{matched}'"
+                )
+                return "SUCCESS", remaining, voices_val, full_response_text
+
+        # Fallback: если ничего не нашли, но есть remaining и cooldown_hint
         if remaining is not None and cooldown_hint:
             logger.info(f"🔍 Статус: COOLDOWN (fallback, remaining={remaining})")
             return "COOLDOWN", remaining, voices_val, full_response_text
 
+        # Если совсем ничего не распознали
         logger.info("🔍 Статус: UNKNOWN (ни одна регулярка не сработала)")
         return "UNKNOWN", remaining, voices_val, full_response_text
 
@@ -219,8 +248,58 @@ class AbilityExecutor:
         is_critical = False
         buff_value = 100
 
+        # 0. Проверяем на критические очищения
+        if "очищение" in text_lower:
+            if "критическое" in text_lower or "🍀" in text:
+                is_critical = True
+                buff_value = 150
+                logger.info("✨ Критическое очищение: 150 голосов")
+                return buff_value, is_critical
+            else:
+                buff_value = 100
+                logger.info("✨ Обычное очищение: 100 голосов")
+                return buff_value, is_critical
+
+        # 0.5. Проверяем на критические проклятия (ДОБАВИТЬ ЭТО!)
+        if "проклятие" in text_lower:
+            if "критическое" in text_lower or "🍀" in text:
+                is_critical = True
+                buff_value = 150
+                logger.info("👿 Критическое проклятие: 150 голосов")
+            else:
+                buff_value = 100
+                logger.info("👿 Обычное проклятие: 100 голосов")
+            
+            # Пробуем найти процент для проклятий
+            if "уменьшена на" in text_lower or "увеличена на" in text_lower:
+                percent_patterns = [
+                    r"уменьшена на\s+(\d{1,3})\s*%",
+                    r"увеличена на\s+(\d{1,3})\s*%", 
+                    r"на\s+(\d{1,3})\s*%",
+                    r"(\+?\d{1,3})\s*%"
+                ]
+                
+                for pattern in percent_patterns:
+                    match = re.search(pattern, text_lower)
+                    if match:
+                        try:
+                            percent = int(match.group(1))
+                            if percent == 30:
+                                is_critical = True
+                                buff_value = 150
+                                logger.info(f"👿 Критическое проклятие {percent}%: 150 голосов")
+                            elif percent == 20:
+                                is_critical = False
+                                buff_value = 100
+                                logger.info(f"👿 Обычное проклятие {percent}%: 100 голосов")
+                            break
+                        except Exception as e:
+                            logger.debug(f"❌ Ошибка парсинга процента проклятия: {e}")
+            
+            return buff_value, is_critical
+
         # 1. Удача в единицах — приоритет
-        luck_match = re.search(r"удача\\s+повышена\\s+на\\s+(\\d{1,3})", text_lower)
+        luck_match = re.search(r"удача\s+повышена\s+на\s+(\d{1,3})", text_lower)
         if luck_match:
             try:
                 luck_val = int(luck_match.group(1))
@@ -260,14 +339,14 @@ class AbilityExecutor:
 
         # 3. Общие проценты (атака/защита/прочее)
         percent_patterns = [
-            r"(\\+?\\d{1,3})\\s*%",
-            r"на\\s+(\\d{1,3})\\s*%",
-            r"повышена\\s+на\\s+(\\d{1,3})\\s*%",
-            r"увеличена\\s+на\\s+(\\d{1,3})\\s*%",
-            r"повышена\\s+(\\d{1,3})\\s*%",
-            r"увеличена\\s+(\\d{1,3})\\s*%",
-            r"броня повышена на (\\d{1,3})%",
-            r"атака повышена на (\\d{1,3})%",
+            r"(\+?\d{1,3})\s*%",
+            r"на\s+(\d{1,3})\s*%",
+            r"повышена\s+на\s+(\d{1,3})\s*%",
+            r"увеличена\s+на\s+(\d{1,3})\s*%",
+            r"повышена\s+(\d{1,3})\s*%",
+            r"увеличена\s+(\d{1,3})\s*%",
+            r"броня повышена на (\d{1,3})%",
+            r"атака повышена на (\d{1,3})%",
         ]
 
         found_percent = None
@@ -433,7 +512,7 @@ class AbilityExecutor:
                         # Это NOT_APOSTLE_OF_RACE или OTHER_RACE
                         # Не наказываем токен, просто сообщаем scheduler'у
                         return False, "PASS_TO_NEXT_APOSTLE", None
-                    
+
                     if status == "NOT_APOSTLE_OF_RACE":
                         if ability.key in RACE_NAMES:
                             before_cnt = len(token.temp_races)
@@ -513,7 +592,7 @@ class AbilityExecutor:
                                         else:
                                             logger.warning(
                                                 f"⚠️ {owner.name}: не удалось добавить "
-                                                f"временную расу '{ability.key}'"
+                                                f"временную расы '{ability.key}'"
                                             )
                                     self.tm.update_race_index(owner)
 
@@ -553,6 +632,7 @@ class AbilityExecutor:
                             "is_critical": is_critical,
                             "ability_key": ability.key,
                             "buff_name": ability.text,
+                            "full_text": buff_response_text,
                         }
                         return True, "SUCCESS", buff_info
 

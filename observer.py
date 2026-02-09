@@ -30,6 +30,10 @@ class ObserverBot:
         self.executor = executor
         self.scheduler = Scheduler(tm, executor, on_buff_complete=self._handle_buff_completion)
         self.health_monitor = TokenHealthMonitor(tm)
+        
+        # Добавляем ссылку на profile_manager (будет установлен в main.py)
+        self.profile_manager = None
+        
         self.observer = self.tm.get_observer()
 
         if not self.observer.access_token:
@@ -646,4 +650,3 @@ class ObserverBot:
                     f"🔄 Переподключение через {delay} секунд (попытка {retry_count}/{max_retries})"
                 )
                 time.sleep(delay)
-

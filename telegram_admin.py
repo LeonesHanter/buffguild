@@ -9,12 +9,20 @@ Telegram админ-бот для управления токенами.
  - /enable       - Включить токен (по имени)
  - /disable      - Отключить токен (по имени)
  - /remove       - Удалить токен (по имени)
- - /reload       - Перезагрузить конфиг (если bot_instance подключен)
+ - /reload       - Перезагрузить конфиг
 """
+
+import sys
+import os
+
+# ДОБАВЛЯЕМ ПУТЬ К ПРОЕКТУ - ВАЖНО!
+# Это позволит импортировать модуль buffguild
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 import json
 import logging
-import os
 import time
 from typing import Dict, Any, List
 
@@ -27,6 +35,9 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+
+# Теперь этот импорт будет работать
+from buffguild.constants import RACE_NAMES
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -58,6 +69,7 @@ class TelegramAdmin:
         self.admin_ids = set(admin_ids)
         self.config_path = config_path
         self.bot_instance = bot_instance
+        self.profile_manager = None  # Будет установлен из main.py
         self.tmp: Dict[int, Dict[str, Any]] = {}
 
     def is_admin(self, uid: int) -> bool:
@@ -222,8 +234,6 @@ class TelegramAdmin:
 
     async def recv_races(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Получение основных рас для апостола"""
-        from buffguild.constants import RACE_NAMES  # путь под твой пакет
-
         uid = update.effective_user.id
         text = update.message.text.strip().replace(" ", "")
         text = text.replace(";", ",")
@@ -244,6 +254,7 @@ class TelegramAdmin:
             seen.add(rk)
             race_keys.append(rk)
 
+        # Теперь RACE_NAMES доступен благодаря добавлению пути в sys.path
         for rk in race_keys:
             if rk not in RACE_NAMES:
                 await update.message.reply_text(
@@ -340,11 +351,12 @@ class TelegramAdmin:
             status = "✅" if t.get("enabled", True) else "🚫"
             voices = t.get("voices", "?")
             voices_emoji = "🔊" if isinstance(voices, int) and voices > 0 else "🔇"
+            manual = "⚠️" if t.get("needs_manual_voices", False) else ""
 
             lines.append(
                 f"{i}. {t.get('name', t['id'])}\n"
                 f" 🎭 {cls_name}\n"
-                f" {status} {voices_emoji} Голосов: {voices}\n"
+                f" {status} {voices_emoji} Голоса: {voices} {manual}\n"
                 f" 🆔 {t['id']}"
             )
 
