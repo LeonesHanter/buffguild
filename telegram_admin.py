@@ -6,9 +6,9 @@ Telegram админ-бот для управления токенами.
  - /start        - Список команд
  - /add_token    - Добавить новый токен (диалог)
  - /list_tokens  - Список всех токенов
- - /enable       - Включить токен
- - /disable      - Отключить токен
- - /remove       - Удалить токен
+ - /enable       - Включить токен (по имени)
+ - /disable      - Отключить токен (по имени)
+ - /remove       - Удалить токен (по имени)
  - /reload       - Перезагрузить конфиг (если bot_instance подключен)
 """
 
@@ -48,6 +48,8 @@ class TelegramAdmin:
     WAIT_CLASS = 2
     WAIT_TOKEN = 3
     WAIT_CHAT = 4
+    WAIT_VOICES = 5
+    WAIT_RACES = 6
 
     def __init__(
         self, telegram_token: str, admin_ids: List[int], config_path: str, bot_instance=None
@@ -97,7 +99,7 @@ class TelegramAdmin:
             "/remove — удалить токен\n"
             "/reload — перезагрузить конфиг"
         )
-        await update.message.reply_text(msg)  # БЕЗ parse_mode
+        await update.message.reply_text(msg)
 
     # ---- Добавление токена (диалог) ----
 
@@ -111,9 +113,9 @@ class TelegramAdmin:
         self.tmp[uid] = {}
         await update.message.reply_text(
             "➕ Добавление токена\n\n"
-            "📝 Шаг 1/4: Введите имя токена\n"
+            "📝 Шаг 1/6: Введите имя токена\n"
             "Например: Main, Backup1, Reserve"
-        )  # БЕЗ parse_mode
+        )
         return self.WAIT_NAME
 
     async def recv_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -130,10 +132,10 @@ class TelegramAdmin:
         )
         await update.message.reply_text(
             f"✅ Имя: {name}\n\n"
-            f"🎭 Шаг 2/4: Выберите класс\n\n"
+            f"🎭 Шаг 2/6: Выберите класс\n\n"
             f"{classes}\n\n"
             f"Отправьте код класса (например: apostle)"
-        )  # БЕЗ parse_mode
+        )
         return self.WAIT_CLASS
 
     async def recv_class(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -144,16 +146,16 @@ class TelegramAdmin:
             await update.message.reply_text(
                 f"❌ Неизвестный класс: {cls}\n\n"
                 f"Доступные: {', '.join(CLASS_CHOICES.keys())}"
-            )  # БЕЗ parse_mode
+            )
             return self.WAIT_CLASS
 
         self.tmp[uid]["class"] = cls
         class_name = CLASS_CHOICES[cls]
         await update.message.reply_text(
             f"✅ Класс: {class_name}\n\n"
-            f"🔑 Шаг 3/4: Отправьте VK access token\n"
+            f"🔑 Шаг 3/6: Отправьте VK access token\n"
             f"Токен должен начинаться с vk1.a."
-        )  # БЕЗ parse_mode
+        )
         return self.WAIT_TOKEN
 
     async def recv_token(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -169,13 +171,13 @@ class TelegramAdmin:
         self.tmp[uid]["access_token"] = token
         await update.message.reply_text(
             "✅ Токен сохранён\n\n"
-            "📁 Шаг 4/4: ID чата (source_chat_id)\n"
+            "📁 Шаг 4/6: ID чата (source_chat_id)\n"
             "Например: 48"
-        )  # БЕЗ parse_mode
+        )
         return self.WAIT_CHAT
 
     async def recv_chat(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Получение chat_id и завершение"""
+        """Получение chat_id"""
         uid = update.effective_user.id
         try:
             chat_id = int(update.message.text.strip())
@@ -184,10 +186,83 @@ class TelegramAdmin:
             return self.WAIT_CHAT
 
         self.tmp[uid]["source_chat_id"] = chat_id
-        target_peer = -183040898
 
+        await update.message.reply_text(
+            "🔊 Шаг 5/6: Введите стартовое количество голосов для токена\n"
+            "Например: 27"
+        )
+        return self.WAIT_VOICES
+
+    async def recv_voices(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Получение стартовых голосов"""
+        uid = update.effective_user.id
+        text = update.message.text.strip()
+        try:
+            voices = int(text)
+            if voices < 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ Нужно неотрицательное число голосов. Попробуйте ещё раз:")
+            return self.WAIT_VOICES
+
+        self.tmp[uid]["voices"] = voices
+
+        cls = self.tmp[uid].get("class")
+        if cls == "apostle":
+            await update.message.reply_text(
+                "🎭 Шаг 6/6: Укажите основные расы для апостола\n"
+                "Формат: буквы через запятую, например: ч,г\n"
+                "Доступные коды рас смотрите в описании бота."
+            )
+            return self.WAIT_RACES
+
+        # если не апостол — завершаем создание
+        await self._finalize_token_creation(uid, update)
+        return ConversationHandler.END
+
+    async def recv_races(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Получение основных рас для апостола"""
+        from buffguild.constants import RACE_NAMES  # путь под твой пакет
+
+        uid = update.effective_user.id
+        text = update.message.text.strip().replace(" ", "")
+        text = text.replace(";", ",")
+        race_keys_raw = [r for r in text.split(",") if r]
+
+        if not race_keys_raw:
+            await update.message.reply_text("❌ Не указаны расы. Введите, например: ч,г")
+            return self.WAIT_RACES
+
+        seen = set()
+        race_keys: List[str] = []
+        for rk in race_keys_raw:
+            if rk in seen:
+                await update.message.reply_text(
+                    f"❌ Нельзя указывать одну и ту же расу несколько раз ('{rk}')."
+                )
+                return self.WAIT_RACES
+            seen.add(rk)
+            race_keys.append(rk)
+
+        for rk in race_keys:
+            if rk not in RACE_NAMES:
+                await update.message.reply_text(
+                    f"❌ Неизвестная раса '{rk}'. Введите заново."
+                )
+                return self.WAIT_RACES
+
+        self.tmp[uid]["races"] = race_keys
+        await self._finalize_token_creation(uid, update)
+        return ConversationHandler.END
+
+    async def _finalize_token_creation(self, uid: int, update: Update):
+        """Финальное создание токена и запись в config.json"""
         data = self.tmp.get(uid, {})
+        target_peer = -183040898
         token_id = f"token_{int(time.time())}"
+
+        voices = int(data.get("voices", 0))
+        races = data.get("races", []) if data.get("class") == "apostle" else []
 
         new_token = {
             "id": token_id,
@@ -197,9 +272,9 @@ class TelegramAdmin:
             "owner_vk_id": 0,
             "source_chat_id": data["source_chat_id"],
             "target_peer_id": target_peer,
-            "voices": 0,
+            "voices": voices,
             "enabled": True,
-            "races": [],
+            "races": races,
             "temp_races": [],
             "captcha_until": 0,
             "level": 0,
@@ -213,12 +288,16 @@ class TelegramAdmin:
         cfg.setdefault("settings", {}).setdefault("delay", 2)
         self._save(cfg)
 
+        # bot_instance для отдельного сервиса, скорее всего, None, но оставим на будущее
         if self.bot_instance and hasattr(self.bot_instance, "tm"):
             self.bot_instance.tm.reload()
+            logging.info("🔄 TokenManager.reload() после добавления токена")
 
         self.tmp.pop(uid, None)
 
         class_name = CLASS_CHOICES[new_token["class"]]
+        races_str = ", ".join(races) if races else "-"
+
         message = (
             "✅ Токен добавлен!\n\n"
             f"📛 Имя: {new_token['name']}\n"
@@ -226,11 +305,11 @@ class TelegramAdmin:
             f"🆔 ID: {token_id}\n"
             f"📁 Chat: {new_token['source_chat_id']}\n"
             f"🎯 Target: {target_peer}\n"
-            f"🔊 Голосов: 0\n"
+            f"🔊 Голосов: {voices}\n"
+            f"🧬 Основные расы: {races_str}\n"
             f"✅ Статус: Активен"
         )
-        await update.message.reply_text(message)  # БЕЗ parse_mode
-        return ConversationHandler.END
+        await update.message.reply_text(message)
 
     async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Отмена диалога"""
@@ -273,20 +352,18 @@ class TelegramAdmin:
 
     # ---- Включение/отключение токенов ----
 
-    def _toggle(self, ident: str, enabled: bool) -> bool:
-        """Включить/отключить токен по ID или имени"""
+    def _toggle(self, name: str, enabled: bool) -> bool:
+        """Включить/отключить токен по имени"""
         cfg = self._load()
         changed = False
         for t in cfg.get("tokens", []):
-            if t.get("id") == ident or t.get("name") == ident:
+            if t.get("name") == name:
                 t["enabled"] = enabled
                 changed = True
 
         if changed:
             self._save(cfg)
-            if self.bot_instance and hasattr(self.bot_instance, "tm"):
-                self.bot_instance.tm.reload()
-
+            # bot_instance здесь, вероятнее всего, None, поэтому reload не вызываем
         return changed
 
     async def enable(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -297,13 +374,13 @@ class TelegramAdmin:
             return
 
         if not context.args:
-            await update.message.reply_text("Использование: /enable <id|name>")
+            await update.message.reply_text("Использование: /enable <name>")
             return
 
-        ident = " ".join(context.args)
-        ok = self._toggle(ident, True)
+        name = " ".join(context.args)
+        ok = self._toggle(name, True)
         await update.message.reply_text(
-            f"✅ Токен '{ident}' включён" if ok else f"❌ Не найдено: '{ident}'"
+            f"✅ Токен '{name}' включён" if ok else f"❌ Не найдено токена с именем: '{name}'"
         )
 
     async def disable(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -314,58 +391,52 @@ class TelegramAdmin:
             return
 
         if not context.args:
-            await update.message.reply_text("Использование: /disable <id|name>")
+            await update.message.reply_text("Использование: /disable <name>")
             return
 
-        ident = " ".join(context.args)
-        ok = self._toggle(ident, False)
+        name = " ".join(context.args)
+        ok = self._toggle(name, False)
         await update.message.reply_text(
-            f"🚫 Токен '{ident}' отключён" if ok else f"❌ Не найдено: '{ident}'"
+            f"🚫 Токен '{name}' отключён" if ok else f"❌ Не найдено токена с именем: '{name}'"
         )
 
     # ---- Удаление токена ----
 
     async def remove(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Удалить токен"""
+        """Удалить токен по имени"""
         uid = update.effective_user.id
         if not self.is_admin(uid):
             await update.message.reply_text("❌ Нет прав.")
             return
 
         if not context.args:
-            await update.message.reply_text("Использование: /remove <id|name>")
+            await update.message.reply_text("Использование: /remove <name>")
             return
 
-        ident = " ".join(context.args)
+        name = " ".join(context.args)
         cfg = self._load()
         before = len(cfg.get("tokens", []))
         cfg["tokens"] = [
-            t
-            for t in cfg.get("tokens", [])
-            if t.get("id") != ident and t.get("name") != ident
+            t for t in cfg.get("tokens", []) if t.get("name") != name
         ]
         after = len(cfg["tokens"])
 
         if after < before:
             self._save(cfg)
-            if self.bot_instance and hasattr(self.bot_instance, "tm"):
-                self.bot_instance.tm.reload()
-            await update.message.reply_text(f"🗑️ Токен '{ident}' удалён")
+            await update.message.reply_text(f"🗑️ Токен '{name}' удалён")
         else:
-            await update.message.reply_text(f"❌ Не найдено: '{ident}'")
+            await update.message.reply_text(f"❌ Не найдено токена с именем: '{name}'")
 
     async def reload_config(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Перезагрузить конфигурацию"""
+        """Перезагрузить конфигурацию (для отдельного сервиса фактически no-op)"""
         uid = update.effective_user.id
         if not self.is_admin(uid):
             await update.message.reply_text("❌ Нет прав.")
             return
 
-        if self.bot_instance and hasattr(self.bot_instance, "tm"):
-            self.bot_instance.tm.reload()
-            await update.message.reply_text("🔄 Конфигурация перезагружена")
-        else:
-            await update.message.reply_text("⚠️ Бот не подключён")
+        # Здесь только читаем файл — перезагрузку делает VK‑бот через свой TokenManager
+        _ = self._load()
+        await update.message.reply_text("🔄 Конфигурация перечитана с диска (локально)")
 
     # ---- Запуск ----
 
@@ -394,6 +465,16 @@ class TelegramAdmin:
                 self.WAIT_CHAT: [
                     MessageHandler(
                         filters.TEXT & ~filters.COMMAND, self.recv_chat
+                    )
+                ],
+                self.WAIT_VOICES: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND, self.recv_voices
+                    )
+                ],
+                self.WAIT_RACES: [
+                    MessageHandler(
+                        filters.TEXT & ~filters.COMMAND, self.recv_races
                     )
                 ],
             },
@@ -426,7 +507,8 @@ def main():
         )
 
     admin_ids = [int(x.strip()) for x in admins.split(",") if x.strip()]
-    TelegramAdmin(tg_token, admin_ids, "config.json").run()
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    TelegramAdmin(tg_token, admin_ids, config_path).run()
 
 
 if __name__ == "__main__":

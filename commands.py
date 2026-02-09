@@ -45,14 +45,13 @@ def parse_golosa_cmd(text: str) -> Optional[Tuple[None, int]]:
     """
     Parse '!голоса N' -> (None, n) or None.
 
-    Имён больше не поддерживаем: команда всегда работает по отправителю.
+    Имён не поддерживаем: команда всегда работает по отправителю.
     """
     t = (text or "").strip()
     if not normalize_text(t).startswith("!голоса"):
         return None
 
     parts = t.split()
-    # Ожидаем ровно два элемента: !голоса N
     if len(parts) != 2:
         return None
 
@@ -84,13 +83,13 @@ def parse_doprasa_cmd(
     if not InputValidator.validate_race_key(race):
         return None
 
-    token_name = None
+    token_name: Optional[str] = None
     if len(parts) == 3:
         token_name = parts[2].strip()
         if not InputValidator.validate_token_name(token_name):
             return None
 
-    original_timestamp = None
+    original_timestamp: Optional[int] = None
     if "reply_message" in msg_item:
         original_timestamp = InputValidator.validate_timestamp(
             msg_item["reply_message"].get("date")

@@ -5,6 +5,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+
 from .constants import RACE_NAMES
 from .regexes import (
     RE_SUCCESS,
@@ -22,11 +23,16 @@ from .regexes import (
     RE_ALREADY_BUFF,
     RE_OTHER_RACE,
     RE_ALREADY_RACE,
+    RE_RES_NO_NEED,
+    RE_RES_LEVEL_TOO_HIGH,
+    RE_ALREADY_RECENT,
 )
 from .token_handler import TokenHandler
 from .models import ParsedAbility, Job
 
+
 logger = logging.getLogger(__name__)
+
 
 
 class AbilityExecutor:
@@ -162,6 +168,24 @@ class AbilityExecutor:
                 )
                 return "ALREADY_BUFF", remaining, voices_val, full_response_text
 
+            # Воскрешение: этому персонажу не требуется воскрешение
+            if RE_RES_NO_NEED.search(text):
+                matched = RE_RES_NO_NEED.search(text).group(0)
+                logger.info(
+                    f"🔍 Статус: RES_NO_NEED - "
+                    f"'{RE_RES_NO_NEED.pattern}' сработало на '{matched}'"
+                )
+                return "RES_NO_NEED", remaining, voices_val, full_response_text
+
+            # Воскрешение: цель должна быть уровнем ниже паладина
+            if RE_RES_LEVEL_TOO_HIGH.search(text):
+                matched = RE_RES_LEVEL_TOO_HIGH.search(text).group(0)
+                logger.info(
+                    f"🔍 Статус: RES_LEVEL_TOO_HIGH - "
+                    f"'{RE_RES_LEVEL_TOO_HIGH.pattern}' сработало на '{matched}'"
+                )
+                return "RES_LEVEL_TOO_HIGH", remaining, voices_val, full_response_text
+
             if RE_NOT_APOSTLE.search(text):
                 matched = RE_NOT_APOSTLE.search(text).group(0)
                 logger.info(
@@ -170,17 +194,26 @@ class AbilityExecutor:
                 )
                 return "NOT_APOSTLE", remaining, voices_val, full_response_text
 
-            if "✨" in text and RE_SUCCESS.search(text):
+            if RE_SUCCESS.search(text):
                 matched = RE_SUCCESS.search(text).group(0)
                 logger.info(
                     f"🔍 Статус: SUCCESS - '{RE_SUCCESS.pattern}' сработало на '{matched}'"
                 )
                 return "SUCCESS", remaining, voices_val, full_response_text
 
+            # Уже было / уже есть (старые кейсы)
             if RE_ALREADY.search(text):
                 matched = RE_ALREADY.search(text).group(0)
                 logger.info(
                     f"🔍 Статус: ALREADY - '{RE_ALREADY.pattern}' сработало на '{matched}'"
+                )
+                return "ALREADY", remaining, voices_val, full_response_text
+
+            # Новый кейс: "цель уже получала ... за последние ..."
+            if RE_ALREADY_RECENT.search(text):
+                matched = RE_ALREADY_RECENT.search(text).group(0)
+                logger.info(
+                    f"🔍 Статус: ALREADY - '{RE_ALREADY_RECENT.pattern}' сработало на '{matched}'"
                 )
                 return "ALREADY", remaining, voices_val, full_response_text
 
@@ -217,7 +250,7 @@ class AbilityExecutor:
         buff_value = 100
 
         # 1) Удача в единицах — приоритет
-        luck_match = re.search(r"удача\\s+повышена\\s+на\\s+(\\d{1,3})", text_lower)
+        luck_match = re.search(r"удача\s+повышена\s+на\s+(\d{1,3})", text_lower)
         if luck_match:
             try:
                 luck_val = int(luck_match.group(1))
@@ -257,14 +290,14 @@ class AbilityExecutor:
 
         # 3) Общие проценты (атака/защита/прочее)
         percent_patterns = [
-            r"(\\+?\\d{1,3})\\s*%",
-            r"на\\s+(\\d{1,3})\\s*%",
-            r"повышена\\s+на\\s+(\\d{1,3})\\s*%",
-            r"увеличена\\s+на\\s+(\\d{1,3})\\s*%",
-            r"повышена\\s+(\\d{1,3})\\s*%",
-            r"увеличена\\s+(\\d{1,3})\\s*%",
-            r"броня повышена на (\\d{1,3})%",
-            r"атака повышена на (\\d{1,3})%",
+            r"(\+?\d{1,3})\s*%",
+            r"на\s+(\d{1,3})\s*%",
+            r"повышена\s+на\s+(\d{1,3})\s*%",
+            r"увеличена\s+на\s+(\d{1,3})\s*%",
+            r"повышена\s+(\d{1,3})\s*%",
+            r"увеличена\s+(\d{1,3})\s*%",
+            r"броня повышена на (\d{1,3})%",
+            r"атака повышена на (\d{1,3})%",
         ]
 
         found_percent = None
@@ -350,6 +383,12 @@ class AbilityExecutor:
                 token.increment_buff_stats(False)
                 return False, "NEEDS_MANUAL_VOICES", None
 
+            # если job уже отменён до старта — выходим сразу
+            if hasattr(job, "is_cancelled") and job.is_cancelled():
+                logger.info(f"⛔ Job для {job.sender_id} отменён до старта, выходим для {token.name}")
+                token.increment_buff_stats(False)
+                return False, "CANCELLED", None
+
             # Автообновление профиля, если способность тратит голоса и локально 0
             if ability.uses_voices and token.voices <= 0:
                 logger.info(f"🔄 {token.name}: voices=0, пробуем refresh_profile перед бафом")
@@ -358,6 +397,15 @@ class AbilityExecutor:
                 else:
                     token.increment_buff_stats(False)
                     return False, "NO_VOICES_LOCAL", None
+
+            # Спец-проверка: для воскрешения требуется минимум 5 голосов
+            if ability.uses_voices and ability.key == "в" and token.voices < 5:
+                logger.info(
+                    f"⛔ {token.name}: голосов недостаточно для воскрешения "
+                    f"(есть {token.voices}, нужно ≥ 5)"
+                )
+                token.increment_buff_stats(False)
+                return False, "NO_VOICES_LOCAL_BELOW_5_FOR_RES", None
 
             can_social, rem_social = token.can_use_social()
             if not can_social:
@@ -397,6 +445,15 @@ class AbilityExecutor:
                 buff_response_text = ""
 
                 for i in range(poll_count):
+                    # жёсткая отмена: если job помечен — прерываем исполнение
+                    if hasattr(job, "is_cancelled") and job.is_cancelled():
+                        logger.info(
+                            f"⛔ Job для {job.sender_id} отменён во время ожидания, "
+                            f"прерываем execute_one для {token.name}"
+                        )
+                        token.increment_buff_stats(False)
+                        return False, "CANCELLED", None
+
                     time.sleep(poll_interval * (1 + i * 0.2))
                     history = token.get_history_cached(token.target_peer_id, count=25)
                     new_msgs = [
@@ -544,6 +601,7 @@ class AbilityExecutor:
                             "is_critical": is_critical,
                             "ability_key": ability.key,
                             "buff_name": ability.text,
+                            "full_text": buff_response_text,
                         }
                         return True, "SUCCESS", buff_info
 

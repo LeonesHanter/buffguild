@@ -27,6 +27,11 @@ class Scheduler:
         self._lock = threading.Lock()
         self._last_cleanup_time: float = 0.0
         self._on_buff_complete = on_buff_complete
+
+        # 🔁 глобальный КД по цели + способности (ability.key)
+        # ключ: (target_id, ability_key) -> unix_ts до какого времени не пробуем
+        self._global_cooldowns: Dict[Tuple[int, str], float] = {}
+
         self._thr = threading.Thread(target=self._run_loop, daemon=True)
         self._thr.start()
 
@@ -204,6 +209,24 @@ class Scheduler:
                     logging.warning(f"⚠️ Unknown letter '{letter}'")
                     continue
 
+                # 🔍 Глобальный КД по цели + способности
+                # сейчас цель отождествляем с sender_id
+                target_id = job.sender_id
+                gc_key = (target_id, ability.key)
+                now = time.time()
+                gc_until = self._global_cooldowns.get(gc_key)
+
+                if gc_until and gc_until > now:
+                    remaining = int(gc_until - now)
+                    logging.info(
+                        f"⏳ Цель {target_id} в глобальном КД по '{ability.key}', "
+                        f"осталось ~{remaining}s, пропускаем попытку"
+                    )
+                    # перенесём задачу ближе к окончанию глобального КД
+                    when = gc_until + 0.5
+                    self._reschedule(when, job, letter)
+                    continue
+
                 candidates, wait_s = self._candidates_and_wait(ability)
 
                 # If race letter and no candidates -> skip (no fallback, no reschedule)
@@ -224,9 +247,19 @@ class Scheduler:
 
                 # Non-race: if no candidates but there is a cooldown wait -> reschedule to earliest moment
                 if not candidates and wait_s > 0:
-                    when = time.time() + wait_s + 0.5  # small buffer
+                    now = time.time()
+                    when = now + wait_s + 0.5  # small buffer
                     self._reschedule(when, job, letter)
                     logging.info(f"⏳ Все токены в КД для '{letter}', повтор через {int(wait_s)}с")
+
+                    # 🔁 Ставим глобальный КД по цели + способности
+                    target_id = job.sender_id
+                    gc_key = (target_id, ability.key)
+                    gc_until = now + wait_s
+                    self._global_cooldowns[gc_key] = gc_until
+                    logging.info(
+                        f"⏳ Устанавливаем глобальный КД для цели {target_id} и '{ability.key}' на {int(wait_s)}s"
+                    )
                     continue
 
                 # No candidates at all (disabled/captcha/no voices/etc.)
@@ -248,6 +281,8 @@ class Scheduler:
                 success = False
                 attempt_status = ""
                 buff_info: Optional[Dict[str, Any]] = None
+
+                cooldown_seen = False  # хотя бы один токен вернул COOLDOWN
 
                 # Try up to 2 random candidates (already shuffled)
                 for token in candidates[:2]:
@@ -277,19 +312,55 @@ class Scheduler:
                         success = True
                         break
 
+                    # COOLDOWN: отмечаем и пробуем следующего токена
+                    if norm_status.startswith("COOLDOWN"):
+                        cooldown_seen = True
+                        logging.info(
+                            f"⏳ {token.name}: COOLDOWN для '{letter}' (status={norm_status}), "
+                            f"пробуем следующего кандидата"
+                        )
+                        continue
+
                     if ok or norm_status in ("SUCCESS", "ALREADY_BUFF"):
                         success = True
                         self._call_on_complete_safe(job, buff_info)
+
+                        # ✅ Баф/эффект прошёл — убираем глобальный КД для этой цели+способности
+                        try:
+                            target_id_ok = job.sender_id
+                            gc_key_ok = (target_id_ok, ability.key)
+                            if gc_key_ok in self._global_cooldowns:
+                                self._global_cooldowns.pop(gc_key_ok, None)
+                                logging.info(
+                                    f"✅ Сброс глобального КД для цели {target_id_ok} и '{ability.key}' "
+                                    f"после успешного статуса {norm_status}"
+                                )
+                        except Exception:
+                            pass
+
                         break
 
                 if not success:
-                    if attempt_status and attempt_status.upper() in ("SUCCESS", "ALREADY", "ALREADY_BUFF"):
-                        self._call_on_complete_safe(job, buff_info or {})
-                    else:
-                        self._reschedule(time.time() + 30.0, job, letter)
+                    norm_attempt = (attempt_status or "").upper()
+
+                    # 🧊 Все кандидаты дали только COOLDOWN -> считаем задачу завершённой без повторов
+                    if cooldown_seen and norm_attempt not in ("SUCCESS", "ALREADY", "ALREADY_BUFF"):
                         logging.info(
-                            f"⏳ Не удалось обработать '{letter}' (статус: {attempt_status}), повтор через 30с"
+                            f"🧊 Все кандидаты для '{letter}' в КД (последний статус: {attempt_status}), "
+                            f"задачу считаем завершённой без повторов"
                         )
+                        if self._on_buff_complete:
+                            info_cd = buff_info or {}
+                            info_cd.setdefault("status", "ALL_IN_COOLDOWN")
+                            self._call_on_complete_safe(job, info_cd)
+                    else:
+                        if norm_attempt in ("SUCCESS", "ALREADY", "ALREADY_BUFF"):
+                            self._call_on_complete_safe(job, buff_info or {})
+                        else:
+                            self._reschedule(time.time() + 30.0, job, letter)
+                            logging.info(
+                                f"⏳ Не удалось обработать '{letter}' (статус: {attempt_status}), повтор через 30с"
+                            )
 
             except Exception as e:
                 logging.error(f"❌ Ошибка в Scheduler: {e}", exc_info=True)
