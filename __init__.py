@@ -12,6 +12,7 @@ from .health import TokenHealthMonitor
 from .profile_manager import ProfileManager
 from .telegram_admin import TelegramAdmin
 from .vk_client import ResilientVKClient
+from .group_handler import GroupHandler
 from .models import Job, ParsedAbility
 from .commands import (
     parse_baf_letters,
@@ -63,7 +64,7 @@ from .job_storage import JobStorage
 from .state_store import JobStateStore
 from .logging_setup import setup_logging
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 __author__ = "Buff Guild Team"
 
 __all__ = [
@@ -76,6 +77,7 @@ __all__ = [
     'ProfileManager',
     'TelegramAdmin',
     'ResilientVKClient',
+    'GroupHandler',
     'Job',
     'ParsedAbility',
     'JobStorage',

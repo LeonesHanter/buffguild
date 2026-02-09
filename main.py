@@ -17,7 +17,7 @@ from buffguild.vk_client import ResilientVKClient
 from buffguild.token_manager import OptimizedTokenManager
 from buffguild.executor import AbilityExecutor
 from buffguild.observer import ObserverBot
-from buffguild.profile_manager import ProfileManager  # <-- ВАЖНО: этот импорт должен быть!
+from buffguild.profile_manager import ProfileManager
 
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 
@@ -31,7 +31,13 @@ def main() -> None:
     executor = AbilityExecutor(tm)
     observer_bot = ObserverBot(tm, executor)
 
-    # ЗАПУСК МЕНЕДЖЕРА С ЧЕРЕДОВАНИЕМ - ЭТО ДОЛЖНО БЫТЬ В ЛОГАХ!
+    # Проверяем тип Observer
+    if observer_bot.is_group:
+        logging.info("👥 Observer работает как группа ВК")
+    else:
+        logging.info("👤 Observer работает как пользовательский токен")
+
+    # ЗАПУСК МЕНЕДЖЕРА С ЧЕРЕДОВАНИЕМ
     profile_manager = ProfileManager(tm)
     profile_manager.start()
     logging.info("🔄 ProfileManager запущен (чередование: 30 мин)")
@@ -74,7 +80,7 @@ if __name__ == "__main__":
         main()
     except (FileNotFoundError, json.JSONDecodeError) as e:
         logging.error(f"❌ Ошибка config.json: {e}")
-        raise
-    except Exception:
+        sys.exit(1)
+    except Exception as e:
         logging.critical("💥 Критическая ошибка при запуске!", exc_info=True)
-        raise
+        sys.exit(1)

@@ -59,9 +59,50 @@ class OptimizedTokenManager:
         self.tokens: List[TokenHandler] = []
         self.observer_token_id: str = ""
         self.settings: Dict[str, Any] = {}
+        
+        # Обработчик сообщества
+        self.group_handler: Optional[Any] = None
 
         self.load()
+        self._init_group_handler()
         self._build_indexes()
+
+    def _init_group_handler(self):
+        """Инициализация обработчика сообщества"""
+        try:
+            from .group_handler import GroupHandler
+            
+            group_settings = self.config.get("group_settings", {})
+            if group_settings:
+                self.group_handler = GroupHandler(group_settings, self._vk)
+                
+                # Детальная проверка
+                logger.info(f"🔍 Инициализация GroupHandler:")
+                logger.info(f"  • config group_id: {self.group_handler.group_id}")
+                logger.info(f"  • API group_id (abs): {abs(self.group_handler.group_id)}")
+                logger.info(f"  • token length: {len(self.group_handler.access_token)}")
+                logger.info(f"  • group_name: {self.group_handler.name}")
+                
+                is_valid = self.group_handler.is_valid()
+                logger.info(f"  • is_valid(): {is_valid}")
+                
+                if is_valid:
+                    logger.info(f"✅ GroupHandler инициализирован: {self.group_handler.name}")
+                    # Пробуем получить LongPoll сервер
+                    if self.group_handler.get_long_poll_server():
+                        logger.info(f"✅ GroupHandler LongPoll настроен")
+                    else:
+                        logger.warning(f"⚠️ GroupHandler: не удалось настроить LongPoll")
+                else:
+                    logger.warning("⚠️ GroupHandler: конфигурация невалидна")
+                    # НЕ обнуляем handler, пусть будет для отладки
+                    
+        except ImportError as e:
+            logger.warning(f"⚠️ Не удалось импортировать GroupHandler: {e}")
+            self.group_handler = None
+        except Exception as e:
+            logger.error(f"❌ Ошибка инициализации GroupHandler: {e}", exc_info=True)
+            self.group_handler = None
 
     def load(self) -> None:
         with open(self.config_path, "r", encoding="utf-8") as f:
@@ -83,20 +124,20 @@ class OptimizedTokenManager:
         self._by_class_index = {}
         self._apostles_by_race_index = {race: [] for race in RACE_NAMES.keys()}
 
-        obs = self.get_observer()
+        obs = self.get_observer_token_object()  # Используем вспомогательный метод
 
         for t in self.tokens:
             self._by_owner_index.setdefault(t.owner_vk_id, []).append(t)
             self._by_class_index.setdefault(t.class_type, []).append(t)
 
-            if t.class_type == "apostle" and t.id != obs.id:
+            if t.class_type == "apostle" and (not obs or t.id != obs.id):
                 # Используем мягкую очистку при загрузке
                 if t.temp_races:
-                    # Логируем перед очисткой
+                    # Логируем перед очистку
                     logger.debug(f"🔍 {t.name}: проверка временных рас при загрузке: {t.temp_races}")
                     
                     # Очищаем только просроченные
-                    changed = t.cleanup_only_expired()  # ← НОВЫЙ МЕТОД
+                    changed = t.cleanup_only_expired()
                     
                     # Логируем активные расы
                     for tr in t.temp_races:
@@ -118,9 +159,99 @@ class OptimizedTokenManager:
                     if race in self._apostles_by_race_index:
                         self._apostles_by_race_index[race].append(t)
 
+    def get_observer_token_object(self) -> Optional[TokenHandler]:
+        """Получает объект токена Observer (если он существует)"""
+        if not self.observer_token_id:
+            return None
+        return self._by_id_index.get(self.observer_token_id)
+
+    def _create_group_proxy(self):
+        """Создает прокси-объект для совместимости с TokenHandler"""
+        if not self.group_handler:
+            raise RuntimeError("GroupHandler не инициализирован")
+        
+        class GroupProxy:
+            def __init__(self, group_handler, source_chat_id, vk):
+                self.group_handler = group_handler
+                self._vk = vk
+                self.source_peer_id = 2000000000 + source_chat_id if source_chat_id else 0
+                self.name = group_handler.name
+                self.id = f"group_{group_handler.group_id}"
+                self.access_token = group_handler.access_token
+                self.class_type = "observer"
+                self.enabled = True
+                
+            def send_to_peer(self, peer_id, text, forward_msg_id=None, reply_to_cmid=None):
+                return self.group_handler.send_to_peer(peer_id, text, forward_msg_id, reply_to_cmid)
+                
+            def get_by_id(self, message_ids):
+                return self.group_handler.get_by_id(message_ids)
+                
+            def get_history_cached(self, peer_id, count=20):
+                return self.group_handler.get_history_cached(peer_id, count)
+                
+            def invalidate_cache(self, peer_id=None):
+                return self.group_handler.invalidate_cache(peer_id)
+                
+            def send_reaction_success(self, peer_id, cmid):
+                return self.group_handler.send_reaction_success(peer_id, cmid)
+                
+            def delete_message(self, peer_id, message_id):
+                return self.group_handler.delete_message(peer_id, message_id)
+                
+            def get_health_info(self):
+                return {
+                    "id": self.id,
+                    "name": self.name,
+                    "class": "observer",
+                    "enabled": True,
+                    "captcha_paused": False,
+                    "captcha_until": 0,
+                    "needs_manual_voices": False,
+                    "voices": 0,
+                    "level": 0,
+                    "temp_races_count": 0,
+                    "successful_buffs": 0,
+                    "total_attempts": 0,
+                    "success_rate": 0.0,
+                    "owner_vk_id": 0,
+                    "races": [],
+                    "temp_races": [],
+                    "social_cd": "-",
+                }
+        
+        source_chat_id = self.settings.get("observer_source_chat_id", 120)
+        return GroupProxy(self.group_handler, source_chat_id, self._vk)
+
+    def get_observer(self):
+        """Получение Observer (токен или группа)"""
+        # Приоритет: GroupHandler если он есть и валиден
+        if self.group_handler:
+            try:
+                # Проверяем валидность GroupHandler
+                if hasattr(self.group_handler, 'is_valid') and self.group_handler.is_valid():
+                    logger.info("👥 Используется GroupHandler для Observer")
+                    return self._create_group_proxy()
+                else:
+                    logger.warning("⚠️ GroupHandler невалиден, пробуем пользовательский токен")
+            except Exception as e:
+                logger.error(f"❌ Ошибка проверки GroupHandler: {e}")
+        
+        # Запасной вариант: пользовательский токен
+        if not self.observer_token_id:
+            raise RuntimeError("observer_token_id is not set in config.json")
+        
+        t = self.get_token_by_id(self.observer_token_id)
+        if not t:
+            raise RuntimeError(f"observer_token_id='{self.observer_token_id}' not found in tokens[]")
+        
+        logger.info("👤 Используется пользовательский токен для Observer")
+        return t
+
     def reload(self) -> None:
         with self._lock:
             self.load()
+            self._init_group_handler()
             self._build_indexes()
             logging.info("🔄 TokenManager: конфигурация перезагружена и индексы обновлены")
 
@@ -271,28 +402,17 @@ class OptimizedTokenManager:
 
         return None
 
-    def get_observer(self) -> TokenHandler:
-        if not self.observer_token_id:
-            raise RuntimeError("observer_token_id is not set in config.json")
-
-        t = self.get_token_by_id(self.observer_token_id)
-        if not t:
-            raise RuntimeError(
-                f"observer_token_id='{self.observer_token_id}' not found in tokens[]"
-            )
-        return t
-
     def all_buffers(self) -> List[TokenHandler]:
-        obs = self.get_observer()
-        return [t for t in self.tokens if t.id != obs.id]
+        obs_token = self.get_observer_token_object()
+        return [t for t in self.tokens if not obs_token or t.id != obs_token.id]
 
     def get_apostles_with_race(self, race_key: str) -> List[TokenHandler]:
         """Получить апостолов с определенной расой, исключая Observer."""
-        obs = self.get_observer()
+        obs_token = self.get_observer_token_object()
         result: List[TokenHandler] = []
 
         for t in self._apostles_by_race_index.get(race_key, []):
-            if t.id != obs.id:
+            if not obs_token or t.id != obs_token.id:
                 result.append(t)
 
         return result
