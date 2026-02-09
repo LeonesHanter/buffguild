@@ -46,13 +46,8 @@ def _format_buff_line(user_id: int, info: Dict[str, Any], tm) -> Optional[str]:
         nice_name = buff_name or "баф"
         return f"{base_link}⏳] баф {nice_name} пропущен (КД)"
 
-    # Уже действует такое благословение
     if status == "ALREADY_BUFF":
         return f"{base_link}🚫] Благословений не было"
-
-    # Любой статус, отличающийся от SUCCESS, не рендерим как баф
-    if status != "SUCCESS":
-        return None
 
     # ----- Non-race buffs (удача/атака/защита) -----
     if "удач" in buff_name or "благословение удачи" in full_text_lower:
@@ -126,7 +121,9 @@ def _format_buff_line(user_id: int, info: Dict[str, Any], tm) -> Optional[str]:
                 core = f"{token_name or 'Благословение'} ({buff_val})"
                 emoji = "✨"
 
-    return f"{base_link}{emoji}]{core}"
+    if status == "SUCCESS":
+        return f"{base_link}{emoji}]{core}"
+    return f"{base_link}🚫]{core}"
 
 
 def build_final_text(user_id: int, tokens_info: List[Dict[str, Any]], tm) -> str:
