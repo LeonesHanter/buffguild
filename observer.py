@@ -86,7 +86,7 @@ class ObserverBot:
         if len(parts) == 1:
             self.observer.send_to_peer(
                 self.source_peer_id,
-                "❌ Укажите имя токена: !диагностика [имя_токена]",
+                "❌ Укажите имя токена: /диагностика [имя_токена]",
                 None,
             )
             return
@@ -137,7 +137,7 @@ class ObserverBot:
         lines: List[str] = []
 
         if apostles:
-            lines.append("🎭 Апостолы")
+            lines.append("👼 Апостолы")
             for t in apostles:
                 races_str = self._format_races_simple(t)
                 manual = " ⚠️" if t.needs_manual_voices else ""
@@ -283,12 +283,12 @@ class ObserverBot:
         return token, None
 
     def _handle_apo_toggle(self, from_id: int, norm: str, text: str) -> None:
-        # !апо вкл Ник  /  !апо выкл Ник
+        # /апо вкл Ник  /  /апо выкл Ник
         parts = text.strip().split()
         if len(parts) < 3:
             self.observer.send_to_peer(
                 self.source_peer_id,
-                "❌ Использование: !апо вкл|выкл ИмяТокена",
+                "❌ Использование: /апо вкл|выкл ИмяТокена",
                 None,
             )
             return
@@ -329,12 +329,12 @@ class ObserverBot:
         )
 
     def _handle_change_races(self, from_id: int, text: str) -> None:
-        # !сменарасы ИмяТокена ч,н
+        # /сменарасы ИмяТокена ч,н
         parts = text.strip().split(maxsplit=2)
         if len(parts) < 3:
             self.observer.send_to_peer(
                 self.source_peer_id,
-                "❌ Использование: !сменарасы ИмяТокена ч,н",
+                "❌ Использование: /сменарасы ИмяТокена ч,н",
                 None,
             )
             return
@@ -605,21 +605,21 @@ class ObserverBot:
             )
             return
 
-        if norm in ["!здоровье", "!health", "!статус"]:
+        if norm in ["/здоровье", "/health", "/статус"]:
             self._handle_health_command(from_id, text)
             return
 
-        if norm.startswith("!диагностика"):
+        if norm.startswith("/диагностика"):
             self._handle_diagnostic_command(from_id, text)
             return
 
-        # !апо вкл/выкл ИмяТокена
-        if norm.startswith("!апо "):
+        # /апо вкл/выкл ИмяТокена
+        if norm.startswith("/апо "):
             self._handle_apo_toggle(from_id, norm, text)
             return
 
-        # !сменарасы ИмяТокена ч,н
-        if norm.startswith("!сменарасы"):
+        # /сменарасы ИмяТокена ч,н
+        if norm.startswith("/сменарасы"):
             self._handle_change_races(from_id, text)
             return
 
@@ -644,7 +644,7 @@ class ObserverBot:
             return
 
         if is_apo_cmd(norm):
-            logger.info(f"📋 Обработка команды !апо от {from_id}")
+            logger.info(f"📋 Обработка команды /апо от {from_id}")
             status = self._format_apo_status()
             logger.info(f"📤 Отправка статуса апостолов ({len(status)} символов)")
             self.observer.send_to_peer(self.source_peer_id, status, None)
@@ -656,7 +656,7 @@ class ObserverBot:
             if self.state.has_active(from_id):
                 self.observer.send_to_peer(
                     self.source_peer_id,
-                    "❌ У вас уже есть активные бафы. Дождитесь их выполнения или отмените командой '!баф отмена'.",
+                    "❌ У вас уже есть активные бафы. Дождитесь их выполнения или отмените командой '/баф отмена'.",
                     None,
                 )
                 return

@@ -16,7 +16,7 @@ from .utils import normalize_text
 def parse_baf_letters(text: str) -> str:
     """Parse '!баф ...' and return up to 4 valid ability letters, or ''."""
     text_n = normalize_text(text or "")
-    if not text_n.startswith("!баф"):
+    if not text_n.startswith("/баф"):
         return ""
 
     s = text_n[4:].strip()
@@ -34,11 +34,11 @@ def parse_baf_letters(text: str) -> str:
 
 
 def is_apo_cmd(text: str) -> bool:
-    return normalize_text(text or "").startswith("!апо")
+    return normalize_text(text or "").startswith("/апо")
 
 
 def is_baf_cancel_cmd(text: str) -> bool:
-    return normalize_text(text or "") == "!баф отмена"
+    return normalize_text(text or "") == "/баф отмена"
 
 
 def parse_golosa_cmd(text: str) -> Optional[Tuple[None, int]]:
@@ -48,7 +48,7 @@ def parse_golosa_cmd(text: str) -> Optional[Tuple[None, int]]:
     Имён не поддерживаем: команда всегда работает по отправителю.
     """
     t = (text or "").strip()
-    if not normalize_text(t).startswith("!голоса"):
+    if not normalize_text(t).startswith("/голоса"):
         return None
 
     parts = t.split()
