@@ -3,7 +3,7 @@ from typing import Any, Dict
 
 
 VK_API_BASE = "https://api.vk.com/method"
-VK_API_VERSION = "5.131"
+VK_API_VERSION = "5.199"
 
 
 # Порядок перебора классов при подборе бафера
@@ -72,8 +72,6 @@ CLASS_ABILITIES: Dict[str, Dict[str, Any]] = {
         "uses_voices": True,
         "default_cooldown": None,
         "abilities": {
-            # Воскрешение: 6 часов + 1 секунда
-            "в": ("воскрешение", 6 * 60 * 60 + 1),
             # Очищение огнем: 15 минут + 30 секунд
             "т": ("очищение огнем", 15 * 60 + 30),
         },
@@ -86,8 +84,6 @@ CLASS_ABILITIES: Dict[str, Dict[str, Any]] = {
         "abilities": {
             # Полное очищение всех проклятий: 15 минут + 30 секунд
             "и": ("очищение", 15 * 60 + 30),
-            # Воскрешение: 6 часов + 1 секунда
-            "в": ("воскрешение", 6 * 60 * 60 + 1),
             # Очищение светом: 15 минут + 30 секунд
             "с": ("очищение светом", 15 * 60 + 30),
         },
@@ -100,4 +96,44 @@ CLASS_ABILITIES: Dict[str, Dict[str, Any]] = {
         "default_cooldown": None,
         "abilities": {},
     },
+}
+
+SYSTEM_VERSION = "3.0.0"
+SYSTEM_FEATURES = {
+    "voice_prophet": True,    # Интеллектуальный предсказатель голосов
+    "safe_race_timer": True,  # Безопасный таймер рас (-60 сек)
+    "turbo_mode": True,       # Турбо-режим (4 бафа за 0.45с)
+}
+
+# Безопасный таймер рас (Safe Race Timer)
+TEMP_RACE_SAFETY_MARGIN = 60  # защитный зазор 60 секунд
+TEMP_RACE_DURATION_HOURS = 2  # стандартная длительность
+TEMP_RACE_CLEANUP_INTERVAL = 300  # очистка каждые 5 минут
+
+# Параметры турбо-режима (Turbo Mode)
+TURBO_MODE_CONFIG = {
+    "enabled": True,
+    "inter_token_delay": 0.15,  # 150 мс между разными токенами
+    "min_letters": 2,           # минимум букв для активации
+    "max_letters": 4,           # максимум букв (ограничение VK)
+}
+
+# Параметры Voice Prophet
+VOICE_PROPHET_CONFIG = {
+    "enabled": True,
+    "min_check_interval": 15 * 60,     # 15 минут (не чаще)
+    "max_check_interval": 4 * 60 * 60, # 4 часа (не реже)
+    "prediction_lead_time": 15 * 60,   # проверка за 15 минут до
+    "critical_voices": 3,             # критический уровень
+    "required_history_size": 5,       # минимум событий для предсказания
+    "storage_dir": "data/voice_prophet"
+}
+
+RESURRECTION_CONFIG = {
+    "command_text": "воскрешение",           # Текст команды
+    "cost_voices": 5,                       # Стоимость в голосах (1)
+    "cost_balance": 100,                   # Стоимость в баллах (100)
+    "cooldown": 6 * 60 * 60 + 1,           # 6 часов + 1 секунда
+    "social_cooldown": 62,                # Социальное КД
+    "min_voices": 5,                      # Минимум голосов (1)
 }

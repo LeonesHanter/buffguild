@@ -1,23 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-buffguild - VK Buff Guild Bot для автоматизации баффов в игре
+buffguild - VK Buff Guild Bot
 """
 
 from .token_handler import TokenHandler
 from .token_manager import OptimizedTokenManager
 from .executor import AbilityExecutor
-from .observer import ObserverBot
+from .observer_main import ObserverBot  # ← ПРОВЕРЬ ЭТУ СТРОКУ
 from .scheduler import Scheduler
 from .health import TokenHealthMonitor
 from .profile_manager import ProfileManager
 from .telegram_admin import TelegramAdmin
 from .vk_client import ResilientVKClient
-from .group_handler import GroupHandler
+from .group_handler import GroupHandler, GroupProxy
 from .models import Job, ParsedAbility
 from .commands import (
     parse_baf_letters,
     parse_golosa_cmd,
     parse_doprasa_cmd,
+    parse_resurrection_cmd,
+    is_resurrection_cmd,
     is_apo_cmd,
     is_baf_cancel_cmd
 )
@@ -37,6 +39,9 @@ from .regexes import (
     RE_OTHER_RACE,
     RE_ALREADY_RACE,
     RE_REQUIRES_ANCIENT_VOICE,
+    RE_RESURRECTION,
+    RE_RESURRECTION_SUCCESS,
+    RE_CLEANSE,
 )
 from .notifications import (
     build_registration_text,
@@ -48,7 +53,15 @@ from .constants import (
     RACE_NAMES,
     RACE_EMOJIS,
     VK_API_BASE,
-    VK_API_VERSION
+    VK_API_VERSION,
+    RESURRECTION_CONFIG,
+    SYSTEM_VERSION,
+    SYSTEM_FEATURES,
+    TEMP_RACE_SAFETY_MARGIN,
+    TEMP_RACE_DURATION_HOURS,
+    TEMP_RACE_CLEANUP_INTERVAL,
+    TURBO_MODE_CONFIG,
+    VOICE_PROPHET_CONFIG,
 )
 from .utils import (
     jitter_sleep,
@@ -63,8 +76,10 @@ from .ability import build_ability_text_and_cd
 from .job_storage import JobStorage
 from .state_store import JobStateStore
 from .logging_setup import setup_logging
+from .custom_triggers import custom_parser, CustomBuff, custom_storage
+from .voice_prophet import VoiceProphet
 
-__version__ = "2.1.0"
+__version__ = "3.1.0"
 __author__ = "Buff Guild Team"
 
 __all__ = [
@@ -78,14 +93,21 @@ __all__ = [
     'TelegramAdmin',
     'ResilientVKClient',
     'GroupHandler',
+    'GroupProxy',
     'Job',
     'ParsedAbility',
+    'CustomBuff',
     'JobStorage',
     'JobStateStore',
+    'custom_parser',
+    'custom_storage',
+    'VoiceProphet',
     'setup_logging',
     'parse_baf_letters',
     'parse_golosa_cmd',
     'parse_doprasa_cmd',
+    'parse_resurrection_cmd',
+    'is_resurrection_cmd',
     'is_apo_cmd',
     'is_baf_cancel_cmd',
     'build_registration_text',
@@ -104,6 +126,14 @@ __all__ = [
     'RACE_EMOJIS',
     'VK_API_BASE',
     'VK_API_VERSION',
+    'RESURRECTION_CONFIG',
+    'SYSTEM_VERSION',
+    'SYSTEM_FEATURES',
+    'TEMP_RACE_SAFETY_MARGIN',
+    'TEMP_RACE_DURATION_HOURS',
+    'TEMP_RACE_CLEANUP_INTERVAL',
+    'TURBO_MODE_CONFIG',
+    'VOICE_PROPHET_CONFIG',
     'RE_SUCCESS',
     'RE_ALREADY',
     'RE_NOT_APOSTLE',
@@ -119,4 +149,7 @@ __all__ = [
     'RE_OTHER_RACE',
     'RE_ALREADY_RACE',
     'RE_REQUIRES_ANCIENT_VOICE',
+    'RE_RESURRECTION',
+    'RE_RESURRECTION_SUCCESS',
+    'RE_CLEANSE',
 ]

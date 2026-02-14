@@ -4,7 +4,7 @@ ProfileManager — менеджер фоновых проверок (профи�
 
 Что делает:
 1) "Мой профиль" — обновление голосов/уровня/рас.
-2) "Виртуальные голоса" — если у паладинов/проклинателей 0 голосов.
+2) "Виртуальные голоса" — если у паладинов/проклинателей/АПОСТОЛОВ 0 голосов.
 
 Режимы проверки профиля:
 - WARMUP (после запуска): проходим ВСЕ доступные токены по одному, каждые 2 минуты.
@@ -45,6 +45,10 @@ class ProfileManager:
     MAX_VIRTUAL_ATTEMPTS = 5                   # максимум попыток выдать виртуальный голос
 
     STATE_FILE = "profile_manager_state.json"
+    
+    # ============= Voice Prophet Storage =============
+    VOICE_PROPHET_STORAGE = "data/voice_prophet"
+    # ================================================
 
     # Из профиля "голоса" — это число в скобках у класса: "Класс: апостол (25), ..."
     RE_VOICES_FROM_CLASS_PARENS = re.compile(r"👤\s*Класс:\s*[^\(\n]*\((\d+)\)", re.IGNORECASE)
@@ -57,7 +61,7 @@ class ProfileManager:
 
         self._state = self._load_state()
 
-        # Отладочная инфа по путям (полезно в journalctl)
+        # Отладочная инфа по путям
         try:
             cwd = os.getcwd()
             sf = os.path.abspath(self.STATE_FILE)
@@ -90,10 +94,7 @@ class ProfileManager:
 
         try:
             if not os.path.exists(self.STATE_FILE):
-                logger.warning(
-                    f"ℹ️ ProfileManager: state-файл не найден: {os.path.abspath(self.STATE_FILE)}. "
-                    f"Стартуем с дефолтного состояния."
-                )
+                logger.warning(f"ℹ️ ProfileManager: state-файл не найден: {os.path.abspath(self.STATE_FILE)}")
                 return state
 
             with open(self.STATE_FILE, "r", encoding="utf-8") as f:
@@ -162,8 +163,17 @@ class ProfileManager:
     # ---------------------------
 
     def start(self) -> None:
+        """Запуск ProfileManager с активацией Voice Prophet"""
         if self._running:
             return
+        
+        # ============= Активируем Voice Prophet для всех токенов =============
+        for token in self.tm.tokens:
+            if token.class_type in ["apostle", "warlock", "crusader", "light_incarnation"]:
+                if not token.voice_prophet:
+                    token.enable_voice_prophet(self.VOICE_PROPHET_STORAGE)
+                    logger.debug(f"🔮 Voice Prophet активирован для {token.name}")
+        # ====================================================================
 
         self._running = True
         self._thread = threading.Thread(
@@ -172,7 +182,7 @@ class ProfileManager:
             name="ProfileManager",
         )
         self._thread.start()
-        logger.info("🔄 ProfileManager запущен (чередование: 30 мин)")
+        logger.info("🔄 ProfileManager запущен с Voice Prophet")
 
     def stop(self) -> None:
         self._running = False
@@ -214,8 +224,15 @@ class ProfileManager:
             if for_profile:
                 eligible.append(token)
             else:
-                if token.class_type in ["warlock", "crusader", "light_incarnation"]:
+                # ============= ИЗМЕНЕНИЕ: ДОБАВЛЯЕМ АПОСТОЛОВ =============
+                # Теперь виртуальные голоса могут получать ВСЕ классы:
+                # - warlock (чернокнижники)
+                # - crusader (паладины)
+                # - light_incarnation (воплощения света)
+                # - apostle (апостолы) - ДОБАВЛЕНО!
+                if token.class_type in ["warlock", "crusader", "light_incarnation", "apostle"]:
                     eligible.append(token)
+                # ==========================================================
 
         return eligible
 
@@ -226,7 +243,7 @@ class ProfileManager:
     def _parse_profile_response(self, text: str) -> Dict[str, Any]:
         """
         Парсит ответ на "Мой профиль".
-        Важно: голоса берём из числа в скобках у класса: "👤Класс: ... (25), ..."
+        Важно: голоса берём из числа в скобках у класса.
         """
         result: Dict[str, Any] = {"level": None, "voices": None, "races": []}
 
@@ -250,7 +267,7 @@ class ProfileManager:
             except Exception:
                 voices = None
 
-        # fallback: старые regexes (если формат вдруг другой)
+        # fallback: старые regexes
         if voices is None:
             vm = RE_VOICES_GENERIC.search(text)
             if vm:
@@ -289,6 +306,20 @@ class ProfileManager:
     # ---------------------------
     # Profile check logic
     # ---------------------------
+    
+    # ============= Voice Prophet Integration =============
+    def _should_check_profile_normal(self, token: TokenHandler) -> bool:
+        """
+        Используем Voice Prophet для принятия решения о проверке.
+        """
+        if token.voice_prophet:
+            return token.voice_prophet.should_check_profile()
+        
+        # Старая логика (fallback)
+        with self._lock:
+            last = float(self._state.get("last_profile_check", {}).get(token.id, 0) or 0)
+        return (time.time() - last) >= float(self.PROFILE_CHECK_INTERVAL)
+    # ====================================================
 
     def _check_single_profile(self, token: TokenHandler) -> bool:
         """
@@ -314,13 +345,12 @@ class ProfileManager:
             found_any_change = False
             found_any_profile_msg = False
 
-            # Смотрим последние 5 сообщений (самые новые обычно первыми)
+            # Смотрим последние 5 сообщений
             for msg in history[:5]:
                 text = str(msg.get("text", "") or "").strip()
                 if not text:
                     continue
 
-                # пропускаем наш запрос
                 if "мой профиль" in text.lower():
                     continue
 
@@ -329,14 +359,11 @@ class ProfileManager:
                     "cmid": msg.get("conversation_message_id"),
                     "date": msg.get("date"),
                 }
-                logger.debug(
-                    f"📩 {token.name}: raw profile text (peer={token.target_peer_id}, meta={meta}):\n{text}"
-                )
+                logger.debug(f"📩 {token.name}: raw profile text:\n{text[:200]}...")
 
                 profile_data = self._parse_profile_response(text)
                 logger.debug(f"🧩 {token.name}: parsed profile_data={profile_data}")
 
-                # если это вообще не похоже на профиль — пропускаем
                 if profile_data["level"] is None and profile_data["voices"] is None and not profile_data["races"]:
                     continue
 
@@ -347,7 +374,7 @@ class ProfileManager:
                     old = token.voices
                     token.update_voices_from_system(int(profile_data["voices"]))
                     token.mark_for_save()
-                    logger.info(f"🗣 {token.name}:  voices {old} → {token.voices}")
+                    logger.info(f"🗣 {token.name}: voices {old} → {token.voices}")
                     found_any_change = True
 
                 # 2) Уровень — для паладинов/воплощений
@@ -358,6 +385,17 @@ class ProfileManager:
                         token.mark_for_save()
                         logger.info(f"📊 {token.name}: уровень {old} → {token.level}")
                         found_any_change = True
+                
+                # ============= ДОБАВЛЯЕМ УРОВЕНЬ ДЛЯ АПОСТОЛОВ =============
+                # Апостолы тоже имеют уровень, обновляем его
+                if token.class_type == "apostle":
+                    if profile_data["level"] is not None and token.level != int(profile_data["level"]):
+                        old = token.level
+                        token.update_level(int(profile_data["level"]))
+                        token.mark_for_save()
+                        logger.info(f"📊 {token.name}: уровень {old} → {token.level}")
+                        found_any_change = True
+                # ===========================================================
 
                 # 3) Расы — для апостолов
                 if token.class_type == "apostle":
@@ -371,12 +409,21 @@ class ProfileManager:
                         logger.info(f"🎭 {token.name}: расы обновлены {old_races} → {token.races}")
                         found_any_change = True
 
-                break  # нашли профильный ответ и обработали
+                break
 
             if not found_any_profile_msg:
-                logger.debug(f"⚠️ {token.name}: профильный ответ не найден в последних сообщениях")
+                logger.debug(f"⚠️ {token.name}: профильный ответ не найден")
             elif not found_any_change:
-                logger.debug(f"ℹ️ {token.name}: профиль не дал новых данных (значения совпали)")
+                logger.debug(f"ℹ️ {token.name}: профиль не дал новых данных")
+            
+            # Логируем статистику Voice Prophet
+            if token.voice_prophet and token.voices <= 3:
+                stats = token.voice_prophet.get_stats()
+                logger.debug(
+                    f"📊 {token.name}: голосов {token.voices}, "
+                    f"предсказание: {stats['next_predicted_zero']}, "
+                    f"уверенность: {stats['confidence']}"
+                )
 
             with self._lock:
                 self._state["last_profile_check"][token.id] = float(time.time())
@@ -387,11 +434,6 @@ class ProfileManager:
         except Exception as e:
             logger.error(f"❌ {token.name}: ошибка проверки профиля: {e}", exc_info=True)
             return False
-
-    def _should_check_profile_normal(self, token: TokenHandler) -> bool:
-        with self._lock:
-            last = float(self._state.get("last_profile_check", {}).get(token.id, 0) or 0)
-        return (time.time() - last) >= float(self.PROFILE_CHECK_INTERVAL)
 
     # ---------------------------
     # Warmup logic
@@ -446,7 +488,6 @@ class ProfileManager:
         else:
             delay_needed = float(self.TOKEN_CHECK_DELAY_NORMAL)
 
-        # интервал между проверками разных токенов
         with self._lock:
             last_any = float(self._state.get("last_token_check_time", 0) or 0)
         dt = now - last_any
@@ -459,14 +500,12 @@ class ProfileManager:
         with self._lock:
             start_index = int(self._state.get("current_token_index", 0) or 0)
 
-        # WARMUP: идём просто по кругу, без PROFILE_CHECK_INTERVAL
         if not warmup_done:
             idx = start_index % len(eligible)
             token_to_check = eligible[idx]
             with self._lock:
                 self._state["current_token_index"] = (idx + 1) % len(eligible)
         else:
-            # NORMAL: ищем токен, которому пора по PROFILE_CHECK_INTERVAL
             for i in range(len(eligible)):
                 idx = (start_index + i) % len(eligible)
                 t = eligible[idx]
@@ -483,7 +522,6 @@ class ProfileManager:
 
         ok = self._check_single_profile(token_to_check)
 
-        # mark warmup progress (важно: отмечаем даже если ok=False, потому что "круг" — это попытка проверки)
         with self._lock:
             self._state["last_token_check_time"] = float(now)
         self._save_state()
@@ -492,30 +530,43 @@ class ProfileManager:
             self._warmup_mark_checked(token_to_check.id)
 
         if warmup_done:
-            logger.info(f"⏭️ ProfileManager: проверили '{token_to_check.name}', ok={ok}. Следующая проверка профиля через 30 мин")
+            logger.info(f"⏭️ ProfileManager: проверили '{token_to_check.name}', ok={ok}. Следующая проверка через 30 мин")
         else:
-            logger.info(f"⏭️ ProfileManager: проверили '{token_to_check.name}', ok={ok}. Следующая проверка профиля через 2 мин")
+            logger.info(f"⏭️ ProfileManager: проверили '{token_to_check.name}', ok={ok}. Следующая проверка через 2 мин")
 
     # ---------------------------
     # Virtual voices
     # ---------------------------
 
     def _grant_virtual_voice(self, token: TokenHandler) -> bool:
+        """
+        Выдать виртуальный голос токену.
+        Теперь работает для ВСЕХ классов, включая апостолов.
+        """
         try:
             with self._lock:
                 attempts = int(self._state.get("virtual_attempts", {}).get(token.id, 0)) + 1
                 self._state.setdefault("virtual_attempts", {})[token.id] = attempts
 
             old_voices = token.voices
+            # ============= ВСЕГДА 1 ГОЛОС (БЕЗ ИЗМЕНЕНИЙ) =============
             token.voices = 1
+            # ==========================================================
             token.mark_for_save()
 
-            logger.info(f"🎁 {token.name}: виртуальный голос выдан (попытка {attempts}/{self.MAX_VIRTUAL_ATTEMPTS}), голоса {old_voices}→{token.voices}")
+            logger.info(
+                f"🎁 {token.name}: виртуальный голос выдан "
+                f"(попытка {attempts}/{self.MAX_VIRTUAL_ATTEMPTS}), "
+                f"голоса {old_voices}→{token.voices}"
+            )
 
             if attempts >= self.MAX_VIRTUAL_ATTEMPTS:
                 token.needs_manual_voices = True
                 token.mark_for_save()
-                logger.warning(f"🚫 {token.name}: превышен лимит виртуальных голосов. Требуется ручной ввод.")
+                logger.warning(
+                    f"🚫 {token.name}: превышен лимит виртуальных голосов. "
+                    f"Требуется ручной ввод."
+                )
 
             self._save_state()
             return True
@@ -525,6 +576,10 @@ class ProfileManager:
             return False
 
     def _check_virtual_voices(self) -> None:
+        """
+        Проверка и выдача виртуальных голосов.
+        ТЕПЕРЬ ВКЛЮЧАЕТ АПОСТОЛОВ!
+        """
         now = time.time()
 
         with self._lock:
@@ -532,7 +587,9 @@ class ProfileManager:
         if now - last < float(self.VIRTUAL_VOICE_RETRY_INTERVAL):
             return
 
+        # ============= ИЗМЕНЕНИЕ: ТЕПЕРЬ ВСЕ ТОКЕНЫ С 0 ГОЛОСОВ =============
         eligible = self._get_eligible_tokens(for_profile=False)
+        # ====================================================================
 
         candidates: List[TokenHandler] = []
         for token in eligible:
@@ -549,7 +606,10 @@ class ProfileManager:
             if attempts >= int(self.MAX_VIRTUAL_ATTEMPTS):
                 token.needs_manual_voices = True
                 token.mark_for_save()
-                logger.warning(f"🚫 {token.name}: превышен лимит виртуальных голосов ({self.MAX_VIRTUAL_ATTEMPTS}). Требуется ручной ввод.")
+                logger.warning(
+                    f"🚫 {token.name}: превышен лимит виртуальных голосов "
+                    f"({self.MAX_VIRTUAL_ATTEMPTS})"
+                )
                 continue
 
             if token.voices <= 0:
@@ -559,6 +619,11 @@ class ProfileManager:
 
         if candidates:
             logger.info(f"🎁 Найдено кандидатов на виртуальный голос: {len(candidates)}")
+            # ============= ВЫВОДИМ ВСЕХ КАНДИДАТОВ, ВКЛЮЧАЯ АПОСТОЛОВ =============
+            for token in candidates:
+                logger.debug(f"   • {token.name} ({token.class_type}) - {token.voices} голосов")
+            # ======================================================================
+            
             for token in candidates:
                 if self._grant_virtual_voice(token):
                     with self._lock:
@@ -575,7 +640,6 @@ class ProfileManager:
     # ---------------------------
 
     def _main_loop(self) -> None:
-        # начальный jitter, чтобы не стартовать строго одновременно с другими сервисами
         jitter = random.randint(0, 300)
         logger.info(f"⏳ ProfileManager: initial jitter sleep {jitter}s")
         time.sleep(jitter)
@@ -588,7 +652,6 @@ class ProfileManager:
             try:
                 logger.debug(f"💓 ProfileManager: tick={tick}")
 
-                # 1) Профили (warmup / normal)
                 eligible_for_profile = self._get_eligible_tokens(for_profile=True)
                 if tick == 1:
                     preview = ", ".join([f"{t.name}/{t.class_type}" for t in eligible_for_profile[:8]])
@@ -596,11 +659,8 @@ class ProfileManager:
                     logger.debug(f"🧩 ProfileManager: eligible_for_profile={len(eligible_for_profile)} [{preview}{suffix}]")
 
                 self._check_next_profile()
-
-                # 2) Виртуальные голоса
                 self._check_virtual_voices()
 
-                # 3) Пауза цикла (1 минута)
                 for _ in range(60):
                     if not self._running:
                         break

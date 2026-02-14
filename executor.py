@@ -22,6 +22,9 @@ from .regexes import (
     RE_OTHER_RACE,
     RE_ALREADY_RACE,
     RE_REQUIRES_ANCIENT_VOICE,
+    RE_RESURRECTION,
+    RE_RESURRECTION_SUCCESS,
+    RE_CLEANSE,
 )
 from .token_handler import TokenHandler
 from .models import ParsedAbility, Job
@@ -81,7 +84,7 @@ class AbilityExecutor:
             text_l = text.lower()
             logger.debug(f"📝 Сообщение для парсинга: {text[:100]}...")
             
-            all_texts.append(text)  # Сохраняем все тексты
+            all_texts.append(text)
 
             mm = RE_REMAINING_SEC.search(text)
             if mm:
@@ -120,123 +123,108 @@ class AbilityExecutor:
                     except Exception as e:
                         logger.error(f"❌ Ошибка парсинга голосов в скобках: {e}")
 
-        # ПОСЛЕ парсинга всех сообщений, выбираем лучший текст
-        # Ищем текст с результатом (содержит эмодзи или детали)
+        # Выбираем лучший текст для анализа
         result_candidates = []
         
         for text in all_texts:
             text_lower = text.lower()
-            # Пропускаем триггеры (короткие или с ...)
             if len(text) < 20 or "..." in text:
                 continue
                 
-            # Ищем тексты с результатом
             if ("🌀" in text or "✨" in text or "☀" in text or 
                 "на вас наложено" in text_lower or "на Вас наложено" in text or
                 "уменьшена на" in text_lower or "увеличена на" in text_lower or
-                "повышена на" in text_lower or "🍀" in text):
+                "повышена на" in text_lower or "🍀" in text or
+                "воскресить" in text_lower or "воскрешение" in text_lower):
                 result_candidates.append(text)
 
         if result_candidates:
-            # Берем самое длинное сообщение (скорее всего это полный результат)
             full_response_text = max(result_candidates, key=len)
             logger.debug(f"📋 Выбран текст результата ({len(full_response_text)} chars): {full_response_text[:200]}...")
         elif all_texts:
-            # Иначе берем последнее сообщение
             full_response_text = all_texts[-1]
             logger.debug(f"📋 Взяли последнее сообщение: {full_response_text[:200]}...")
 
-        # Порядок проверки ВАЖЕН: от специфичных ошибок к общим, успех - ближе к концу
+        # Проверка статуса (порядок ВАЖЕН!)
         for m in msgs:
             text = str(m.get("text", "")).strip()
             logger.debug(f"🔍 Проверяем статус в сообщении: {text[:100]}...")
 
-            # 1. Самые специфичные ошибки (проверять ПЕРВЫМИ!)
+            # 1. Самые специфичные ошибки
             if RE_NOT_APOSTLE_OF_RACE.search(text):
                 matched = RE_NOT_APOSTLE_OF_RACE.search(text).group(0)
-                logger.info(
-                    f"🔍 Статус: NOT_APOSTLE_OF_RACE - "
-                    f"'{RE_NOT_APOSTLE_OF_RACE.pattern}' сработало на '{matched}'"
-                )
+                logger.info(f"🔍 Статус: NOT_APOSTLE_OF_RACE")
                 return "PASS_TO_NEXT_APOSTLE", remaining, voices_val, full_response_text
 
             if RE_ALREADY_BUFF.search(text):
                 matched = RE_ALREADY_BUFF.search(text).group(0)
-                logger.info(
-                    f"🔍 Статус: ALREADY_BUFF - "
-                    f"'{RE_ALREADY_BUFF.pattern}' сработало на '{matched}'"
-                )
+                logger.info(f"🔍 Статус: ALREADY_BUFF")
                 return "ALREADY_BUFF", remaining, voices_val, full_response_text
 
             if RE_OTHER_RACE.search(text):
                 matched = RE_OTHER_RACE.search(text).group(0)
-                logger.info(
-                    f"🔍 Статус: OTHER_RACE - "
-                    f"'{RE_OTHER_RACE.pattern}' сработало на '{matched}'"
-                )
+                logger.info(f"🔍 Статус: OTHER_RACE")
                 return "PASS_TO_NEXT_APOSTLE", remaining, voices_val, full_response_text
 
             if RE_ALREADY_RACE.search(text):
                 matched = RE_ALREADY_RACE.search(text).group(0)
-                logger.info(
-                    f"🔍 Статус: ALREADY_BUFF - "
-                    f"'{RE_ALREADY_RACE.pattern}' сработало на '{matched}'"
-                )
+                logger.info(f"🔍 Статус: ALREADY_BUFF")
                 return "ALREADY_BUFF", remaining, voices_val, full_response_text
 
-            # 2. "Требуется Голос Древних" - специфичная ошибка для голосов
+            # 2. Требуется Голос Древних
             if RE_REQUIRES_ANCIENT_VOICE.search(text):
                 matched = RE_REQUIRES_ANCIENT_VOICE.search(text).group(0)
                 logger.info(f"🔍 Статус: NO_VOICES - требуется Голос Древних")
                 return "NO_VOICES", remaining, voices_val, full_response_text
 
-            # 3. Общие ошибки (проверять ПОСЛЕ специфичных)
+            # 3. Общие ошибки
             if RE_NO_VOICES.search(text):
                 matched = RE_NO_VOICES.search(text).group(0)
-                logger.info(
-                    f"🔍 Статус: NO_VOICES - '{RE_NO_VOICES.pattern}' сработало на '{matched}'"
-                )
+                logger.info(f"🔍 Статус: NO_VOICES")
                 return "NO_VOICES", remaining, voices_val, full_response_text
 
             if RE_NOT_APOSTLE.search(text):
                 matched = RE_NOT_APOSTLE.search(text).group(0)
-                logger.info(
-                    f"🔍 Статус: NOT_APOSTLE - '{RE_NOT_APOSTLE.pattern}' сработало на '{matched}'"
-                )
+                logger.info(f"🔍 Статус: NOT_APOSTLE")
                 return "NOT_APOSTLE", remaining, voices_val, full_response_text
 
-            # 4. Уже/КД (проверять перед успехом, чтобы не спутать)
+            # 4. Уже/КД
             if RE_ALREADY.search(text):
                 matched = RE_ALREADY.search(text).group(0)
-                logger.info(
-                    f"🔍 Статус: ALREADY - '{RE_ALREADY.pattern}' сработало на '{matched}'"
-                )
+                logger.info(f"🔍 Статус: ALREADY")
                 return "ALREADY", remaining, voices_val, full_response_text
 
             if RE_COOLDOWN.search(text):
                 matched = RE_COOLDOWN.search(text).group(0)
                 if len(matched) > 50:
                     matched = matched[:50] + "..."
-                logger.info(
-                    f"🔍 Статус: COOLDOWN - '{RE_COOLDOWN.pattern}' сработало на '{matched}'"
-                )
+                logger.info(f"🔍 Статус: COOLDOWN")
                 return "COOLDOWN", remaining, voices_val, full_response_text
 
-            # 5. УСПЕХ (проверять в САМОМ КОНЦЕ, после всех ошибок)
+            # ============= ВОСКРЕШЕНИЕ =============
+            if RE_RESURRECTION_SUCCESS.search(text) or RE_RESURRECTION.search(text):
+                logger.info(f"🔍 Статус: RESURRECTION_SUCCESS")
+                return "SUCCESS", remaining, voices_val, full_response_text
+            # =======================================
+
+            # ============= ОЧИЩЕНИЕ =============
+            if RE_CLEANSE.search(text):
+                logger.info(f"🔍 Статус: CLEANSE_SUCCESS")
+                return "SUCCESS", remaining, voices_val, full_response_text
+            # ====================================
+
+            # 5. УСПЕХ (в самом конце)
             if RE_SUCCESS.search(text):
                 matched = RE_SUCCESS.search(text).group(0)
-                logger.info(
-                    f"🔍 Статус: SUCCESS - '{RE_SUCCESS.pattern}' сработало на '{matched}'"
-                )
+                logger.info(f"🔍 Статус: SUCCESS")
                 return "SUCCESS", remaining, voices_val, full_response_text
 
-        # Fallback: если ничего не нашли, но есть remaining и cooldown_hint
+        # Fallback
         if remaining is not None and cooldown_hint:
             logger.info(f"🔍 Статус: COOLDOWN (fallback, remaining={remaining})")
             return "COOLDOWN", remaining, voices_val, full_response_text
 
-        # Если совсем ничего не распознали
-        logger.info("🔍 Статус: UNKNOWN (ни одна регулярка не сработала)")
+        logger.info("🔍 Статус: UNKNOWN")
         return "UNKNOWN", remaining, voices_val, full_response_text
 
     def _parse_buff_value(self, text: str) -> Tuple[int, bool]:
@@ -247,6 +235,12 @@ class AbilityExecutor:
         text_lower = text.lower()
         is_critical = False
         buff_value = 100
+
+        # ============= ВОСКРЕШЕНИЕ =============
+        if "воскрешение" in text_lower or "воскресить" in text_lower:
+            logger.info("♻ Воскрешение: 100 голосов")
+            return 100, False
+        # =======================================
 
         # 0. Проверяем на критические очищения
         if "очищение" in text_lower:
@@ -260,7 +254,7 @@ class AbilityExecutor:
                 logger.info("✨ Обычное очищение: 100 голосов")
                 return buff_value, is_critical
 
-        # 0.5. Проверяем на критические проклятия (ДОБАВИТЬ ЭТО!)
+        # 0.5. Проверяем на критические проклятия
         if "проклятие" in text_lower:
             if "критическое" in text_lower or "🍀" in text:
                 is_critical = True
@@ -309,29 +303,15 @@ class AbilityExecutor:
                 if luck_val == 6:
                     logger.info("🍀 Баф удачи: 6 единиц = 100 голосов (обычный)")
                     return 100, False
-                logger.info(
-                    f"🍀 Баф удачи: {luck_val} единиц → по умолчанию 100 голосов (обычный)"
-                )
+                logger.info(f"🍀 Баф удачи: {luck_val} единиц → по умолчанию 100 голосов")
                 return 100, False
             except Exception as e:
-                logger.debug(f"❌ Ошибка парсинга удачи в единицах: {e}")
+                logger.debug(f"❌ Ошибка парсинга удачи: {e}")
 
         # 2. Расовые бафы — фиксированная стоимость
         race_keywords = [
-            "человек",
-            "гоблин",
-            "нежить",
-            "эльф",
-            "гном",
-            "демон",
-            "орк",
-            "людей",
-            "гоблинов",
-            "нежити",
-            "эльфов",
-            "гномов",
-            "демонов",
-            "орков",
+            "человек", "гоблин", "нежить", "эльф", "гном", "демон", "орк",
+            "людей", "гоблинов", "нежити", "эльфов", "гномов", "демонов", "орков",
         ]
         if any(race in text_lower for race in race_keywords):
             logger.debug(f"📊 Расовый баф: {text[:50]}...")
@@ -356,9 +336,7 @@ class AbilityExecutor:
             if match:
                 try:
                     found_percent = int(match.group(1))
-                    logger.info(
-                        f"🔍 Найден процент в тексте: {found_percent}% (паттерн: {pattern})"
-                    )
+                    logger.info(f"🔍 Найден процент: {found_percent}%")
                     break
                 except Exception as e:
                     logger.debug(f"❌ Ошибка парсинга процента: {e}")
@@ -368,39 +346,28 @@ class AbilityExecutor:
             if found_percent == 30:
                 is_critical = True
                 buff_value = 150
-                logger.info(
-                    f"🎯 Определен крит баф: {found_percent}% = {buff_value} голосов"
-                )
+                logger.info(f"🎯 Крит баф: {found_percent}% = {buff_value} голосов")
             elif found_percent == 20:
                 is_critical = False
                 buff_value = 100
-                logger.info(
-                    f"📊 Обычный баф: {found_percent}% = {buff_value} голосов"
-                )
+                logger.info(f"📊 Обычный баф: {found_percent}% = {buff_value} голосов")
             else:
                 buff_value = 100
                 is_critical = "критический" in text_lower or "🍀" in text_lower
-                logger.info(
-                    f"📈 Баф {found_percent}%: значение={buff_value}, крит={is_critical}"
-                )
+                logger.info(f"📈 Баф {found_percent}%: значение={buff_value}, крит={is_critical}")
         else:
             logger.debug(f"📝 Процент не найден в тексте: {text[:100]}...")
 
         if not is_critical and ("критический баф" in text_lower or "🍀" in text_lower):
             is_critical = True
             buff_value = 150
-            logger.info("🍀 Определен крит баф по тексту: 'критический' или '🍀'")
+            logger.info("🍀 Определен крит баф по тексту")
 
         if any(x in text_lower for x in ["атаки", "защиты"]):
             buff_value = 150 if is_critical else 100
-            logger.debug(
-                f"⚔️ Баф атаки/защиты: значение={buff_value}, крит={is_critical}"
-            )
+            logger.debug(f"⚔️ Баф атаки/защиты: значение={buff_value}, крит={is_critical}")
 
-        logger.info(
-            f"📊 Итог парсинга бафа: значение={buff_value}, крит={is_critical}, "
-            f"текст='{text[:80]}...'"
-        )
+        logger.info(f"📊 Итог парсинга: значение={buff_value}, крит={is_critical}")
         return buff_value, is_critical
 
     def execute_one(
@@ -414,9 +381,7 @@ class AbilityExecutor:
             if observer_token and (
                 token.id == observer_token.id or token.name == "Observer"
             ):
-                logger.warning(
-                    f"⛔ {token.name} является Observer и не должен участвовать в бафах"
-                )
+                logger.warning(f"⛔ {token.name} является Observer и не должен участвовать в бафах")
                 token.increment_buff_stats(False)
                 return False, "OBSERVER_CANNOT_BUFF", None
 
@@ -495,22 +460,15 @@ class AbilityExecutor:
 
                     if full_response_text and not buff_response_text:
                         buff_response_text = full_response_text
-                        logger.debug(
-                            f"📋 Получен полный текст ответа: {full_response_text[:200]}..."
-                        )
+                        logger.debug(f"📋 Получен полный текст ответа: {buff_response_text[:200]}...")
 
                     if voices_val is not None:
-                        logger.info(
-                            f"🗣️ {token.name}: обновление голосов "
-                            f"{token.voices} → {voices_val}"
-                        )
+                        logger.info(f"🗣️ {token.name}: обновление голосов {token.voices} → {voices_val}")
                         token.update_voices_from_system(voices_val)
                         token.mark_for_save()
 
-                    # 🆕 Обработка PASS_TO_NEXT_APOSTLE
+                    # PASS_TO_NEXT_APOSTLE
                     if status == "PASS_TO_NEXT_APOSTLE":
-                        # Это NOT_APOSTLE_OF_RACE или OTHER_RACE
-                        # Не наказываем токен, просто сообщаем scheduler'у
                         return False, "PASS_TO_NEXT_APOSTLE", None
 
                     if status == "NOT_APOSTLE_OF_RACE":
@@ -522,14 +480,11 @@ class AbilityExecutor:
                             if len(token.temp_races) != before_cnt:
                                 self.tm.mark_for_save()
                                 self.tm.update_race_index(token)
-                            logger.warning(
-                                f"🗑️ {token.name}: удалена временная раса "
-                                f"'{ability.key}' (NOT_APOSTLE_OF_RACE)"
-                            )
+                            logger.warning(f"🗑️ {token.name}: удалена временная раса '{ability.key}'")
 
                         token.set_ability_cooldown(ability.key, 300)
                         token.set_social_cooldown(300)
-                        return False, "PASS_TO_NEXT_APOSTLE", None  # 🆕 Теперь PASS_TO_NEXT
+                        return False, "PASS_TO_NEXT_APOSTLE", None
 
                     if status == "ALREADY_BUFF":
                         token.set_social_cooldown(62)
@@ -537,7 +492,7 @@ class AbilityExecutor:
 
                     if status == "OTHER_RACE":
                         token.set_social_cooldown(62)
-                        return False, "PASS_TO_NEXT_APOSTLE", None  # 🆕 Теперь PASS_TO_NEXT
+                        return False, "PASS_TO_NEXT_APOSTLE", None
 
                     if status == "NOT_APOSTLE":
                         if ability.key in RACE_NAMES:
@@ -548,10 +503,7 @@ class AbilityExecutor:
                             if len(token.temp_races) != before_cnt:
                                 self.tm.mark_for_save()
                                 self.tm.update_race_index(token)
-                            logger.warning(
-                                f"🗑️ {token.name}: удалена временная раса "
-                                f"'{ability.key}' (NOT_APOSTLE)"
-                            )
+                            logger.warning(f"🗑️ {token.name}: удалена временная раса '{ability.key}'")
 
                         token.set_ability_cooldown(ability.key, 300)
                         token.set_social_cooldown(300)
@@ -567,10 +519,7 @@ class AbilityExecutor:
                             owner = self.tm.get_token_by_sender_id(job.sender_id)
                             if owner and owner.class_type == "apostle":
                                 if observer_token and owner.id == observer_token.id:
-                                    logger.debug(
-                                        f"ℹ️ Observer получил баф {ability.key}, "
-                                        f"но не добавляем временную расу"
-                                    )
+                                    logger.debug(f"ℹ️ Observer получил баф {ability.key}")
                                 else:
                                     now_ts = time.time()
                                     expires_at = round(now_ts + 2 * 60 * 60)
@@ -584,43 +533,29 @@ class AbilityExecutor:
                                             expires_at=expires_at,
                                         )
                                         if added:
-                                            logger.info(
-                                                f"🎯 {owner.name}: добавлена временная "
-                                                f"раса '{ability.key}' "
-                                                f"(владелец !баф id={job.sender_id})"
-                                            )
+                                            logger.info(f"🎯 {owner.name}: добавлена временная раса '{ability.key}'")
                                         else:
-                                            logger.warning(
-                                                f"⚠️ {owner.name}: не удалось добавить "
-                                                f"временную расы '{ability.key}'"
-                                            )
+                                            logger.warning(f"⚠️ {owner.name}: не удалось добавить временную расу '{ability.key}'")
                                     self.tm.update_race_index(owner)
 
+                        # ============= СПИСАНИЕ ГОЛОСА =============
                         if ability.uses_voices:
-                            if token.voices > 0:
-                                new_voices = token.voices - 1
-                                logger.info(
-                                    f"🗣️ {token.name}: списание голоса "
-                                    f"{token.voices} → {new_voices}"
-                                )
-                                token.update_voices_from_system(new_voices)
-                                token.mark_for_save()
+                            if token.spend_voice():
+                                logger.info(f"🗣️ {token.name}: списан голос (осталось {token.voices})")
+                            else:
+                                logger.error(f"❌ {token.name}: НЕ УДАЛОСЬ списать голос! voices={token.voices}")
+                                if token.voice_prophet:
+                                    token.voice_prophet.record_check(token.voices, None)
+                        # =========================================
 
-                        logger.debug(
-                            f"🔍 Анализ крита для бафа '{ability.text}':"
-                        )
-                        logger.debug(
-                            f"📋 Текст ответа для анализа: {buff_response_text[:200]}..."
-                        )
+                        logger.debug(f"🔍 Анализ крита для бафа '{ability.text}':")
+                        logger.debug(f"📋 Текст ответа: {buff_response_text[:200]}...")
 
                         buff_value, is_critical = self._parse_buff_value(
                             buff_response_text
                         )
 
-                        logger.info(
-                            f"📊 Результат: {token.name}: {ability.text} "
-                            f"(значение: {buff_value}, крит: {is_critical})"
-                        )
+                        logger.info(f"📊 {token.name}: {ability.text} (значение: {buff_value}, крит: {is_critical})")
 
                         token.successful_buffs += 1
                         token.total_attempts += 1
@@ -641,9 +576,7 @@ class AbilityExecutor:
                         token.successful_buffs += 1
                         token.total_attempts += 1
                         token.mark_for_save()
-                        logger.info(
-                            f"ℹ️ {token.name}: {ability.text} ALREADY"
-                        )
+                        logger.info(f"ℹ️ {token.name}: {ability.text} ALREADY")
                         return True, "ALREADY", None
 
                     if status == "NO_VOICES":
@@ -658,9 +591,7 @@ class AbilityExecutor:
                             token.set_ability_cooldown(ability.key, rem_safe)
                             token.set_social_cooldown(rem_safe)
                             token.increment_buff_stats(False)
-                            logger.warning(
-                                f"⚠️ {token.name}: COOLDOWN from VK => set {rem_safe}s"
-                            )
+                            logger.warning(f"⚠️ {token.name}: COOLDOWN => {rem_safe}s")
                             return False, f"COOLDOWN({rem_safe}s)", None
 
                         token.set_ability_cooldown(ability.key, 62)
@@ -701,9 +632,7 @@ class AbilityExecutor:
                 try:
                     found_voices = int(vm.group(1))
                 except Exception as e:
-                    logger.error(
-                        f"❌ {token.name}: ошибка парсинга голосов с RE_VOICES_GENERIC: {e}"
-                    )
+                    logger.error(f"❌ {token.name}: ошибка парсинга голосов: {e}")
 
             if found_voices is None:
                 vm = RE_VOICES_ANY.search(text)
@@ -711,9 +640,7 @@ class AbilityExecutor:
                     try:
                         found_voices = int(vm.group(1))
                     except Exception as e:
-                        logger.error(
-                            f"❌ {token.name}: ошибка парсинга голосов с RE_VOICES_ANY: {e}"
-                        )
+                        logger.error(f"❌ {token.name}: ошибка парсинга голосов: {e}")
 
             if found_voices is None:
                 vm = RE_VOICES_IN_PARENTHESES.search(text)
@@ -721,17 +648,13 @@ class AbilityExecutor:
                     try:
                         found_voices = int(vm.group(1))
                     except Exception as e:
-                        logger.error(
-                            f"❌ {token.name}: ошибка парсинга голосов в скобках: {e}"
-                        )
+                        logger.error(f"❌ {token.name}: ошибка парсинга голосов в скобках: {e}")
 
             if found_voices is not None:
                 token.update_voices_from_system(found_voices)
                 token.mark_for_save()
                 got_voices = True
-                logger.info(
-                    f"📊 {token.name}: обновлены голоса в профиле: {found_voices}"
-                )
+                logger.info(f"📊 {token.name}: обновлены голоса: {found_voices}")
 
             level_match = RE_PROFILE_LEVEL.search(text)
             if level_match:
@@ -739,12 +662,8 @@ class AbilityExecutor:
                     level = int(level_match.group(1))
                     token.update_level(level)
                     token.mark_for_save()
-                    logger.info(
-                        f"📊 {token.name}: обновлен уровень: {level}"
-                    )
+                    logger.info(f"📊 {token.name}: обновлен уровень: {level}")
                 except Exception as e:
-                    logger.error(
-                        f"❌ {token.name}: ошибка парсинга уровня: {e}"
-                    )
+                    logger.error(f"❌ {token.name}: ошибка парсинга уровня: {e}")
 
         return got_voices

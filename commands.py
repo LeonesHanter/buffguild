@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 Command parsing & normalization helpers.
-
-Goal: keep ObserverBot slim and make command parsing stable and testable.
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, Optional, Tuple
 
 from .constants import CLASS_ABILITIES
@@ -42,11 +41,7 @@ def is_baf_cancel_cmd(text: str) -> bool:
 
 
 def parse_golosa_cmd(text: str) -> Optional[Tuple[None, int]]:
-    """
-    Parse '!голоса N' -> (None, n) or None.
-
-    Имён не поддерживаем: команда всегда работает по отправителю.
-    """
+    """Parse '!голоса N' -> (None, n) or None."""
     t = (text or "").strip()
     if not normalize_text(t).startswith("/голоса"):
         return None
@@ -67,10 +62,7 @@ def parse_doprasa_cmd(
     text: str,
     msg_item: Dict[str, Any],
 ) -> Optional[Tuple[str, Optional[str], Optional[int], str]]:
-    """
-    Parse '/допраса [race] [token_name?]' and extract timestamp from reply/fwd.
-    Returns (race_key, token_name, original_timestamp, original_text) or None.
-    """
+    """Parse '/допраса [race] [token_name?]'."""
     t = InputValidator.sanitize_text(text or "", max_length=50)
     if not normalize_text(t).startswith("/допраса"):
         return None
@@ -100,3 +92,37 @@ def parse_doprasa_cmd(
         )
 
     return race, token_name, original_timestamp, (text or "")
+
+
+# ============= ПАРСИНГ КОМАНДЫ /ВОСКРЕШЕНИЕ =============
+def parse_resurrection_cmd(text: str) -> Optional[int]:
+    """
+    Парсит команду '/воскрешение [уровень]'
+    
+    Args:
+        text: текст команды (например, "/воскрешение 25")
+        
+    Returns:
+        int: уровень цели, или None если неверный формат
+    """
+    t = (text or "").strip()
+    if not normalize_text(t).startswith("/воскрешение"):
+        return None
+    
+    parts = t.split()
+    if len(parts) != 2:
+        return None
+    
+    try:
+        level = int(parts[1].strip())
+        if level < 1 or level > 1000:
+            return None
+        return level
+    except ValueError:
+        return None
+
+
+def is_resurrection_cmd(text: str) -> bool:
+    """Проверяет, является ли текст командой воскрешения"""
+    return normalize_text(text or "").startswith("/воскрешение")
+# =========================================================

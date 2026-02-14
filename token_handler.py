@@ -13,6 +13,7 @@ from .utils import (
     timestamp_to_moscow,
     format_moscow_time,
 )
+from .voice_prophet import VoiceProphet
 
 logger = logging.getLogger(__name__)
 
@@ -69,13 +70,29 @@ class TokenHandler:
         self._history_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
         self._cache_ttl = 3
         self._cache_lock = threading.Lock()
+        
+        # ============= Voice Prophet =============
+        self.voice_prophet: Optional[VoiceProphet] = None
+        # =========================================
+        
+        # ============= Safe Race Timer =============
+        self.SAFETY_MARGIN = 60  # защитный зазор 60 секунд
+        # ===========================================
 
     def mark_for_save(self) -> None:
         old_state = self._needs_save
         self._needs_save = True
         self._manager.mark_for_save()
-        if not old_state:  # Логируем только при изменении состояния
+        if not old_state:
             logger.debug(f"💾 {self.name}: помечен для сохранения")
+    
+    # ============= АКТИВАЦИЯ VOICE PROPHET =============
+    def enable_voice_prophet(self, storage_dir: str = "data/voice_prophet") -> None:
+        """Активировать предсказатель голосов для этого токена"""
+        if not self.voice_prophet:
+            self.voice_prophet = VoiceProphet(self, storage_dir)
+            logger.info(f"🔮 {self.name}: активирован Voice Prophet")
+    # ==================================================
 
     def fetch_owner_id_lazy(self) -> int:
         if self.owner_vk_id != 0:
@@ -94,7 +111,6 @@ class TokenHandler:
                 old_owner_id = self.owner_vk_id
                 self.owner_vk_id = uid
                 
-                # Просто помечаем для сохранения
                 self.mark_for_save()
                 logger.info(f"📌 {self.name}: lazy owner_vk_id={uid} (было: {old_owner_id})")
                 
@@ -160,19 +176,46 @@ class TokenHandler:
         if success:
             self.successful_buffs += 1
         self.mark_for_save()
+    
+    # ============= SPEND VOICE - ТОЛЬКО ДЛЯ РАСХОДА =============
+    def spend_voice(self) -> bool:
+        """
+        Списать один голос при успешном бафе.
+        
+        Returns:
+            bool: True если голос списан, False если голосов нет
+        
+        Важно:
+        - Только уменьшает voices на 1
+        - Записывает СОБЫТИЕ РАСХОДА в Voice Prophet
+        - НЕ вызывает update_voices_from_system()
+        - НЕ путается с проверками профиля
+        """
+        if self.voices <= 0:
+            logger.debug(f"⚠️ {self.name}: попытка списать голос, но voices={self.voices}")
+            return False
+        
+        old_voices = self.voices
+        self.voices -= 1
+        self.mark_for_save()
+        
+        # Записываем РАСХОД в Voice Prophet
+        if self.voice_prophet:
+            self.voice_prophet.record_spend(old_voices)
+        
+        logger.info(f"🗣️ {self.name}: списан голос ({old_voices}→{self.voices})")
+        return True
+    # ============================================================
 
     def _cleanup_expired_temp_races(self, force: bool = False) -> bool:
         now = time.time()
         
-        # Если не force и не прошло 5 минут с последней очистки - пропускаем
         if not force and (now - self._last_temp_race_cleanup < 300):
             return False
 
         changed = False
         with self._lock:
             before = len(self.temp_races)
-            
-            # Очищаем только действительно просроченные
             valid_races = []
             expired_races = []
             
@@ -182,13 +225,12 @@ class TokenHandler:
                 
                 if expires > now:
                     valid_races.append(tr)
-                    logger.debug(f"✅ {self.name}: временная раса '{race}' активна (истекает через {(expires - now)/3600:.1f} часов)")
+                    logger.debug(f"✅ {self.name}: временная раса '{race}' активна (осталось {(expires - now)/60:.0f} мин)")
                 else:
                     expired_races.append(race)
                     logger.info(f"🗑️ {self.name}: удалена просроченная временная раса '{race}'")
                     changed = True
             
-            # Обновляем список только если есть изменения
             if changed:
                 self.temp_races = valid_races
                 self.mark_for_save()
@@ -199,7 +241,6 @@ class TokenHandler:
         return changed
 
     def cleanup_only_expired(self) -> bool:
-        """Очищает только действительно просроченные временные расы"""
         now = time.time()
         changed = False
         
@@ -211,7 +252,7 @@ class TokenHandler:
             for tr in self.temp_races:
                 expires = int(tr.get("expires", 0))
                 race = tr.get("race", "unknown")
-                if expires > now:  # Только активные
+                if expires > now:
                     valid_races.append(tr)
                 else:
                     expired_races.append(race)
@@ -224,31 +265,54 @@ class TokenHandler:
                 logger.info(f"🧹 {self.name}: очищены только просроченные временные расы ({before} → {len(valid_races)})")
         
         return changed
-
+    
+    # ============= HAS RACE С ЗАЩИТНЫМ ТАЙМЕРОМ =============
     def has_race(self, race_key: str) -> bool:
+        """
+        Проверка наличия расы с УЧЁТОМ ЗАЩИТНОГО ТАЙМЕРА.
+        Раса считается доступной ТОЛЬКО если expires > now.
+        """
         if race_key in self.races:
             return True
+        
         self._cleanup_expired_temp_races()
+        
         for tr in self.temp_races:
             if tr.get("race") == race_key:
-                return True
+                if tr.get("expires", 0) > time.time():
+                    return True
+                else:
+                    # Удаляем просроченную запись
+                    logger.debug(f"🧹 {self.name}: удаляем просроченную расу {race_key}")
+                    self.temp_races = [
+                        t for t in self.temp_races 
+                        if t.get("race") != race_key
+                    ]
+                    self.mark_for_save()
+        
         return False
+    # ======================================================
 
     def get_temp_race_count(self) -> int:
         self._cleanup_expired_temp_races()
         return len(self.temp_races)
-
+    
+    # ============= ADD TEMPORARY RACE С ЗАЩИТНЫМ ТАЙМЕРОМ =============
     def add_temporary_race(
         self,
         race_key: str,
         duration_hours: int = 2,
         expires_at: Optional[int] = None,
     ) -> bool:
+        """
+        Добавляет временную расу с ЗАЩИТНЫМ ТАЙМЕРОМ.
+        Реальный срок жизни сокращается на SAFETY_MARGIN секунд.
+        """
         with self._lock:
             if race_key not in RACE_NAMES:
                 return False
 
-            self._cleanup_expired_temp_races(force=False)  # Используем мягкую очистку
+            self._cleanup_expired_temp_races(force=False)
 
             if self.has_race(race_key):
                 return False
@@ -258,24 +322,31 @@ class TokenHandler:
 
             if expires_at is None:
                 expires_at = round(time.time() + duration_hours * 3600)
+            
+            # КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: защитный зазор
+            safe_expires_at = expires_at - self.SAFETY_MARGIN
 
-            self.temp_races.append(
-                {"race": race_key, "expires": int(expires_at)}
-            )
+            self.temp_races.append({
+                "race": race_key, 
+                "expires": int(safe_expires_at)
+            })
             self.mark_for_save()
 
             expires_time = format_moscow_time(
+                timestamp_to_moscow(int(safe_expires_at))
+            )
+            real_expires_time = format_moscow_time(
                 timestamp_to_moscow(int(expires_at))
             )
+            
             logger.info(
-                f"🎯 {self.name}: добавлена временная раса "
-                f"'{race_key}' до {expires_time}"
+                f"🎯 {self.name}: добавлена временная раса '{race_key}' "
+                f"до {expires_time} "
+                f"(реально до {real_expires_time}, зазор {self.SAFETY_MARGIN}с)"
             )
             
-            # Логируем для отладки
-            logger.debug(f"💾 {self.name}: temp_races после добавления: {self.temp_races}")
-            
             return True
+    # ====================================================================
 
     def update_temp_race_expiry(self, race_key: str, new_expires_at: int) -> bool:
         with self._lock:
@@ -290,12 +361,36 @@ class TokenHandler:
                         f"🔄 {self.name}: обновлена временная раса "
                         f"'{race_key}' до {expires_time}"
                     )
-                    
-                    # Логируем для отладки
-                    logger.debug(f"💾 {self.name}: temp_races после обновления: {self.temp_races}")
-                    
                     return True
         return False
+    
+    # ============= GET TEMP RACES INFO =============
+    def get_temp_races_info(self) -> List[Dict]:
+        """
+        Получить информацию о временных расах с таймерами.
+        Для логирования и отладки.
+        """
+        result = []
+        now = time.time()
+        
+        for tr in self.temp_races:
+            expires = tr.get("expires", 0)
+            remaining = expires - now
+            
+            if remaining > 0:
+                result.append({
+                    'race': tr.get('race'),
+                    'expires_at': expires,
+                    'remaining_seconds': int(remaining),
+                    'remaining_minutes': int(remaining / 60),
+                    'safe_until': format_moscow_time(timestamp_to_moscow(expires)),
+                    'real_until': format_moscow_time(
+                        timestamp_to_moscow(expires + self.SAFETY_MARGIN)
+                    )
+                })
+        
+        return result
+    # ================================================
 
     def mark_real_voices_received(self) -> None:
         if (
@@ -307,8 +402,20 @@ class TokenHandler:
             self.virtual_voice_grants = 0
             self.next_virtual_grant_ts = 0
             self.mark_for_save()
-
+    
+    # ============= UPDATE VOICES FROM SYSTEM - ТОЛЬКО ДЛЯ ПРОВЕРОК =============
     def update_voices_from_system(self, new_voices: int) -> None:
+        """
+        Обновить голоса из системы (ответ на "Мой профиль").
+        
+        Args:
+            new_voices: Актуальное количество голосов из профиля
+        
+        Важно:
+        - Устанавливает новое значение voices
+        - Записывает СОБЫТИЕ ПРОВЕРКИ в Voice Prophet
+        - НЕ уменьшает голоса (это делает spend_voice)
+        """
         new_voices = int(new_voices)
         if new_voices < 0:
             new_voices = 0
@@ -319,6 +426,12 @@ class TokenHandler:
             self.mark_for_save()
             logger.info(f"🗣 {self.name}: voices {old} → {new_voices}")
             self.mark_real_voices_received()
+            
+            # Записываем ПРОВЕРКУ в Voice Prophet
+            if self.voice_prophet:
+                predicted = self.voice_prophet.predict_zero_at()
+                self.voice_prophet.record_check(new_voices, predicted)
+    # ============================================================================
 
     def update_voices_manual(self, new_voices: int) -> None:
         new_voices = int(new_voices)

@@ -18,7 +18,7 @@ def build_registration_text(letters: str) -> str:
     return (
         f"✅ Баф зарегистрирован: {letters}\n"
         f"📊 Ожидается бафов: {len(letters)}\n"
-        f"📌 Для отмены напишите: !баф отмена"
+        f"📌 Для отмены напишите: /баф отмена"
     )
 
 
@@ -42,29 +42,23 @@ def _format_buff_line(user_id: int, info: Dict[str, Any], tm) -> Optional[str]:
 
     owner_id = None
     if token:
-        # Пробуем получить owner_vk_id
         owner_id = token.owner_vk_id
 
-        # Если owner_vk_id не установлен (0), пробуем определить его лениво
         if not owner_id or owner_id <= 0:
             logger.debug(f"🔍 Токен {token.name}: owner_vk_id не установлен, вызываем fetch_owner_id_lazy()")
             owner_id = token.fetch_owner_id_lazy()
 
-            # Если определили, сохраняем в объекте токена
             if owner_id and owner_id > 0:
                 token.owner_vk_id = owner_id
                 token.mark_for_save()
                 logger.debug(f"✅ Токен {token.name}: определен owner_vk_id={owner_id}")
 
-    # Если так и не нашли owner_id, используем user_id (заказчика)
     if not owner_id or owner_id <= 0:
         owner_id = user_id
         logger.debug(f"⚠️ Токен {token_name}: не удалось определить owner_vk_id, используем заказчика={owner_id}")
 
-    # Mentions: prefer owner (caster), else requester
     base_link = f"[https://vk.ru/id{owner_id}|"
 
-    # Глобальный КД по цели: баф пропущен
     if status == "GLOBAL_COOLDOWN":
         nice_name = buff_name or "баф"
         return f"{base_link}⏳] баф {nice_name} пропущен (КД)"
@@ -72,12 +66,33 @@ def _format_buff_line(user_id: int, info: Dict[str, Any], tm) -> Optional[str]:
     if status == "ALREADY_BUFF":
         return f"{base_link}🚫] Благословений не было"
 
+    # ============= ВОСКРЕШЕНИЕ =============
+    if buff_name == "воскрешение" or "воскрешение" in full_text_lower:
+        core, emoji = "Воскрешение", "♻️"
+    # =======================================
+
+    # ============= ОЧИЩЕНИЕ =============
+    elif buff_name == "очищение огнем" or "очищение огнем" in full_text_lower:
+        if is_critical or "критическое" in full_text_lower or "🍀" in full_text:
+            core, emoji = "Очищение огнем!🍀", "🔥"
+        else:
+            core, emoji = "Очищение огнем", "🔥"
+
+    elif buff_name == "очищение светом" or "очищение светом" in full_text_lower:
+        if is_critical or "критическое" in full_text_lower or "🍀" in full_text:
+            core, emoji = "Очищение светом!🍀", "✨"
+        else:
+            core, emoji = "Очищение светом", "✨"
+
+    elif buff_name == "очищение" or full_text_lower.startswith("очищение"):
+        core, emoji = "Очищение (сняты проклятия)", "☀️"
+    # ====================================
+
     # ----- Warlock / Paladin / Races -----
     # СНАЧАЛА проверяем проклятия (чтобы "проклятие неудачи" не попало в "удач")
 
     # 1) Проклятия (warlock) - ТОЧНЫЕ ПРОВЕРКИ
-    if buff_name == "проклятие добычи" or "проклятие добычи" in full_text_lower:
-        # ДОБАВИТЬ: анализ полного текста для определения процента
+    elif buff_name == "проклятие добычи" or "проклятие добычи" in full_text_lower:
         if "уменьшена на 30%" in full_text_lower or (is_critical and buff_val >= 150):
             core, emoji = "Проклятие добычи -30%!🍀", "📉"
         else:
@@ -95,73 +110,40 @@ def _format_buff_line(user_id: int, info: Dict[str, Any], tm) -> Optional[str]:
         else:
             core, emoji = "Проклятие боли +20%!", "💢"
 
-    # 2) Очищения и воскрешения (paladin)
-    elif buff_name == "очищение огнем" or "очищение огнем" in full_text_lower:
-        # Крит очищения огнем
-        if is_critical or "критическое" in full_text_lower or "🍀" in full_text:
-            core, emoji = "Очищение огнем!🍀", "🔥"
-        else:
-            core, emoji = "Очищение огнем", "🔥"
-
-    elif buff_name == "очищение светом" or "очищение светом" in full_text_lower:
-        # Крит очищения светом
-        if is_critical or "критическое" in full_text_lower or "🍀" in full_text:
-            core, emoji = "Очищение светом!🍀", "✨"
-        else:
-            core, emoji = "Очищение светом", "✨"
-
-    elif buff_name == "очищение" or full_text_lower.startswith("очищение"):
-        # Общее очищение (не показываем крит, т.к. обычно это снятие проклятий без крита)
-        core, emoji = "Очищение (сняты проклятия)", "☀️"
-
-    elif buff_name == "воскрешение" or "воскрешение" in full_text_lower:
-        core, emoji = "Воскрешение", "♻️"
-
     # ----- Non-race buffs (удача/атака/защита) -----
-    # ТОЧНЫЕ ПРОВЕРКИ для благословений
     elif buff_name == "благословение удачи" or "благословение удачи" in full_text_lower:
-        # Удача: базовая иконка 🍀, при крите — 9
         if buff_val >= 150 or is_critical:
             core, emoji = "Удача +9!🍀", "🍀"
         else:
             core, emoji = "Удача +6!", "🍀"
 
     elif buff_name == "благословение атаки" or "благословение атаки" in full_text_lower:
-        # Атака: базовая 🗡️, при крите — +30%
         if buff_val >= 150 or is_critical:
             core, emoji = "Атака +30%!🍀", "🗡️"
         else:
             core, emoji = "Атака +20%!", "🗡️"
 
     elif buff_name == "благословение защиты" or "благословение защиты" in full_text_lower:
-        # Защита: базовая 🛡️, при крите — +30%
         if buff_val >= 150 or is_critical:
             core, emoji = "Защита +30%!🍀", "🛡️"
         else:
             core, emoji = "Защита +20%!", "🛡️"
 
     else:
-        # 3) Races (unified table) - ИСПРАВЛЕННАЯ ВЕРСИЯ
-        # Используем RACE_NAMES для поиска по ключу способности (ability_key)
+        # 3) Races (unified table)
         ability_key = info.get("ability_key", "")
         
-        # Проверяем, является ли ability_key расой из RACE_NAMES
         if ability_key in RACE_NAMES:
-            # Получаем название расы из RACE_NAMES
             race_name = RACE_NAMES.get(ability_key, ability_key)
-            # Форматируем название расы: первая буква заглавная
             core = f"{race_name.capitalize()}!"
             emoji = RACE_EMOJIS.get(ability_key, "✨")
             logger.debug(f"🏆 Определена раса по ability_key='{ability_key}': {core}, эмодзи={emoji}")
         else:
-            # Если не нашли по ability_key, пробуем поискать в тексте
             found_race_key = None
             for rk, rn in RACE_NAMES.items():
-                # Проверяем в названии бафа
                 if buff_name == f"благословение {rn}" or f"благословение {rn}" in buff_name:
                     found_race_key = rk
                     break
-                # Проверяем в полном тексте
                 if f"благословение {rn}" in full_text_lower:
                     found_race_key = rk
                     break

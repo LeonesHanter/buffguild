@@ -16,7 +16,9 @@ from buffguild.logging_setup import setup_logging
 from buffguild.vk_client import ResilientVKClient
 from buffguild.token_manager import OptimizedTokenManager
 from buffguild.executor import AbilityExecutor
-from buffguild.observer import ObserverBot
+from buffguild.scheduler import Scheduler
+from buffguild.health import TokenHealthMonitor
+from buffguild.observer_main import ObserverBot
 from buffguild.profile_manager import ProfileManager
 
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
@@ -29,7 +31,15 @@ def main() -> None:
     vk = ResilientVKClient()
     tm = OptimizedTokenManager(CONFIG_PATH, vk)
     executor = AbilityExecutor(tm)
-    observer_bot = ObserverBot(tm, executor)
+    
+    # ============= СОЗДАЁМ SCHEDULER =============
+    scheduler = Scheduler(tm, executor, on_buff_complete=None)
+    
+    # ============= СОЗДАЁМ HEALTH MONITOR =============
+    health_monitor = TokenHealthMonitor(tm)
+    
+    # ============= СОЗДАЁМ OBSERVER =============
+    observer_bot = ObserverBot(tm, executor, scheduler, health_monitor)
 
     # Проверяем тип Observer
     if observer_bot.is_group:
@@ -37,10 +47,23 @@ def main() -> None:
     else:
         logging.info("👤 Observer работает как пользовательский токен")
 
-    # ЗАПУСК МЕНЕДЖЕРА С ЧЕРЕДОВАНИЕМ
+    # ============= Активируем Voice Prophet для всех токенов =============
+    for token in tm.tokens:
+        if token.class_type in ["apostle", "warlock", "crusader", "light_incarnation"]:
+            if not token.voice_prophet:
+                token.enable_voice_prophet("data/voice_prophet")
+                logging.info(f"🔮 Voice Prophet активирован для {token.name}")
+
+    # ЗАПУСК МЕНЕДЖЕРА С ПРОФИЛЯМИ
     profile_manager = ProfileManager(tm)
     profile_manager.start()
-    logging.info("🔄 ProfileManager запущен (чередование: 30 мин)")
+    logging.info("🔄 ProfileManager запущен с Voice Prophet")
+    
+    # ============= Активируем турбо-режим =============
+    observer_bot.scheduler.turbo_mode_enabled = True
+    observer_bot.scheduler.TURBO_DELAY = 0.15
+    observer_bot.scheduler.MIN_LETTERS_FOR_TURBO = 2
+    logging.info(f"🚀 TURBO MODE активирован: задержка {observer_bot.scheduler.TURBO_DELAY}с, мин.букв {observer_bot.scheduler.MIN_LETTERS_FOR_TURBO}")
 
     # Сохраняем ссылку на менеджер в observer для доступа из команд
     observer_bot.profile_manager = profile_manager
@@ -52,24 +75,34 @@ def main() -> None:
     # Запуск автосохранения токенов
     tm.start_auto_save(interval=60)
     
-    # Телеграм‑админка запускается отдельным сервисом (telegram-bot.service)
-    logging.info("📱 Telegram admin bot запускается отдельным сервисом telegram-bot.service")
+    logging.info("📱 Telegram admin bot запускается отдельным сервисом")
 
-    # Таймер для периодического сохранения
+    # Таймеры
     last_save_time = time.time()
+    last_race_cleanup_time = time.time()
+    RACE_CLEANUP_INTERVAL = 300  # 5 минут
     
     try:
         while True:
-            # Периодическое сохранение каждые 60 секунд
             current_time = time.time()
+            
             if current_time - last_save_time > 60:
                 tm.periodic_save()
                 last_save_time = current_time
             
+            if current_time - last_race_cleanup_time > RACE_CLEANUP_INTERVAL:
+                for token in tm.tokens:
+                    if token.class_type == "apostle":
+                        changed = token._cleanup_expired_temp_races(force=False)
+                        if changed:
+                            tm.update_race_index(token)
+                last_race_cleanup_time = current_time
+                logging.debug("🧹 Выполнена плановая очистка временных рас")
+            
             time.sleep(5)
+            
     except KeyboardInterrupt:
         logging.info("🛑 Остановка по Ctrl+C")
-        # Принудительно сохраняем перед выходом
         tm.save(force=True)
         profile_manager.stop()
         tm.stop_auto_save()
