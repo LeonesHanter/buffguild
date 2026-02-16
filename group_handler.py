@@ -82,10 +82,7 @@ class GroupHandler:
         call_params['access_token'] = self.access_token
         call_params['v'] = VK_API_VERSION
 
-        debug_params = {
-            k: v for k, v in call_params.items()
-            if k != 'access_token'
-        }
+        debug_params = {k: v for k, v in call_params.items() if k != 'access_token'}
         logger.debug(f"🔧 [{self.name}] API {method}: {debug_params}")
 
         try:
@@ -113,17 +110,11 @@ class GroupHandler:
         но возвращает conversation_message_id (cmid).
         Используем cmid как effective_id.
         """
-        logger.info(
-            f"📤 [{self.name}] Отправка в {peer_id}: "
-            f"'{text[:50]}...'"
-        )
+        logger.info(f"📤 [{self.name}] Отправка в {peer_id}: '{text[:50]}...'")
 
         if self.is_rate_limited():
             remaining = self.get_rate_limit_remaining()
-            logger.warning(
-                f"⏳ Отправка отложена: rate limit, "
-                f"осталось {remaining}с"
-            )
+            logger.warning(f"⏳ Отправка отложена: rate limit, осталось {remaining}с")
             return False, None
 
         jitter_sleep()
@@ -144,9 +135,7 @@ class GroupHandler:
                 'conversation_message_ids': [int(reply_to_cmid)],
                 'is_reply': True
             })
-            logger.info(
-                f"↩️ Reply на cmid={reply_to_cmid} в чате {peer_id}"
-            )
+            logger.info(f"↩️ Reply на cmid={reply_to_cmid} в чате {peer_id}")
         elif forward_msg_id:
             params['forward_messages'] = str(int(forward_msg_id))
             logger.info(f"📎 Forward msg_id={forward_msg_id}")
@@ -169,10 +158,7 @@ class GroupHandler:
 
             if code == 29:
                 self._consecutive_failures += 1
-                wait_time = min(
-                    60 * (2 ** (self._consecutive_failures - 1)),
-                    3600
-                )
+                wait_time = min(60 * (2 ** (self._consecutive_failures - 1)), 3600)
                 self._rate_limit_until = time.time() + wait_time
 
             return False, None
@@ -190,8 +176,8 @@ class GroupHandler:
             msg_id = result.get('message_id', 0)
             cmid = result.get('conversation_message_id', 0)
 
-            # Групповой токен НЕ возвращает message_id (всегда 0)
-            # Используем cmid как основной идентификатор
+            # Групповой токен НЕ возвращает global message_id (0),
+            # используем cmid как основной идентификатор
             effective_id = msg_id if msg_id > 0 else cmid
 
             logger.info(
@@ -201,7 +187,7 @@ class GroupHandler:
 
             self._consecutive_failures = 0
             return True, {
-                'message_id': effective_id,
+                'message_id': effective_id,  # cmid, если msg_id=0
                 'cmid': cmid,
                 'peer_id': peer_id,
                 'is_cmid': msg_id == 0
@@ -212,9 +198,7 @@ class GroupHandler:
             if response == 0:
                 logger.error(f"❌ response=0! peer_ids не сработал")
             else:
-                logger.info(
-                    f"✅ [{self.name}] message_id={response} (fallback)"
-                )
+                logger.info(f"✅ [{self.name}] message_id={response} (fallback)")
                 return True, {
                     'message_id': response,
                     'cmid': 0,
@@ -305,17 +289,63 @@ class GroupHandler:
                     f"{err.get('error_msg', '')}"
                 )
 
-        logger.error(
-            f"❌ [{self.name}] Редактирование провалилось"
-        )
+        logger.error(f"❌ [{self.name}] Редактирование провалилось")
         return False, "EDIT_FAILED"
+
+    # ──────────────────────────────────────────────
+    #  УДАЛЕНИЕ СООБЩЕНИЯ
+    # ──────────────────────────────────────────────
+    def delete_message(
+        self,
+        peer_id: int,
+        message_id: int = 0,
+        cmid: int = 0
+    ) -> bool:
+        """
+        Удалить сообщение группы.
+        Для группового токена message_id обычно 0,
+        поэтому ПРИОРИТЕТ у cmid.
+        """
+        logger.info(
+            f"🗑️ [{self.name}] Удаление сообщения в чате {peer_id}: "
+            f"msg_id={message_id}, cmid={cmid}"
+        )
+
+        if self.is_rate_limited():
+            return False
+
+        jitter_sleep()
+
+        params = {
+            'peer_id': peer_id,
+            'delete_for_all': 1,
+        }
+
+        if cmid and cmid > 0:
+            params['cmids'] = str(int(cmid))
+        elif message_id and message_id > 0:
+            params['message_ids'] = str(int(message_id))
+        else:
+            logger.error("❌ Нет ни message_id ни cmid для удаления")
+            return False
+
+        ret = self._api_call('messages.delete', params)
+
+        if 'error' in ret:
+            err = ret['error']
+            logger.error(
+                f"❌ [{self.name}] delete error "
+                f"{err.get('error_code')} {err.get('error_msg')}"
+            )
+            return False
+
+        logger.info("✅ Сообщение удалено (по мнению VK)")
+        return True
 
     # ──────────────────────────────────────────────
     #  ИСТОРИЯ
     # ──────────────────────────────────────────────
-    def get_history(
-        self, peer_id: int, count: int = 20
-    ) -> List[Dict[str, Any]]:
+    def get_history(self, peer_id: int, count: int = 20) -> List[Dict[str, Any]]:
         if self.is_rate_limited():
             return []
 
@@ -329,10 +359,7 @@ class GroupHandler:
 
                 if code == 29:
                     self._consecutive_failures += 1
-                    wait_time = min(
-                        60 * (2 ** (self._consecutive_failures - 1)),
-                        3600
-                    )
+                    wait_time = min(60 * (2 ** (self._consecutive_failures - 1)), 3600)
                     self._rate_limit_until = time.time() + wait_time
 
                 return []
@@ -340,37 +367,27 @@ class GroupHandler:
             return ret.get('response', {}).get('items', []) or []
 
         except Exception as e:
-            logger.error(
-                f"❌ [{self.name}] getHistory exception: {e}"
-            )
+            logger.error(f"❌ [{self.name}] getHistory exception: {e}")
             return []
 
-    def get_history_cached(
-        self, peer_id: int, count: int = 20
-    ) -> List[Dict[str, Any]]:
+    def get_history_cached(self, peer_id: int, count: int = 20) -> List[Dict[str, Any]]:
         cache_key = f"history_{peer_id}_{count}"
         now = time.time()
 
         with self._cache_lock:
             if cache_key in self._history_cache:
-                cached_time, cached_data = self._history_cache[
-                    cache_key
-                ]
+                cached_time, cached_data = self._history_cache[cache_key]
                 if now - cached_time < self._cache_ttl:
                     return cached_data.copy()
 
         fresh_data = self.get_history(peer_id, count)
 
         with self._cache_lock:
-            self._history_cache[cache_key] = (
-                now, fresh_data.copy()
-            )
+            self._history_cache[cache_key] = (now, fresh_data.copy())
 
         return fresh_data
 
-    def invalidate_cache(
-        self, peer_id: Optional[int] = None
-    ) -> None:
+    def invalidate_cache(self, peer_id: Optional[int] = None) -> None:
         with self._cache_lock:
             if peer_id is None:
                 self._history_cache.clear()
@@ -389,18 +406,11 @@ class GroupProxy:
     Единый интерфейс с TokenHandler.
     """
 
-    def __init__(
-        self,
-        group_handler: GroupHandler,
-        source_chat_id: int,
-        vk
-    ):
+    def __init__(self, group_handler: GroupHandler, source_chat_id: int, vk):
         self.group_handler = group_handler
         self._vk = vk
         self.source_chat_id = source_chat_id
-        self.source_peer_id = (
-            2000000000 + source_chat_id if source_chat_id else 0
-        )
+        self.source_peer_id = 2000000000 + source_chat_id if source_chat_id else 0
         self.name = group_handler.name
         self.id = f"group_{group_handler.group_id}"
         self.access_token = group_handler.access_token
@@ -443,10 +453,23 @@ class GroupProxy:
         text: str,
         cmid: int = 0
     ) -> Tuple[bool, str]:
-        """Редактирование"""
+        """Редактирование сообщения"""
         return self.group_handler.edit_message(
             peer_id=peer_id,
             text=text,
+            message_id=message_id,
+            cmid=cmid
+        )
+
+    def delete_message(
+        self,
+        peer_id: int,
+        message_id: int = 0,
+        cmid: int = 0
+    ) -> bool:
+        """Удаление сообщения через GroupHandler"""
+        return self.group_handler.delete_message(
+            peer_id=peer_id,
             message_id=message_id,
             cmid=cmid
         )

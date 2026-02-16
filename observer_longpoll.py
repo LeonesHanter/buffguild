@@ -14,20 +14,17 @@ logger = logging.getLogger(__name__)
 
 class LongPollWorker:
     """Поток для получения сообщений через User LongPoll"""
-    
+
     def __init__(self, bot):
         self.bot = bot
         self._thread = None
         self._running = False
-        self._ready = False
-        
-        # Берем токен из observer (читающего токена)
-        self.access_token = self.bot.observer.access_token
-        
+
         self._lp_server = ""
         self._lp_key = ""
         self._lp_ts = ""
         self._error_count = 0
+        self._ready = False
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -35,14 +32,14 @@ class LongPollWorker:
         self._running = True
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
-        logger.info("✅ LongPoll поток запущен для пользовательского токена")
+        logger.info("✅ LongPoll поток запущен")
 
     def stop(self):
         self._running = False
 
     def _worker(self):
         logger.info("👂 LongPoll worker начал работу")
-        
+
         while self._running:
             try:
                 if not self._get_server():
@@ -51,42 +48,42 @@ class LongPollWorker:
                     logger.warning(f"⏳ Ошибка, пауза {wait}с")
                     time.sleep(wait)
                     continue
-                
+
                 self._error_count = 0
                 self._ready = True
-                logger.info(f"✅ LongPoll готов. Слушаю чат {self.bot.source_peer_id}")
-                
+                logger.info("✅ LongPoll готов")
+
                 while self._running:
                     try:
                         lp = self._check()
                         if not lp:
                             time.sleep(1)
                             continue
-                        
+
                         if "failed" in lp:
                             if self._handle_error(lp):
                                 break
                             continue
-                        
+
                         new_ts = lp.get("ts")
                         if new_ts:
                             self._lp_ts = str(new_ts)
-                        
+
                         updates = lp.get("updates", []) or []
                         if updates:
                             self._process_updates(updates)
-                        
+
                     except Exception as e:
                         logger.error(f"❌ Ошибка цикла: {e}")
                         time.sleep(5)
-                        
+
             except Exception as e:
                 logger.error(f"❌ Критическая ошибка: {e}")
                 time.sleep(10)
 
     def _get_server(self) -> bool:
         data = {
-            "access_token": self.access_token,
+            "access_token": self.bot.observer.access_token,
             "v": VK_API_VERSION,
             "lp_version": 3
         }
@@ -120,12 +117,14 @@ class LongPollWorker:
 
         try:
             timeout = aiohttp.ClientTimeout(total=30)
+
             async def req():
                 async with aiohttp.ClientSession(timeout=timeout) as s:
                     async with s.get(server, params=data) as r:
                         return await r.json()
+
             return asyncio.run(req())
-        except:
+        except Exception:
             return {"failed": 2}
 
     def _handle_error(self, lp: Dict) -> bool:
@@ -141,20 +140,40 @@ class LongPollWorker:
         return False
 
     def _process_updates(self, updates: list):
+        """
+        Не фильтруем по peer_id.
+        Все новые сообщения (код 4) отправляем в очередь,
+        а фильтрацию делаем уже по from_id в MessageProcessor.
+        """
         for upd in updates:
             if isinstance(upd, list) and len(upd) > 3:
                 event_code = upd[0]
-                
-                # ТОЛЬКО новые сообщения (код 4)
-                if event_code == 4 and upd[3] == self.bot.source_peer_id:
+
+                # Новое сообщение
+                if event_code == 4:
                     msg_id = upd[1]
                     flags = upd[2]
-                    logger.info(f"📨 Новое сообщение: id={msg_id}, flags={flags}")
+                    peer_id = upd[3]
+                    logger.info(
+                        f"📨 Новое сообщение: "
+                        f"id={msg_id}, flags={flags}, peer_id={peer_id}"
+                    )
                     items = self.bot.observer.get_by_id([msg_id])
                     for item in items:
-                        # ИСПРАВЛЕНО: используем user_message_queue вместо message_queue
-                        self.bot.user_message_queue.put(("new", item))
-                
-                # ВСЕ ОСТАЛЬНЫЕ СОБЫТИЯ ИГНОРИРУЮТСЯ
+                        self.bot.message_queue.put(("new", item))
+
+                # Редактирование (на будущее, если нужно)
+                elif event_code == 5:
+                    msg_id = upd[1]
+                    flags = upd[2]
+                    peer_id = upd[3]
+                    logger.info(
+                        f"✏️ Отредактировано сообщение: "
+                        f"id={msg_id}, flags={flags}, peer_id={peer_id}"
+                    )
+                    items = self.bot.observer.get_by_id([msg_id])
+                    for item in items:
+                        self.bot.message_queue.put(("edit", item))
+
                 else:
                     logger.debug(f"ℹ️ Пропуск события {event_code}")
