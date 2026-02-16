@@ -19,12 +19,15 @@ class LongPollWorker:
         self.bot = bot
         self._thread = None
         self._running = False
+        self._ready = False
+        
+        # Берем токен из observer (читающего токена)
+        self.access_token = self.bot.observer.access_token
         
         self._lp_server = ""
         self._lp_key = ""
         self._lp_ts = ""
         self._error_count = 0
-        self._ready = False
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -32,7 +35,7 @@ class LongPollWorker:
         self._running = True
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
-        logger.info("✅ LongPoll поток запущен")
+        logger.info("✅ LongPoll поток запущен для пользовательского токена")
 
     def stop(self):
         self._running = False
@@ -83,7 +86,7 @@ class LongPollWorker:
 
     def _get_server(self) -> bool:
         data = {
-            "access_token": self.bot.observer.access_token,
+            "access_token": self.access_token,
             "v": VK_API_VERSION,
             "lp_version": 3
         }
@@ -139,9 +142,19 @@ class LongPollWorker:
 
     def _process_updates(self, updates: list):
         for upd in updates:
-            if isinstance(upd, list) and len(upd) > 3 and upd[0] == 4:
-                if upd[3] == self.bot.source_peer_id:
+            if isinstance(upd, list) and len(upd) > 3:
+                event_code = upd[0]
+                
+                # ТОЛЬКО новые сообщения (код 4)
+                if event_code == 4 and upd[3] == self.bot.source_peer_id:
                     msg_id = upd[1]
+                    flags = upd[2]
+                    logger.info(f"📨 Новое сообщение: id={msg_id}, flags={flags}")
                     items = self.bot.observer.get_by_id([msg_id])
                     for item in items:
-                        self.bot.message_queue.put(item)
+                        # ИСПРАВЛЕНО: используем user_message_queue вместо message_queue
+                        self.bot.user_message_queue.put(("new", item))
+                
+                # ВСЕ ОСТАЛЬНЫЕ СОБЫТИЯ ИГНОРИРУЮТСЯ
+                else:
+                    logger.debug(f"ℹ️ Пропуск события {event_code}")

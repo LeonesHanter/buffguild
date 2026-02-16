@@ -14,23 +14,19 @@ class ParsedAbility:
     uses_voices: bool
     processed: bool = False
     token_name: Optional[str] = None
-    # сюда можно добавить любые доп. поля при необходимости
 
 
 @dataclass
 class Job:
-    # если у тебя был id, можешь вернуть:
-    # id: int
     sender_id: int
     trigger_text: str
     letters: str
     created_ts: float = field(default_factory=lambda: time.time())
     chat_id: Optional[int] = None
     abilities: List[ParsedAbility] = field(default_factory=list)
-    # флаг отмены
     cancelled: bool = False
-    # произвольные доп. данные
     extra: Dict[str, Any] = field(default_factory=dict)
+    registration_msg_id: Optional[int] = None  # ← ДОБАВЛЯЕМ ЭТО ПОЛЕ
 
     def is_cancelled(self) -> bool:
         return bool(self.cancelled)

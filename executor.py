@@ -78,12 +78,12 @@ class AbilityExecutor:
 
         # Собираем ВСЕ тексты для анализа
         all_texts = []
-        
+
         for m in msgs:
             text = str(m.get("text", "")).strip()
             text_l = text.lower()
             logger.debug(f"📝 Сообщение для парсинга: {text[:100]}...")
-            
+
             all_texts.append(text)
 
             mm = RE_REMAINING_SEC.search(text)
@@ -125,13 +125,13 @@ class AbilityExecutor:
 
         # Выбираем лучший текст для анализа
         result_candidates = []
-        
+
         for text in all_texts:
             text_lower = text.lower()
             if len(text) < 20 or "..." in text:
                 continue
-                
-            if ("🌀" in text or "✨" in text or "☀" in text or 
+
+            if ("🌀" in text or "✨" in text or "☀" in text or
                 "на вас наложено" in text_lower or "на Вас наложено" in text or
                 "уменьшена на" in text_lower or "увеличена на" in text_lower or
                 "повышена на" in text_lower or "🍀" in text or
@@ -263,16 +263,16 @@ class AbilityExecutor:
             else:
                 buff_value = 100
                 logger.info("👿 Обычное проклятие: 100 голосов")
-            
+
             # Пробуем найти процент для проклятий
             if "уменьшена на" in text_lower or "увеличена на" in text_lower:
                 percent_patterns = [
                     r"уменьшена на\s+(\d{1,3})\s*%",
-                    r"увеличена на\s+(\d{1,3})\s*%", 
+                    r"увеличена на\s+(\d{1,3})\s*%",
                     r"на\s+(\d{1,3})\s*%",
                     r"(\+?\d{1,3})\s*%"
                 ]
-                
+
                 for pattern in percent_patterns:
                     match = re.search(pattern, text_lower)
                     if match:
@@ -289,7 +289,7 @@ class AbilityExecutor:
                             break
                         except Exception as e:
                             logger.debug(f"❌ Ошибка парсинга процента проклятия: {e}")
-            
+
             return buff_value, is_critical
 
         # 1. Удача в единицах — приоритет
@@ -561,6 +561,7 @@ class AbilityExecutor:
                         token.total_attempts += 1
                         token.mark_for_save()
 
+                        # ВАЖНО: добавляем registration_msg_id в buff_info
                         buff_info = {
                             "token_name": token.name,
                             "buff_value": buff_value,
@@ -568,6 +569,7 @@ class AbilityExecutor:
                             "ability_key": ability.key,
                             "buff_name": ability.text,
                             "full_text": buff_response_text,
+                            "registration_msg_id": job.registration_msg_id,  # ← КЛЮЧЕВОЕ ПОЛЕ
                         }
                         return True, "SUCCESS", buff_info
 

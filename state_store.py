@@ -1,12 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 Thread-safe job state store for Observer.
-
-Keeps all mutable state in one place and provides atomic operations for:
-- register job
-- append completion
-- cancel
-- restore from jobs.json (and re-enqueue scheduler)
 """
 from __future__ import annotations
 
@@ -19,6 +13,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from .models import Job
 from .job_storage import JobStorage
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class ActiveJobInfo:
@@ -27,6 +23,7 @@ class ActiveJobInfo:
     cmid: Optional[int]
     message_id: int
     registration_time: float
+    registration_msg_id: Optional[int] = None
 
 
 @dataclass
@@ -35,6 +32,7 @@ class BuffResultInfo:
     total_value: int
     expected_count: int
     completed_count: int
+    registration_msg_id: Optional[int] = None
 
 
 class JobStateStore:
@@ -54,13 +52,10 @@ class JobStateStore:
             return info.letters if info else ""
 
     def restore_and_enqueue(self, scheduler) -> None:
-        """
-        Restore from jobs.json and enqueue remaining letters to scheduler.
-        """
         try:
             stored = self._storage.load_all()
         except Exception as e:
-            logging.error(f"❌ Ошибка восстановления активных бафов: {e}")
+            logger.error(f"❌ Ошибка восстановления активных бафов: {e}")
             return
 
         if not stored:
@@ -79,6 +74,8 @@ class JobStateStore:
                     letters=job_payload["letters"],
                     created_ts=job_payload["created_ts"],
                 )
+                # Восстанавливаем registration_msg_id
+                job.registration_msg_id = job_dict.get("registration_msg_id")
             except Exception:
                 continue
 
@@ -91,6 +88,7 @@ class JobStateStore:
                 cmid=job_dict.get("cmid"),
                 message_id=job_dict.get("message_id", 0),
                 registration_time=job_dict.get("registration_time", job.created_ts),
+                registration_msg_id=job_dict.get("registration_msg_id"),
             )
 
             with self._lock:
@@ -101,9 +99,9 @@ class JobStateStore:
                         total_value=buff_dict.get("total_value", 0),
                         expected_count=buff_dict.get("expected_count", 0),
                         completed_count=buff_dict.get("completed_count", 0),
+                        registration_msg_id=buff_dict.get("registration_msg_id"),
                     )
 
-            # Enqueue remaining letters
             letters_all = (job_info.letters or "")
             done = 0
             if buff_dict:
@@ -116,22 +114,19 @@ class JobStateStore:
 
             if letters_left:
                 scheduler.enqueue_letters(job, letters_left)
-                logging.info(
+                logger.info(
                     f"🔁 Восстановлена очередь бафов для {user_id}: осталось '{letters_left}' "
                     f"(из '{letters_all}', done={done})"
                 )
             else:
-                logging.info(f"ℹ️ Бафы для {user_id} уже завершены (letters='{letters_all}', done={done})")
+                logger.info(f"ℹ️ Бафы для {user_id} уже завершены (letters='{letters_all}', done={done})")
 
             restored += 1
 
         if restored:
-            logging.info(f"📦 Восстановлено активных бафов из jobs.json: {restored} пользователей")
+            logger.info(f"📦 Восстановлено активных бафов из jobs.json: {restored} пользователей")
 
     def register_job(self, user_id: int, job: Job, letters: str, cmid: Optional[int]) -> ActiveJobInfo:
-        """
-        Register active job + empty buff result, and persist to storage.
-        """
         with self._lock:
             info = ActiveJobInfo(
                 job=job,
@@ -139,6 +134,7 @@ class JobStateStore:
                 cmid=cmid,
                 message_id=0,
                 registration_time=time.time(),
+                registration_msg_id=None,
             )
             self._active_jobs[user_id] = info
             self._buff_results[user_id] = BuffResultInfo(
@@ -146,6 +142,7 @@ class JobStateStore:
                 total_value=0,
                 expected_count=len(letters),
                 completed_count=0,
+                registration_msg_id=None,
             )
             self._save_locked(user_id)
             return info
@@ -154,16 +151,21 @@ class JobStateStore:
         with self._lock:
             info = self._active_jobs.get(user_id)
             if not info:
+                logger.warning(f"⚠️ Попытка обновить message_id для несуществующего job user_id={user_id}")
                 return
+
             info.message_id = message_id
+            info.registration_msg_id = message_id
+            # Сохраняем ID в самом job
+            info.job.registration_msg_id = message_id
+
+            if user_id in self._buff_results:
+                self._buff_results[user_id].registration_msg_id = message_id
+
+            logger.info(f"📝 Сохранен registration_msg_id={message_id} для user_id={user_id}")
             self._save_locked(user_id)
 
     def cancel_and_clear(self, user_id: int) -> Tuple[bool, str]:
-        """
-        Clear state and delete from storage atomically.
-        Returns (had_job, letters).
-        Scheduler cancellation should be called outside.
-        """
         with self._lock:
             info = self._active_jobs.get(user_id)
             if not info:
@@ -172,17 +174,14 @@ class JobStateStore:
             self._buff_results.pop(user_id, None)
             self._active_jobs.pop(user_id, None)
             self._storage.delete_for_user(user_id)
+            logger.info(f"🗑️ Отменены бафы для user_id={user_id}, letters='{letters}'")
             return True, letters
 
     def apply_completion(self, job: Job, buff_info: Dict[str, Any]) -> Tuple[bool, Optional[List[Dict[str, Any]]]]:
-        """
-        Apply completion atomically. Returns:
-            (should_finalize, tokens_info_snapshot_if_finalize)
-        If job is not active, returns (False, None).
-        """
         user_id = job.sender_id
         with self._lock:
             if user_id not in self._active_jobs:
+                logger.debug(f"⚠️ apply_completion для неактивного user_id={user_id}")
                 return False, None
 
             buff_value = buff_info.get("buff_value", 0)
@@ -199,30 +198,42 @@ class JobStateStore:
                     total_value=0,
                     expected_count=len(letters),
                     completed_count=0,
+                    registration_msg_id=self._active_jobs[user_id].registration_msg_id,
                 )
 
             user_data = self._buff_results[user_id]
+
+            if "registration_msg_id" not in buff_info and user_data.registration_msg_id:
+                buff_info["registration_msg_id"] = user_data.registration_msg_id
+                logger.info(f"📝 Добавлен registration_msg_id={user_data.registration_msg_id} в buff_info для user_id={user_id}")
+
             user_data.tokens_info.append(buff_info)
             if status == "SUCCESS":
                 user_data.total_value += buff_value_int
             user_data.completed_count += 1
 
+            logger.debug(f"📊 user_id={user_id}: completed={user_data.completed_count}/{user_data.expected_count}")
+
             self._save_locked(user_id)
 
             if user_data.completed_count >= user_data.expected_count:
-                # snapshot tokens_info and clear state + storage
                 snapshot = list(user_data.tokens_info)
+
+                for i, item in enumerate(snapshot):
+                    if "registration_msg_id" not in item and user_data.registration_msg_id:
+                        item["registration_msg_id"] = user_data.registration_msg_id
+                        logger.debug(f"📝 Добавлен registration_msg_id={user_data.registration_msg_id} в snapshot[{i}]")
+
                 self._buff_results.pop(user_id, None)
                 self._active_jobs.pop(user_id, None)
                 self._storage.delete_for_user(user_id)
+
+                logger.info(f"✅ Все бафы собраны для user_id={user_id}, всего {len(snapshot)} шт.")
                 return True, snapshot
 
             return False, None
 
     def _save_locked(self, user_id: int) -> None:
-        """
-        Persist current user state to storage. Caller must hold _lock.
-        """
         info = self._active_jobs.get(user_id)
         if not info:
             return
@@ -239,11 +250,14 @@ class JobStateStore:
             "cmid": info.cmid,
             "message_id": info.message_id,
             "registration_time": info.registration_time,
+            "registration_msg_id": info.registration_msg_id,
         }
         buff_dict = {
             "tokens_info": (buff.tokens_info if buff else []),
             "total_value": (buff.total_value if buff else 0),
             "expected_count": (buff.expected_count if buff else len(info.letters)),
             "completed_count": (buff.completed_count if buff else 0),
+            "registration_msg_id": (buff.registration_msg_id if buff else info.registration_msg_id),
         }
         self._storage.save_for_user(user_id, job_dict, buff_dict)
+        logger.debug(f"💾 Состояние сохранено для user_id={user_id}")

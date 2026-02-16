@@ -20,6 +20,7 @@ from buffguild.scheduler import Scheduler
 from buffguild.health import TokenHealthMonitor
 from buffguild.observer_main import ObserverBot
 from buffguild.profile_manager import ProfileManager
+from buffguild.telegram_admin import TelegramAdmin
 
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 
@@ -28,8 +29,13 @@ def main() -> None:
     setup_logging()
     logging.info("🚀 Запуск VK Buff Guild Bot...")
 
+    # Инициализация VK клиента
     vk = ResilientVKClient()
+    
+    # Инициализация менеджера токенов
     tm = OptimizedTokenManager(CONFIG_PATH, vk)
+    
+    # Инициализация исполнителя бафов
     executor = AbilityExecutor(tm)
     
     # ============= СОЗДАЁМ SCHEDULER =============
@@ -54,7 +60,7 @@ def main() -> None:
                 token.enable_voice_prophet("data/voice_prophet")
                 logging.info(f"🔮 Voice Prophet активирован для {token.name}")
 
-    # ЗАПУСК МЕНЕДЖЕРА С ПРОФИЛЯМИ
+    # ============= ЗАПУСК МЕНЕДЖЕРА С ПРОФИЛЯМИ =============
     profile_manager = ProfileManager(tm)
     profile_manager.start()
     logging.info("🔄 ProfileManager запущен с Voice Prophet")
@@ -68,28 +74,59 @@ def main() -> None:
     # Сохраняем ссылку на менеджер в observer для доступа из команд
     observer_bot.profile_manager = profile_manager
 
+    # ============= ЗАПУСК VK БОТА =============
     bot_thread = threading.Thread(target=observer_bot.run, daemon=True)
     bot_thread.start()
     logging.info("🤖 VK бот запущен")
 
-    # Запуск автосохранения токенов
-    tm.start_auto_save(interval=60)
-    
-    logging.info("📱 Telegram admin bot запускается отдельным сервисом")
+    # ============= ЗАПУСК TELEGRAM АДМИН-БОТА =============
+    telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    admin_ids = os.getenv("ADMIN_USER_IDS", "")
 
-    # Таймеры
+    if telegram_token and admin_ids:
+        try:
+            admin_ids_list = [int(x.strip()) for x in admin_ids.split(",") if x.strip()]
+            
+            # Создаем Telegram админ-бота с передачей profile_manager
+            telegram_admin = TelegramAdmin(
+                telegram_token, 
+                admin_ids_list, 
+                CONFIG_PATH, 
+                bot_instance=observer_bot,
+                profile_manager=profile_manager  # ← Важно: передаем profile_manager!
+            )
+            
+            # Запускаем в отдельном потоке
+            tg_thread = threading.Thread(target=telegram_admin.run, daemon=True)
+            tg_thread.start()
+            logging.info(f"📱 Telegram admin бот запущен с поддержкой ProfileManager")
+            logging.info(f"   Admin IDs: {admin_ids_list}")
+        except Exception as e:
+            logging.error(f"❌ Ошибка запуска Telegram бота: {e}")
+    else:
+        logging.warning("⚠️ TELEGRAM_BOT_TOKEN или ADMIN_USER_IDS не заданы - Telegram бот не запущен")
+
+    # ============= ЗАПУСК АВТОСОХРАНЕНИЯ =============
+    tm.start_auto_save(interval=60)
+    logging.info("💾 Автосохранение токенов запущено")
+
+    # ============= ТАЙМЕРЫ ДЛЯ ПЕРИОДИЧЕСКИХ ЗАДАЧ =============
     last_save_time = time.time()
     last_race_cleanup_time = time.time()
     RACE_CLEANUP_INTERVAL = 300  # 5 минут
+    
+    logging.info("✅ Система полностью запущена и готова к работе")
     
     try:
         while True:
             current_time = time.time()
             
+            # Периодическое сохранение конфигурации
             if current_time - last_save_time > 60:
                 tm.periodic_save()
                 last_save_time = current_time
             
+            # Очистка временных рас
             if current_time - last_race_cleanup_time > RACE_CLEANUP_INTERVAL:
                 for token in tm.tokens:
                     if token.class_type == "apostle":
@@ -103,9 +140,27 @@ def main() -> None:
             
     except KeyboardInterrupt:
         logging.info("🛑 Остановка по Ctrl+C")
-        tm.save(force=True)
+        
+        # Корректное завершение всех компонентов
+        logging.info("🛑 Останавливаю ProfileManager...")
         profile_manager.stop()
+        
+        logging.info("🛑 Останавливаю автосохранение...")
         tm.stop_auto_save()
+        
+        logging.info("💾 Сохраняю финальную конфигурацию...")
+        tm.save(force=True)
+        
+        logging.info("👋 Система остановлена")
+        
+    except Exception as e:
+        logging.critical(f"💥 Критическая ошибка в главном цикле: {e}", exc_info=True)
+        # Пытаемся сохранить конфигурацию перед выходом
+        try:
+            tm.save(force=True)
+        except:
+            pass
+        sys.exit(1)
 
 
 if __name__ == "__main__":

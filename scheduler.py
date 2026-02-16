@@ -251,13 +251,26 @@ class Scheduler:
     # -------------------------
 
     def _is_token_basic_ok(self, t: TokenHandler, ability: ParsedAbility) -> bool:
+        """Базовая проверка токена"""
         if not t.enabled:
+            logger.debug(f"   ⏭️ {t.name} - отключен")
             return False
         if t.is_captcha_paused():
+            logger.debug(f"   ⏭️ {t.name} - в капче до {time.ctime(t.captcha_until)}")
             return False
+        
+        # ВАЖНО: Если флаг ручного ввода стоит, но голоса есть - сбрасываем его
+        if t.needs_manual_voices and t.voices > 0:
+            logger.info(f"🔄 {t.name}: обнаружен флаг ручного ввода при наличии голосов ({t.voices}), сбрасываю")
+            t.needs_manual_voices = False
+            t.mark_for_save()
+        
         if t.needs_manual_voices:
+            logger.debug(f"   ⏭️ {t.name} - требует ручного ввода голосов")
             return False
+        
         if ability.uses_voices and t.voices <= 0:
+            logger.debug(f"   ⏭️ {t.name} - нет голосов ({t.voices})")
             return False
         return True
 
@@ -287,19 +300,43 @@ class Scheduler:
         # 1) Race ability: ONLY apostles with the race.
         if ability.key in RACE_NAMES:
             ready: List[TokenHandler] = []
-            for t in self.tm.get_apostles_with_race(ability.key):
+            logger.info(f"🔍 Поиск апостолов с расой '{ability.key}'")
+            
+            # Получаем всех апостолов (не только с расой, потом отфильтруем)
+            all_apostles = [t for t in self.tm.tokens if t.class_type == "apostle"]
+            logger.info(f"   Всего апостолов: {len(all_apostles)}")
+            
+            # Детально логируем каждого апостола для отладки
+            for t in all_apostles:
+                logger.debug(f"   Апостол {t.name}: расы={t.races}, временные={t.temp_races}, голоса={t.voices}, enabled={t.enabled}, needs_manual={t.needs_manual_voices}")
+            
+            for t in all_apostles:
+                # Пропускаем Observer
                 if observer_id and t.id == observer_id:
+                    logger.debug(f"   ⏭️ {t.name} - Observer, пропускаем")
                     continue
+                
+                # Базовая проверка токена
                 if not self._is_token_basic_ok(t, ability):
                     continue
-                if t.class_type != "apostle" or not t.has_race(ability.key):
+                
+                # Проверка наличия расы
+                if not t.has_race(ability.key):
+                    logger.debug(f"   ⏭️ {t.name} - нет расы '{ability.key}'")
                     continue
-                if not self._supports_ability(t, ability):
+                
+                # Проверка кулдауна
+                wait_s = self._cooldown_wait_seconds(t, ability)
+                if wait_s > 0:
+                    logger.debug(f"   ⏭️ {t.name} - в кулдауне ({wait_s:.0f}с)")
                     continue
-                if self._cooldown_wait_seconds(t, ability) > 0:
-                    continue
+                
+                # Все проверки пройдены
+                logger.info(f"   ✅ {t.name} - подходит для расы '{ability.key}' (голоса={t.voices})")
                 ready.append(t)
 
+            logger.info(f"   Итого кандидатов: {len(ready)}")
+            
             if preferred_token:
                 for i, t in enumerate(ready):
                     if t.id == preferred_token:

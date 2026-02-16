@@ -184,12 +184,6 @@ class TokenHandler:
         
         Returns:
             bool: True если голос списан, False если голосов нет
-        
-        Важно:
-        - Только уменьшает voices на 1
-        - Записывает СОБЫТИЕ РАСХОДА в Voice Prophet
-        - НЕ вызывает update_voices_from_system()
-        - НЕ путается с проверками профиля
         """
         if self.voices <= 0:
             logger.debug(f"⚠️ {self.name}: попытка списать голос, но voices={self.voices}")
@@ -273,13 +267,17 @@ class TokenHandler:
         Раса считается доступной ТОЛЬКО если expires > now.
         """
         if race_key in self.races:
+            logger.debug(f"✅ {self.name}: найдена постоянная раса '{race_key}'")
             return True
         
         self._cleanup_expired_temp_races()
         
         for tr in self.temp_races:
             if tr.get("race") == race_key:
-                if tr.get("expires", 0) > time.time():
+                expires = tr.get("expires", 0)
+                if expires > time.time():
+                    remaining = (expires - time.time()) / 60
+                    logger.debug(f"✅ {self.name}: найдена временная раса '{race_key}' (осталось {remaining:.0f} мин)")
                     return True
                 else:
                     # Удаляем просроченную запись
@@ -290,6 +288,7 @@ class TokenHandler:
                     ]
                     self.mark_for_save()
         
+        logger.debug(f"❌ {self.name}: раса '{race_key}' не найдена")
         return False
     # ======================================================
 
@@ -407,14 +406,6 @@ class TokenHandler:
     def update_voices_from_system(self, new_voices: int) -> None:
         """
         Обновить голоса из системы (ответ на "Мой профиль").
-        
-        Args:
-            new_voices: Актуальное количество голосов из профиля
-        
-        Важно:
-        - Устанавливает новое значение voices
-        - Записывает СОБЫТИЕ ПРОВЕРКИ в Voice Prophet
-        - НЕ уменьшает голоса (это делает spend_voice)
         """
         new_voices = int(new_voices)
         if new_voices < 0:
@@ -425,13 +416,18 @@ class TokenHandler:
             self.voices = new_voices
             self.mark_for_save()
             logger.info(f"🗣 {self.name}: voices {old} → {new_voices}")
+            
+            # ВАЖНО: Сбрасываем флаг ручного ввода, если голоса появились
+            if new_voices > 0 and self.needs_manual_voices:
+                self.needs_manual_voices = False
+                logger.info(f"✅ {self.name}: сброшен флаг ручного ввода (появились голоса)")
+            
             self.mark_real_voices_received()
             
             # Записываем ПРОВЕРКУ в Voice Prophet
             if self.voice_prophet:
                 predicted = self.voice_prophet.predict_zero_at()
                 self.voice_prophet.record_check(new_voices, predicted)
-    # ============================================================================
 
     def update_voices_manual(self, new_voices: int) -> None:
         new_voices = int(new_voices)
@@ -440,11 +436,20 @@ class TokenHandler:
 
         old = self.voices
         self.voices = new_voices
-        self.needs_manual_voices = False
+        self.needs_manual_voices = False  # Явно сбрасываем
         self.virtual_voice_grants = 0
         self.next_virtual_grant_ts = 0
         self.mark_for_save()
         logger.info(f"🛠 {self.name}: manual voices {old} → {new_voices}")
+
+    def reset_manual_voices_flag(self) -> bool:
+        """Принудительно сбрасывает флаг ручного ввода"""
+        if self.needs_manual_voices:
+            self.needs_manual_voices = False
+            self.mark_for_save()
+            logger.info(f"🔄 {self.name}: принудительно сброшен флаг ручного ввода")
+            return True
+        return False
 
     def update_level(self, lvl: int) -> None:
         lvl = int(lvl)
@@ -586,12 +591,90 @@ class TokenHandler:
                 )
                 return False, "ERROR"
 
-            message_id = ret.get("response", 0)
-            return True, f"OK:{message_id}"
+            # ВАЖНО: Проверяем структуру ответа
+            response = ret.get("response")
+            
+            # Если response - словарь, ищем id
+            if isinstance(response, dict):
+                message_id = response.get("id")
+                if message_id:
+                    logger.info(f"✅ {self.name}: сообщение отправлено, ID={message_id}")
+                    return True, str(message_id)
+            
+            # Если response - число, это и есть ID
+            elif isinstance(response, (int, str)) and str(response).isdigit():
+                message_id = int(response)
+                if message_id > 0:
+                    logger.info(f"✅ {self.name}: сообщение отправлено, ID={message_id}")
+                    return True, str(message_id)
+            
+            # Если ничего не нашли
+            logger.warning(f"⚠️ {self.name}: не удалось получить ID сообщения, response={response}")
+            return True, "OK"
 
         except Exception as e:
             logger.error(f"❌ {self.name}: send exception {e}")
             return False, "ERROR"
+
+    # ============= МЕТОД ДЛЯ РЕДАКТИРОВАНИЯ =============
+    def edit_message(self, peer_id: int, message_id: int, text: str) -> Tuple[bool, str]:
+        """
+        Редактирует существующее сообщение
+        
+        Args:
+            peer_id: ID чата
+            message_id: ID сообщения для редактирования
+            text: новый текст сообщения
+            
+        Returns:
+            Tuple[bool, str]: (успех, статус)
+        """
+        if not self.enabled:
+            return False, "DISABLED"
+        if self.is_captcha_paused():
+            return False, "CAPTCHA_PAUSED"
+
+        try:
+            jitter_sleep()
+            data = {
+                "access_token": self.access_token,
+                "v": VK_API_VERSION,
+                "peer_id": int(peer_id),
+                "message_id": int(message_id),
+                "message": text,
+                "dont_parse_links": 1,  # Не парсить ссылки
+            }
+            
+            # Для групповых токенов добавляем group_id
+            if hasattr(self, 'group_id') and self.group_id:
+                data["group_id"] = abs(self.group_id)
+                
+            ret = self._vk.call(self._vk.post("messages.edit", data))
+            
+            if "error" in ret:
+                err = ret["error"]
+                code = int(err.get("error_code", 0))
+                msg = str(err.get("error_msg", ""))
+                
+                if code == 14:
+                    self.set_captcha_pause(60)
+                    return False, "CAPTCHA"
+                if code == 9:
+                    return False, "FLOOD"
+                if code == 29:  # Rate limit
+                    logger.warning(f"⏳ {self.name}: rate limit при редактировании")
+                    return False, "RATE_LIMITED"
+                
+                logger.error(f"❌ {self.name}: edit error {code} {msg}")
+                return False, "ERROR"
+            
+            logger.info(f"✏️ {self.name}: сообщение {message_id} отредактировано")
+            return True, "OK"
+
+        except Exception as e:
+            logger.error(f"❌ {self.name}: edit exception {e}")
+            return False, "ERROR"
+    # =====================================================
 
     def delete_message(self, peer_id: int, message_id: int) -> bool:
         if not self.enabled:

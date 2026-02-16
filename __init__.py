@@ -6,7 +6,7 @@ buffguild - VK Buff Guild Bot
 from .token_handler import TokenHandler
 from .token_manager import OptimizedTokenManager
 from .executor import AbilityExecutor
-from .observer_main import ObserverBot  # ← ПРОВЕРЬ ЭТУ СТРОКУ
+from .observer_main import ObserverBot
 from .scheduler import Scheduler
 from .health import TokenHealthMonitor
 from .profile_manager import ProfileManager

@@ -6,6 +6,7 @@ import re
 import time
 import logging
 import threading
+from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 from .regexes import RE_VOICES_GENERIC, RE_VOICES_ANY, RE_VOICES_IN_PARENTHESES
@@ -27,13 +28,74 @@ class CustomBuff:
     timestamp: float = 0.0
 
 
+class TTLCache:
+    """Кэш с автоматическим удалением старых записей"""
+    def __init__(self, max_size: int = 5000, ttl_seconds: int = 3600):
+        self.max_size = max_size
+        self.ttl = ttl_seconds
+        self.cache = OrderedDict()
+        self.timestamps = {}
+        self._lock = threading.Lock()
+    
+    def add(self, key: int) -> None:
+        """Добавляет ключ в кэш"""
+        with self._lock:
+            now = time.time()
+            # Удаляем старые записи
+            while self.cache and now - self.timestamps[next(iter(self.cache))] > self.ttl:
+                oldest = next(iter(self.cache))
+                self.cache.pop(oldest)
+                del self.timestamps[oldest]
+            
+            # Добавляем новую
+            self.cache[key] = True
+            self.timestamps[key] = now
+            
+            # Ограничиваем размер
+            if len(self.cache) > self.max_size:
+                oldest = next(iter(self.cache))
+                self.cache.pop(oldest)
+                del self.timestamps[oldest]
+    
+    def __contains__(self, key: int) -> bool:
+        """Проверяет наличие ключа в кэше"""
+        with self._lock:
+            if key in self.cache:
+                # Обновляем время при обращении
+                self.timestamps[key] = time.time()
+                return True
+            return False
+    
+    def size(self) -> int:
+        """Возвращает текущий размер кэша"""
+        with self._lock:
+            return len(self.cache)
+    
+    def clear(self) -> None:
+        """Очищает кэш"""
+        with self._lock:
+            self.cache.clear()
+            self.timestamps.clear()
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Возвращает статистику кэша"""
+        with self._lock:
+            return {
+                'size': len(self.cache),
+                'max_size': self.max_size,
+                'ttl': self.ttl,
+                'oldest': min(self.timestamps.values()) if self.timestamps else None,
+                'newest': max(self.timestamps.values()) if self.timestamps else None,
+            }
+
+
 class CustomTriggerParser:
     """Парсер для кастомных триггеров Ара и Кир."""
 
     def __init__(self):
         self.buff_mappings = {
             'а': 'а', 'ата': 'а', 'атак': 'а', 'атака': 'а', 'атаки': 'а',
-            'з': 'з', 'защ': 'з', 'защит': 'з', 'защита': 'з', 'защиты': 'з',
+            'з': 'з', 'защ': 'з', 'защит': 'з', 'защита': 'з', 'защиты': 'з', 'брон': 'з', 'броня': 'з',
             'у': 'у', 'уд': 'у', 'удач': 'у', 'удача': 'у', 'удачи': 'у',
             'ч': 'ч', 'чел': 'ч', 'челов': 'ч', 'человек': 'ч', 'люди': 'ч', 'людей': 'ч',
             'э': 'э', 'эльф': 'э', 'эльфа': 'э', 'эльфов': 'э',
@@ -63,7 +125,7 @@ class CustomTriggerParser:
     def parse_buff_query(self, trigger: str, query: str) -> List[str]:
         """
         Парсит запрос пользователя и возвращает список ключей бафов.
-        Теперь с гибким поиском паттернов в любом месте строки.
+        Поддерживает любой порядок: ['а','з','у'] или ['з','а','у'] и т.д.
         """
         if not query:
             logger.warning(f"⚠️ Пустой запрос для {trigger}")
@@ -76,53 +138,43 @@ class CustomTriggerParser:
         # Проверка на ALL-команды
         if query in self.all_commands:
             logger.info(f"📋 {trigger.title()} ALL: {query}")
-            return ['а', 'з', 'у']
+            return ['а', 'з', 'у']  # Всегда атака, защита, удача
         
-        # Проверяем, есть ли слово "все" в запросе (для фраз типа "дай все")
+        # Разбиваем на слова
         words = query.split()
+        
+        # Проверка на ALL в составе фразы
         if any(cmd in words for cmd in self.all_commands):
             logger.info(f"📋 {trigger.title()} ALL (в тексте): {query}")
-            return ['а', 'з', 'у']
+            return ['а', 'з', 'у']  # Всегда атака, защита, удача
         
-        # Сортируем паттерны по длине (от длинных к коротким)
-        # чтобы "защиты" ловилось до "защ", "атака" до "ата" и т.д.
-        sorted_patterns = sorted(self.buff_mappings.items(), 
-                               key=lambda x: len(x[0]), 
-                               reverse=True)
-        
+        # Для одиночных команд ищем по словам
         found_buffs = set()
         
-        # Ищем каждый паттерн в запросе
-        for pattern, key in sorted_patterns:
-            # Пропускаем уже найденные бафы
-            if key in found_buffs:
+        # Сначала ищем по полным словам
+        for word in words:
+            # Пропускаем очень короткие слова (1 буква) - они будут обработаны позже
+            if len(word) <= 1:
                 continue
                 
-            # Различные варианты совпадения
-            if (pattern == query or  # точное совпадение
-                query.startswith(pattern + ' ') or  # в начале с пробелом после
-                query.endswith(' ' + pattern) or  # в конце с пробелом перед
-                ' ' + pattern + ' ' in query or  # в середине
-                query.startswith(pattern) or  # начинается с паттерна
-                pattern in query):  # паттерн есть где-то в строке
-                
-                logger.info(f"✅ Найден баф {key} по паттерну '{pattern}'")
-                
-                if key in ['а', 'з', 'у', 'ч', 'э']:
-                    found_buffs.add(key)
-                else:
-                    logger.warning(f"❌ Баф {key} не разрешен для {trigger}")
-                    return []
+            # Ищем совпадение с маппингами
+            for pattern, key in self.buff_mappings.items():
+                if len(pattern) > 1 and (pattern == word or pattern in word):
+                    if key in ['а', 'з', 'у', 'ч', 'э']:
+                        logger.info(f"✅ Найден баф {key} по слову '{word}' (паттерн '{pattern}')")
+                        found_buffs.add(key)
+                        break
         
-        # Если ничего не нашли, пробуем найти по отдельным словам
+        # Если ничего не нашли по словам, ищем по отдельным буквам
         if not found_buffs:
-            for word in words:
-                for pattern, key in sorted_patterns:
-                    if pattern in word or word in pattern:
-                        if key in ['а', 'з', 'у', 'ч', 'э']:
-                            logger.info(f"✅ Найден баф {key} по слову '{word}'")
-                            found_buffs.add(key)
-                            break
+            for ch in query:
+                if ch in ['а', 'з', 'у', 'ч', 'э']:
+                    logger.info(f"✅ Найден баф {ch} по отдельной букве")
+                    found_buffs.add(ch)
+        
+        # Если нашли больше 3-х бафов, ограничиваем только атакой/защитой/удачей
+        if len(found_buffs) > 3:
+            found_buffs = {k for k in found_buffs if k in ['а', 'з', 'у']}
         
         result = list(found_buffs)
         if result:
@@ -140,41 +192,66 @@ class CustomTriggerParser:
         if not response_text:
             return False, 100, ""
         
-        logger.info(f"🔍 Парсинг ответа игры: '{response_text[:100]}...'")
+        logger.info(f"🔍 Парсинг ответа игры:")
+        logger.info(f"📄 Полный текст: '{response_text[:200]}...'")
+        
         text_lower = response_text.lower()
+        
+        # Расширенные списки ключевых слов
+        attack_patterns = ["атак", "🗡️", "меч", "оружи"]
+        defense_patterns = ["защит", "🛡️", "брон", "щит", "броня"]
+        luck_patterns = ["удач", "🍀", "везен", "фортун"]
+        human_patterns = ["человек", "людей", "🧍"]
+        elf_patterns = ["эльф", "🧝"]
+        
+        # Логируем найденные паттерны
+        found_attack = [p for p in attack_patterns if p in text_lower]
+        found_defense = [p for p in defense_patterns if p in text_lower]
+        found_luck = [p for p in luck_patterns if p in text_lower]
+        found_human = [p for p in human_patterns if p in text_lower]
+        found_elf = [p for p in elf_patterns if p in text_lower]
+        
+        if found_attack:
+            logger.info(f"✅ Найдены паттерны АТАКИ: {found_attack}")
+        if found_defense:
+            logger.info(f"✅ Найдены паттерны ЗАЩИТЫ: {found_defense}")
+        if found_luck:
+            logger.info(f"✅ Найдены паттерны УДАЧИ: {found_luck}")
+        if found_human:
+            logger.info(f"✅ Найдены паттерны ЧЕЛОВЕКА: {found_human}")
+        if found_elf:
+            logger.info(f"✅ Найдены паттерны ЭЛЬФА: {found_elf}")
+        
+        # Определение типа бафа
+        buff_type = ""
+        
+        if found_attack:
+            buff_type = "атака"
+            logger.info(f"📊 Определен тип: АТАКА")
+        elif found_defense:
+            buff_type = "защита"
+            logger.info(f"📊 Определен тип: ЗАЩИТА")
+        elif found_luck:
+            buff_type = "удача"
+            logger.info(f"📊 Определен тип: УДАЧА")
+        elif found_human:
+            buff_type = "человек"
+            logger.info(f"📊 Определен тип: ЧЕЛОВЕК")
+        elif found_elf:
+            buff_type = "эльф"
+            logger.info(f"📊 Определен тип: ЭЛЬФ")
+        
+        # Определение критичности и значения
         is_critical = False
         buff_value = 100
-        buff_type = ""
-
-        # Определение типа бафа по ключевым словам
-        if any(word in text_lower for word in ["атак"]):
-            buff_type = "атака"
-            logger.info("📊 Определен тип: атака")
-        elif any(word in text_lower for word in ["защит"]):
-            buff_type = "защита"
-            logger.info("📊 Определен тип: защита")
-        elif any(word in text_lower for word in ["удач"]):
-            buff_type = "удача"
-            logger.info("📊 Определен тип: удача")
-        elif any(word in text_lower for word in ["человек", "людей"]):
-            buff_type = "человек"
-            logger.info("📊 Определен тип: человек")
-        elif any(word in text_lower for word in ["эльф"]):
-            buff_type = "эльф"
-            logger.info("📊 Определен тип: эльф")
-
-        # Проверка на критический баф
-        if "критический" in text_lower or "🍀" in response_text:
-            is_critical = True
-            buff_value = 150
-            logger.info(f"🍀 Критический баф!")
-
-        # Поиск процентов для атаки/защиты
+        
+        # Для защиты и атаки ищем проценты
         if buff_type in ["атака", "защита"]:
             percent_patterns = [
-                r"повышена\s+на\s+(\d{1,3})\s*%",
                 r"на\s+(\d{1,3})\s*%",
-                r"(\+?\d{1,3})\s*%"
+                r"повышена\s+на\s+(\d{1,3})\s*%",
+                r"(\d{1,3})\s*%",
+                r"\+(\d{1,3})%"
             ]
             for pattern in percent_patterns:
                 match = re.search(pattern, text_lower)
@@ -184,7 +261,7 @@ class CustomTriggerParser:
                         if percent >= 30:
                             is_critical = True
                             buff_value = 150
-                            logger.info(f"📊 Найдено {percent}% - критический")
+                            logger.info(f"📊 Найдено {percent}% - КРИТИЧЕСКИЙ")
                         else:
                             is_critical = False
                             buff_value = 100
@@ -192,9 +269,9 @@ class CustomTriggerParser:
                         break
                     except Exception as e:
                         logger.error(f"Ошибка парсинга процентов: {e}")
-
-        # Поиск значения для удачи
-        if buff_type == "удача":
+        
+        # Для удачи
+        elif buff_type == "удача":
             luck_match = re.search(r"удача\s+повышена\s+на\s+(\d{1,3})", text_lower)
             if luck_match:
                 try:
@@ -202,15 +279,22 @@ class CustomTriggerParser:
                     if luck_val >= 9:
                         is_critical = True
                         buff_value = 150
-                        logger.info(f"🍀 Удача +{luck_val} (крит)")
+                        logger.info(f"🍀 Удача +{luck_val} (КРИТ)")
                     else:
                         is_critical = False
                         buff_value = 100
                         logger.info(f"🍀 Удача +{luck_val} (обычный)")
-                except Exception as e:
-                    logger.error(f"Ошибка парсинга удачи: {e}")
-
-        logger.info(f"📊 Результат парсинга: крит={is_critical}, значение={buff_value}, тип={buff_type}")
+                except Exception:
+                    pass
+        
+        # Проверка на критический баф по эмодзи
+        if "критический" in text_lower or "🍀" in response_text:
+            if not is_critical:
+                is_critical = True
+                buff_value = 150
+                logger.info(f"🍀 Критический баф определен по эмодзи/тексту!")
+        
+        logger.info(f"📊 Итог: тип={buff_type}, крит={is_critical}, значение={buff_value}")
         return is_critical, buff_value, buff_type
 
     def extract_voices_from_response(self, response_text: str) -> Optional[int]:
@@ -218,7 +302,6 @@ class CustomTriggerParser:
         if not response_text:
             return None
         
-        # Пробуем разные регулярные выражения
         vm = RE_VOICES_GENERIC.search(response_text)
         if vm:
             try:
@@ -254,7 +337,6 @@ class CustomTriggerParser:
         for buff in sorted_buffs:
             executor_link = f"[{self.VK_URL}{executor_id}|{self.buff_emojis.get(buff.buff_key, '✨')}]"
 
-            # Форматирование в зависимости от типа бафа
             if buff.buff_key in ['а', 'з']:
                 if buff.is_critical:
                     value = f"+30%!🍀"
@@ -267,7 +349,7 @@ class CustomTriggerParser:
                 else:
                     value = f"+6!"
                 line = f"{executor_link}{buff.buff_name} {value}"
-            else:  # расовые бафы
+            else:
                 if buff.is_critical:
                     line = f"{executor_link}{buff.buff_name}!🍀"
                 else:
@@ -286,7 +368,7 @@ class CustomTriggerStorage:
     """Общее хранилище для кастомных триггеров между потоками."""
 
     _instance = None
-    _lock = threading.Lock()
+    _lock = threading.RLock()  # Используем RLock вместо Lock для предотвращения deadlock'ов
 
     def __new__(cls):
         with cls._lock:
@@ -294,18 +376,29 @@ class CustomTriggerStorage:
                 cls._instance = super().__new__(cls)
                 cls._instance.pending_triggers = {}
                 cls._instance.responses = {}
-                cls._instance.processed_msgs = set()
-                cls._instance.processed_cmids = set()
-                cls._instance.notification_sent = set()  # Множество user_id, для которых уже отправлено уведомление
+                # Используем TTL-кэши для processed сообщений
+                cls._instance.processed_msgs_cache = TTLCache(max_size=5000, ttl_seconds=3600)
+                cls._instance.processed_cmids_cache = TTLCache(max_size=5000, ttl_seconds=3600)
+                cls._instance.notification_sent = set()
+                cls._instance.recent_commands = {}
             return cls._instance
 
-    def register_trigger(self, user_id: int, trigger: str, executor_id: int, buff_keys: List[str]):
-        """Регистрирует новый триггер для пользователя"""
+    def register_trigger(self, user_id: int, trigger: str, executor_id: int, buff_keys: List[str]) -> bool:
+        """
+        Регистрирует новый триггер для пользователя.
+        Возвращает True, если триггер зарегистрирован.
+        """
         with self._lock:
-            # Убеждаемся, что для этого user_id нет активного триггера
+            # Проверяем, есть ли уже активный триггер
             if user_id in self.pending_triggers:
-                logger.warning(f"⚠️ Перезапись существующего триггера для user_id={user_id}")
-                self.complete_trigger(user_id)
+                age = time.time() - self.pending_triggers[user_id]['timestamp']
+                logger.info(f"⏳ У user_id={user_id} уже есть активный триггер (возраст {age:.1f}с), ожидаем ответа...")
+                return True
+            
+            # СБРАСЫВАЕМ ФЛАГ УВЕДОМЛЕНИЯ при новой регистрации
+            if user_id in self.notification_sent:
+                logger.info(f"🔄 Сброс флага notification_sent для user_id={user_id} (новая команда)")
+                self.notification_sent.discard(user_id)
             
             self.pending_triggers[user_id] = {
                 'trigger': trigger,
@@ -315,9 +408,8 @@ class CustomTriggerStorage:
                 'responses': []
             }
             self.responses[user_id] = []
-            # НЕ удаляем notification_sent при регистрации нового триггера!
-            # Это гарантирует, что для одного user_id уведомление отправится только один раз
             logger.info(f"📝 Зарегистрирован триггер для user_id={user_id}, бафы={buff_keys}")
+            return True
 
     def add_response(self, user_id: int, buff: CustomBuff) -> Tuple[bool, bool]:
         """
@@ -325,11 +417,12 @@ class CustomTriggerStorage:
         Возвращает (all_collected, should_notify)
         """
         with self._lock:
-            # Если уведомление уже было отправлено для этого user_id, игнорируем все новые ответы
+            # Проверяем, не отправлено ли уже уведомление
             if user_id in self.notification_sent:
                 logger.debug(f"⏭️ Уведомление уже отправлено для user_id={user_id}, игнорируем новый баф {buff.buff_key}")
                 return False, False
             
+            # Проверяем наличие активного триггера
             if user_id not in self.pending_triggers:
                 logger.debug(f"⚠️ Нет активного триггера для user_id={user_id}")
                 return False, False
@@ -345,64 +438,57 @@ class CustomTriggerStorage:
 
             # Добавляем ответ
             trigger_data['responses'].append(buff)
+            
+            # Обновляем responses для обратной совместимости
+            if user_id not in self.responses:
+                self.responses[user_id] = []
             self.responses[user_id].append(buff)
 
             current_count = len(trigger_data['responses'])
+            logger.debug(f"📊 После добавления: current_count={current_count}, expected={expected_count}")
+            
             all_collected = current_count >= expected_count
             should_notify = all_collected and user_id not in self.notification_sent
 
             if should_notify:
                 self.notification_sent.add(user_id)
                 logger.info(f"🎉 СОБРАНЫ ВСЕ {expected_count} БАФОВ для user_id={user_id}!")
-
-            logger.debug(f"✅ Добавлен ответ {buff.buff_key} для user_id={user_id} ({current_count}/{expected_count})")
+            
             return all_collected, should_notify
 
     def get_trigger_data(self, user_id: int) -> Optional[Dict]:
         """Возвращает данные триггера для пользователя"""
         with self._lock:
-            return self.pending_triggers.get(user_id)
+            data = self.pending_triggers.get(user_id)
+            if data:
+                # Возвращаем копию, чтобы избежать изменений извне
+                return {
+                    'trigger': data['trigger'],
+                    'executor_id': data['executor_id'],
+                    'buff_keys': data['buff_keys'].copy(),
+                    'timestamp': data['timestamp'],
+                    'responses': data['responses'].copy()
+                }
+            return None
 
     def get_responses(self, user_id: int) -> List[CustomBuff]:
         """Возвращает список ответов для пользователя"""
         with self._lock:
-            return self.responses.get(user_id, [])
+            return self.responses.get(user_id, []).copy()
 
     def has_notification_been_sent(self, user_id: int) -> bool:
-        """Проверяет, было ли уже отправлено уведомление для user_id"""
+        """Проверяет, было ли уже отправлено уведомление"""
         with self._lock:
             return user_id in self.notification_sent
 
-    def force_send_notification(self, user_id: int, reason: str = "timeout") -> bool:
-        """
-        Принудительно помечает, что уведомление отправлено.
-        Используется при таймауте или других принудительных отправках.
-        Возвращает True, если уведомление ещё не было отправлено.
-        """
-        with self._lock:
-            if user_id in self.notification_sent:
-                logger.debug(f"⏭️ Уведомление уже было отправлено для user_id={user_id}, пропускаем принудительную отправку")
-                return False
-            
-            logger.info(f"📢 Принудительная отметка об отправке уведомления для user_id={user_id} (причина: {reason})")
-            self.notification_sent.add(user_id)
-            return True
-
     def complete_trigger(self, user_id: int, keep_notification_flag: bool = True) -> Optional[Dict]:
-        """
-        Завершает триггер и удаляет данные пользователя.
-        
-        Args:
-            user_id: ID пользователя
-            keep_notification_flag: Если True, сохраняет флаг notification_sent (чтобы не отправлять повторно)
-                                    Если False, удаляет флаг (для тестов или принудительной очистки)
-        """
+        """Завершает триггер и удаляет данные пользователя"""
         with self._lock:
             data = self.pending_triggers.pop(user_id, None)
             self.responses.pop(user_id, None)
             
-            # Не удаляем notification_sent, если keep_notification_flag=True
-            # Это гарантирует, что для одного user_id уведомление отправится только один раз
+            # Важно: НЕ удаляем notification_sent если keep_notification_flag=True
+            # Это предотвращает повторные уведомления для одного и того же триггера
             if not keep_notification_flag:
                 self.notification_sent.discard(user_id)
                 logger.debug(f"🗑️ Удален флаг notification_sent для user_id={user_id}")
@@ -415,49 +501,35 @@ class CustomTriggerStorage:
 
     def is_msg_processed(self, msg_id: int, cmid: int = 0) -> bool:
         """Проверяет, было ли сообщение уже обработано"""
-        with self._lock:
-            if cmid > 0:
-                return cmid in self.processed_cmids
-            return msg_id in self.processed_msgs
+        if cmid > 0:
+            return cmid in self.processed_cmids_cache
+        return msg_id in self.processed_msgs_cache
 
     def mark_msg_processed(self, msg_id: int, cmid: int = 0):
         """Отмечает сообщение как обработанное"""
-        with self._lock:
-            if cmid > 0:
-                self.processed_cmids.add(cmid)
-                # Ограничиваем размер множества
-                if len(self.processed_cmids) > 1000:
-                    self.processed_cmids = set(list(self.processed_cmids)[-500:])
-            else:
-                self.processed_msgs.add(msg_id)
-                if len(self.processed_msgs) > 1000:
-                    self.processed_msgs = set(list(self.processed_msgs)[-500:])
+        if cmid > 0:
+            self.processed_cmids_cache.add(cmid)
+        else:
+            self.processed_msgs_cache.add(msg_id)
 
     def cleanup_old_triggers(self, max_age: float = 300.0):
         """
         Очищает старые триггеры (по умолчанию 5 минут).
         НЕ отправляет уведомления, только очищает данные.
-        Уведомления по таймауту должны обрабатываться отдельно.
         """
         with self._lock:
             now = time.time()
             expired = []
             
-            for user_id, data in self.pending_triggers.items():
+            for user_id, data in list(self.pending_triggers.items()):
                 age = now - data['timestamp']
                 if age > max_age:
                     expired.append((user_id, age, data))
 
             for user_id, age, data in expired:
                 logger.info(f"🧹 Очистка устаревшего триггера для user_id={user_id} (возраст {age:.1f}с)")
-                
-                # При очистке НЕ отправляем уведомление, просто удаляем данные
-                # Уведомление по таймауту должно отправляться в отдельном методе check_timeouts
-                
-                # Завершаем триггер, но сохраняем флаг notification_sent, если он был
                 self.pending_triggers.pop(user_id, None)
                 self.responses.pop(user_id, None)
-                # НЕ удаляем notification_sent
 
     def check_timeouts_and_notify(self, max_age: float = 300.0, callback=None):
         """
@@ -471,40 +543,42 @@ class CustomTriggerStorage:
         Returns:
             Список user_id, для которых были отправлены уведомления по таймауту
         """
-        notified_users = []
-        
+        # Собираем данные под блокировкой
         with self._lock:
             now = time.time()
-            expired = []
+            expired_data = []  # Будем хранить копии данных для внешних вызовов
             
             for user_id, data in list(self.pending_triggers.items()):
-                # Пропускаем, если уведомление уже отправлено
                 if user_id in self.notification_sent:
                     continue
                     
                 age = now - data['timestamp']
                 if age > max_age:
-                    expired.append((user_id, age, data))
-            
-            # Отмечаем как отправленные и вызываем callback
-            for user_id, age, data in expired:
-                logger.warning(f"⏰ ТАЙМАУТ для user_id={user_id} (возраст {age:.1f}с, собрано {len(data['responses'])}/{len(data['buff_keys'])} бафов)")
-                
-                # Помечаем, что уведомление отправлено
-                self.notification_sent.add(user_id)
-                notified_users.append(user_id)
-                
-                # Вызываем callback для отправки уведомления, если он предоставлен
+                    # Копируем данные для внешнего вызова
+                    expired_data.append({
+                        'user_id': user_id,
+                        'age': age,
+                        'data': {
+                            'trigger': data['trigger'],
+                            'executor_id': data['executor_id'],
+                            'buff_keys': data['buff_keys'].copy(),
+                            'timestamp': data['timestamp'],
+                            'responses': data['responses'].copy()
+                        }
+                    })
+                    self.notification_sent.add(user_id)
+        
+        # Вызываем callback БЕЗ блокировки
+        notified_users = []
+        for item in expired_data:
+            user_id = item['user_id']
+            data = item['data']
+            try:
                 if callback:
-                    try:
-                        # Выходим из блокировки перед вызовом callback
-                        self._lock.release()
-                        try:
-                            callback(user_id, data)
-                        finally:
-                            self._lock.acquire()
-                    except Exception as e:
-                        logger.error(f"Ошибка в callback для user_id={user_id}: {e}")
+                    callback(user_id, data)
+                notified_users.append(user_id)
+            except Exception as e:
+                logger.error(f"Ошибка в callback для user_id={user_id}: {e}")
         
         return notified_users
 
@@ -515,9 +589,30 @@ class CustomTriggerStorage:
                 'pending_triggers': len(self.pending_triggers),
                 'total_responses': sum(len(r) for r in self.responses.values()),
                 'notification_sent': len(self.notification_sent),
-                'processed_msgs': len(self.processed_msgs),
-                'processed_cmids': len(self.processed_cmids)
+                'processed_msgs': self.processed_msgs_cache.size(),
+                'processed_cmids': self.processed_cmids_cache.size(),
+                'processed_msgs_stats': self.processed_msgs_cache.get_stats(),
+                'processed_cmids_stats': self.processed_cmids_cache.get_stats(),
             }
+
+    def get_user_state(self, user_id: int) -> Dict[str, Any]:
+        """Возвращает состояние пользователя для отладки"""
+        with self._lock:
+            return {
+                'has_pending': user_id in self.pending_triggers,
+                'has_responses': user_id in self.responses,
+                'notification_sent': user_id in self.notification_sent,
+                'pending_data': self.pending_triggers.get(user_id),
+                'responses_count': len(self.responses.get(user_id, [])),
+            }
+
+    def reset_user_state(self, user_id: int):
+        """Сброс состояния пользователя для тестирования"""
+        with self._lock:
+            self.pending_triggers.pop(user_id, None)
+            self.responses.pop(user_id, None)
+            self.notification_sent.discard(user_id)
+            logger.info(f"🔄 Сброшено состояние для user_id={user_id}")
 
 
 # Создаем глобальные экземпляры

@@ -169,7 +169,7 @@ class ProfileManager:
         
         # ============= Активируем Voice Prophet для всех токенов =============
         for token in self.tm.tokens:
-            if token.class_type in ["apostle", "warlock", "crusader", "light_incarnation"]:
+            if token.class_type in ["apostle", "crusader", "light_incarnation"]:  # УБРАЛИ warlock
                 if not token.voice_prophet:
                     token.enable_voice_prophet(self.VOICE_PROPHET_STORAGE)
                     logger.debug(f"🔮 Voice Prophet активирован для {token.name}")
@@ -222,17 +222,13 @@ class ProfileManager:
                 continue
 
             if for_profile:
-                eligible.append(token)
+                # ДЛЯ ПРОВЕРКИ ПРОФИЛЯ: исключаем warlock
+                if token.class_type not in ["warlock"]:  # warlock не проверяем профиль
+                    eligible.append(token)
             else:
-                # ============= ИЗМЕНЕНИЕ: ДОБАВЛЯЕМ АПОСТОЛОВ =============
-                # Теперь виртуальные голоса могут получать ВСЕ классы:
-                # - warlock (чернокнижники)
-                # - crusader (паладины)
-                # - light_incarnation (воплощения света)
-                # - apostle (апостолы) - ДОБАВЛЕНО!
+                # ДЛЯ ВИРТУАЛЬНЫХ ГОЛОСОВ: все классы, включая warlock
                 if token.class_type in ["warlock", "crusader", "light_incarnation", "apostle"]:
                     eligible.append(token)
-                # ==========================================================
 
         return eligible
 
@@ -326,6 +322,11 @@ class ProfileManager:
         Проверяет профиль одного токена.
         Возвращает True если были изменения (голоса/уровень/расы), иначе False.
         """
+        # Пропускаем warlock (хотя они не должны сюда попадать, но на всякий случай)
+        if token.class_type == "warlock":
+            logger.debug(f"⏭️ {token.name}: пропускаем проверку профиля (warlock)")
+            return False
+
         logger.info(f"🔍 Проверка профиля: {token.name} ({token.class_type})")
 
         try:
@@ -369,7 +370,7 @@ class ProfileManager:
 
                 found_any_profile_msg = True
 
-                # 1) Голоса — для всех классов
+                # 1) Голоса — для всех классов (кроме warlock, но они сюда не попадают)
                 if profile_data["voices"] is not None and token.voices != int(profile_data["voices"]):
                     old = token.voices
                     token.update_voices_from_system(int(profile_data["voices"]))
@@ -386,8 +387,7 @@ class ProfileManager:
                         logger.info(f"📊 {token.name}: уровень {old} → {token.level}")
                         found_any_change = True
                 
-                # ============= ДОБАВЛЯЕМ УРОВЕНЬ ДЛЯ АПОСТОЛОВ =============
-                # Апостолы тоже имеют уровень, обновляем его
+                # 3) Уровень для апостолов
                 if token.class_type == "apostle":
                     if profile_data["level"] is not None and token.level != int(profile_data["level"]):
                         old = token.level
@@ -395,9 +395,8 @@ class ProfileManager:
                         token.mark_for_save()
                         logger.info(f"📊 {token.name}: уровень {old} → {token.level}")
                         found_any_change = True
-                # ===========================================================
 
-                # 3) Расы — для апостолов
+                # 4) Расы — для апостолов
                 if token.class_type == "apostle":
                     races = profile_data.get("races") or []
                     if races and set(races) != set(token.races):
@@ -541,7 +540,7 @@ class ProfileManager:
     def _grant_virtual_voice(self, token: TokenHandler) -> bool:
         """
         Выдать виртуальный голос токену.
-        Теперь работает для ВСЕХ классов, включая апостолов.
+        Теперь работает для ВСЕХ классов, включая апостолов и warlock.
         """
         try:
             with self._lock:
@@ -549,9 +548,9 @@ class ProfileManager:
                 self._state.setdefault("virtual_attempts", {})[token.id] = attempts
 
             old_voices = token.voices
-            # ============= ВСЕГДА 1 ГОЛОС (БЕЗ ИЗМЕНЕНИЙ) =============
+            # ============= ВСЕГДА 1 ГОЛОС =============
             token.voices = 1
-            # ==========================================================
+            # =========================================
             token.mark_for_save()
 
             logger.info(
@@ -578,7 +577,7 @@ class ProfileManager:
     def _check_virtual_voices(self) -> None:
         """
         Проверка и выдача виртуальных голосов.
-        ТЕПЕРЬ ВКЛЮЧАЕТ АПОСТОЛОВ!
+        ТЕПЕРЬ ВКЛЮЧАЕТ ВСЕ КЛАССЫ!
         """
         now = time.time()
 
@@ -587,9 +586,9 @@ class ProfileManager:
         if now - last < float(self.VIRTUAL_VOICE_RETRY_INTERVAL):
             return
 
-        # ============= ИЗМЕНЕНИЕ: ТЕПЕРЬ ВСЕ ТОКЕНЫ С 0 ГОЛОСОВ =============
+        # ============= ВСЕ ТОКЕНЫ С 0 ГОЛОСОВ =============
         eligible = self._get_eligible_tokens(for_profile=False)
-        # ====================================================================
+        # =================================================
 
         candidates: List[TokenHandler] = []
         for token in eligible:
@@ -619,10 +618,8 @@ class ProfileManager:
 
         if candidates:
             logger.info(f"🎁 Найдено кандидатов на виртуальный голос: {len(candidates)}")
-            # ============= ВЫВОДИМ ВСЕХ КАНДИДАТОВ, ВКЛЮЧАЯ АПОСТОЛОВ =============
             for token in candidates:
                 logger.debug(f"   • {token.name} ({token.class_type}) - {token.voices} голосов")
-            # ======================================================================
             
             for token in candidates:
                 if self._grant_virtual_voice(token):

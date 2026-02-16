@@ -1,32 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-Telegram админ-бот для управления токенами.
-
-Команды:
- - /start        - Список команд
- - /add_token    - Добавить новый токен (диалог)
- - /list_tokens  - Список всех токенов
- - /enable       - Включить токен (по имени)
- - /disable      - Отключить токен (по имени)
- - /remove       - Удалить токен (по имени)
- - /reload       - Перезагрузить конфиг
+Telegram админ-бот для управления токенами и сервисами.
 """
-
 import sys
 import os
+import subprocess
+import json
+import logging
+import time
+import asyncio
+from typing import Dict, Any, List, Optional, Tuple
 
-# ДОБАВЛЯЕМ ПУТЬ К ПРОЕКТУ - ВАЖНО!
-# Это позволит импортировать модуль buffguild
+# ДОБАВЛЯЕМ ПУТЬ К ПРОЕКТУ
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-import json
-import logging
-import time
-from typing import Dict, Any, List
-
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -34,9 +24,9 @@ from telegram.ext import (
     ConversationHandler,
     MessageHandler,
     filters,
+    CallbackQueryHandler,
 )
 
-# Теперь этот импорт будет работать
 from buffguild.constants import RACE_NAMES
 
 logging.basicConfig(
@@ -51,10 +41,128 @@ CLASS_CHOICES = {
     "light_incarnation": "Воплощение света",
 }
 
+# Имена сервисов systemd
+BUFFGUILD_SERVICE = "buffguild.service"
+TELEGRAM_SERVICE = "telegram-bot.service"
+
+
+class ServiceManager:
+    """Класс для управления systemd сервисами"""
+    
+    @staticmethod
+    def run_command(cmd: List[str]) -> Tuple[bool, str, str]:
+        """Выполняет команду и возвращает (успех, stdout, stderr)"""
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            stdout, stderr = process.communicate(timeout=30)
+            success = process.returncode == 0
+            return success, stdout.strip(), stderr.strip()
+        except subprocess.TimeoutExpired:
+            process.kill()
+            return False, "", "Timeout expired"
+        except Exception as e:
+            return False, "", str(e)
+    
+    @staticmethod
+    def restart_service(service_name: str) -> Tuple[bool, str]:
+        """Перезапускает systemd сервис"""
+        success, stdout, stderr = ServiceManager.run_command(
+            ["sudo", "systemctl", "restart", service_name]
+        )
+        if success:
+            return True, f"✅ Сервис {service_name} успешно перезапущен"
+        else:
+            return False, f"❌ Ошибка перезапуска {service_name}:\n{stderr}"
+    
+    @staticmethod
+    def stop_service(service_name: str) -> Tuple[bool, str]:
+        """Останавливает systemd сервис"""
+        success, stdout, stderr = ServiceManager.run_command(
+            ["sudo", "systemctl", "stop", service_name]
+        )
+        if success:
+            return True, f"✅ Сервис {service_name} остановлен"
+        else:
+            return False, f"❌ Ошибка остановки {service_name}:\n{stderr}"
+    
+    @staticmethod
+    def start_service(service_name: str) -> Tuple[bool, str]:
+        """Запускает systemd сервис"""
+        success, stdout, stderr = ServiceManager.run_command(
+            ["sudo", "systemctl", "start", service_name]
+        )
+        if success:
+            return True, f"✅ Сервис {service_name} запущен"
+        else:
+            return False, f"❌ Ошибка запуска {service_name}:\n{stderr}"
+    
+    @staticmethod
+    def get_service_status(service_name: str) -> Dict[str, Any]:
+        """Получает статус сервиса"""
+        # Проверяем, активен ли сервис
+        success, stdout, stderr = ServiceManager.run_command(
+            ["systemctl", "is-active", service_name]
+        )
+        is_active = success and stdout.strip() == "active"
+        
+        # Получаем детальный статус
+        success, stdout, stderr = ServiceManager.run_command(
+            ["systemctl", "status", service_name, "--no-pager"]
+        )
+        
+        # Извлекаем основные метрики
+        status_text = stdout if success else stderr
+        pid = None
+        memory = None
+        cpu = None
+        
+        for line in status_text.split('\n'):
+            if 'Main PID:' in line:
+                pid_match = line.split('Main PID:')[1].strip().split()[0]
+                pid = pid_match
+            if 'Memory:' in line:
+                memory = line.split('Memory:')[1].strip()
+            if 'CPU:' in line:
+                cpu = line.split('CPU:')[1].strip()
+        
+        return {
+            'name': service_name,
+            'active': is_active,
+            'pid': pid,
+            'memory': memory,
+            'cpu': cpu,
+            'status_text': status_text[:500] + "..." if len(status_text) > 500 else status_text
+        }
+    
+    @staticmethod
+    def get_logs(service_name: str, lines: int = 50) -> str:
+        """Получает последние логи сервиса"""
+        success, stdout, stderr = ServiceManager.run_command(
+            ["sudo", "journalctl", "-u", service_name, "-n", str(lines), "--no-pager"]
+        )
+        if success:
+            return stdout
+        else:
+            return f"Ошибка получения логов:\n{stderr}"
+    
+    @staticmethod
+    def check_sudo_permissions() -> bool:
+        """Проверяет, есть ли права sudo без пароля"""
+        success, stdout, stderr = ServiceManager.run_command(
+            ["sudo", "-n", "true"]
+        )
+        return success
+
 
 class TelegramAdmin:
-    """Telegram бот для управления токенами"""
+    """Telegram бот для управления токенами и сервисами"""
 
+    # Состояния для ConversationHandler
     WAIT_NAME = 1
     WAIT_CLASS = 2
     WAIT_TOKEN = 3
@@ -63,14 +171,24 @@ class TelegramAdmin:
     WAIT_RACES = 6
 
     def __init__(
-        self, telegram_token: str, admin_ids: List[int], config_path: str, bot_instance=None
+        self, 
+        telegram_token: str, 
+        admin_ids: List[int], 
+        config_path: str, 
+        bot_instance=None,
+        profile_manager=None  # ← Добавляем profile_manager
     ):
         self.telegram_token = telegram_token
         self.admin_ids = set(admin_ids)
         self.config_path = config_path
         self.bot_instance = bot_instance
-        self.profile_manager = None  # Будет установлен из main.py
+        self.profile_manager = profile_manager  # ← Сохраняем profile_manager
         self.tmp: Dict[int, Dict[str, Any]] = {}
+        
+        # Проверяем права sudo при инициализации
+        self.sudo_available = ServiceManager.check_sudo_permissions()
+        if not self.sudo_available:
+            logging.warning("⚠️ Нет прав sudo без пароля! Команды управления сервисами будут недоступны.")
 
     def is_admin(self, uid: int) -> bool:
         """Проверка прав администратора"""
@@ -92,7 +210,7 @@ class TelegramAdmin:
         with open(self.config_path, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
 
-    # ---- Команды ----
+    # ---- Основные команды ----
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /start"""
@@ -101,19 +219,655 @@ class TelegramAdmin:
             await update.message.reply_text("❌ Нет прав.")
             return
 
+        sudo_status = "✅ Есть" if self.sudo_available else "❌ Нет (команды управления сервисами недоступны)"
+        pm_status = "✅ Доступен" if self.profile_manager else "❌ Не инициализирован"
+        
         msg = (
-            "🤖 Blessing Bot Admin Panel\n\n"
-            "📋 Команды:\n"
+            "🤖 **Blessing Bot Admin Panel**\n\n"
+            "📋 **Команды управления токенами:**\n"
             "/add_token — добавить токен\n"
             "/list_tokens — список токенов\n"
             "/enable — включить токен\n"
             "/disable — отключить токен\n"
             "/remove — удалить токен\n"
-            "/reload — перезагрузить конфиг"
+            "/reload — перезагрузить конфиг\n"
+            "/token_info — детальная информация о токене\n"
+            "/set_voices — установить голоса\n\n"
+            "🛠 **Команды управления сервисами:**\n"
+            "/restart_bot — перезапустить buffguild.service\n"
+            "/restart_tg — перезапустить telegram-bot.service\n"
+            "/status — статус сервисов\n"
+            "/logs — последние логи buffguild.service\n"
+            "/watch — слежение за логами\n\n"
+            "📊 **Мониторинг и диагностика:**\n"
+            "/stats — общая статистика системы\n"
+            "/profile — управление ProfileManager\n"
+            "/diagnose — полная диагностика\n\n"
+            f"🔐 **Права sudo:** {sudo_status}\n"
+            f"📊 **ProfileManager:** {pm_status}"
         )
-        await update.message.reply_text(msg)
+        await update.message.reply_text(msg, parse_mode='Markdown')
 
-    # ---- Добавление токена (диалог) ----
+    # ---- Мониторинг и статистика ----
+
+    async def system_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /stats - общая статистика системы"""
+        uid = update.effective_user.id
+        if not self.is_admin(uid):
+            await update.message.reply_text("❌ Нет прав.")
+            return
+        
+        # Получаем статус сервисов
+        bot_status = ServiceManager.get_service_status(BUFFGUILD_SERVICE)
+        tg_status = ServiceManager.get_service_status(TELEGRAM_SERVICE)
+        
+        # Системная информация
+        success, uname, _ = ServiceManager.run_command(["uname", "-a"])
+        success, uptime, _ = ServiceManager.run_command(["uptime"])
+        success, disk, _ = ServiceManager.run_command(["df", "-h", "/"])
+        success, memory, _ = ServiceManager.run_command(["free", "-h"])
+        
+        # Информация о токенах из конфига
+        cfg = self._load()
+        tokens = cfg.get("tokens", [])
+        enabled_tokens = sum(1 for t in tokens if t.get("enabled", True))
+        total_voices = sum(t.get("voices", 0) for t in tokens)
+        
+        # Статистика по классам
+        apostles = sum(1 for t in tokens if t.get("class") == "apostle")
+        warlocks = sum(1 for t in tokens if t.get("class") == "warlock")
+        paladins = sum(1 for t in tokens if t.get("class") in ["crusader", "light_incarnation"])
+        
+        stats_msg = (
+            "📊 **СИСТЕМНАЯ СТАТИСТИКА**\n\n"
+            f"**Сервисы:**\n"
+            f"• {BUFFGUILD_SERVICE}: {'✅' if bot_status['active'] else '❌'}\n"
+            f"• {TELEGRAM_SERVICE}: {'✅' if tg_status['active'] else '❌'}\n\n"
+            f"**Токены VK:**\n"
+            f"• Всего: {len(tokens)}\n"
+            f"• Активных: {enabled_tokens}\n"
+            f"• Апостолы: {apostles}\n"
+            f"• Чернокнижники: {warlocks}\n"
+            f"• Паладины: {paladins}\n"
+            f"• Всего голосов: {total_voices}\n\n"
+            f"**Система:**\n"
+            f"• Uptime: {uptime[:100]}...\n"
+            f"• Диск: {disk.splitlines()[-1] if disk else 'N/A'}\n"
+            f"• Память: {memory.splitlines()[1] if memory else 'N/A'}"
+        )
+        
+        await update.message.reply_text(stats_msg, parse_mode='Markdown')
+
+    # ---- Управление токенами ----
+
+    async def token_info(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /token_info - детальная информация о токене"""
+        uid = update.effective_user.id
+        if not self.is_admin(uid):
+            await update.message.reply_text("❌ Нет прав.")
+            return
+        
+        if not context.args:
+            await update.message.reply_text("Использование: /token_info <имя_токена>")
+            return
+        
+        name = " ".join(context.args)
+        cfg = self._load()
+        
+        for t in cfg.get("tokens", []):
+            if t.get("name", "").lower() == name.lower():
+                # Форматируем временные расы
+                temp_races = []
+                for tr in t.get("temp_races", []):
+                    expires = tr.get("expires", 0)
+                    if expires > time.time():
+                        remaining = int(expires - time.time())
+                        hours = remaining // 3600
+                        minutes = (remaining % 3600) // 60
+                        temp_races.append(f"{tr['race']} ({hours}ч {minutes}м)")
+                
+                # Статистика успешности
+                total = t.get("total_attempts", 0)
+                success = t.get("successful_buffs", 0)
+                success_rate = (success / total * 100) if total > 0 else 0
+                
+                # Статус капчи
+                captcha_until = t.get("captcha_until", 0)
+                captcha_status = "нет"
+                if captcha_until > time.time():
+                    remaining = int(captcha_until - time.time())
+                    minutes = remaining // 60
+                    captcha_status = f"капча до {time.ctime(captcha_until)} (осталось {minutes} мин)"
+                
+                info_msg = (
+                    f"🔍 **Информация о токене: {t.get('name')}**\n\n"
+                    f"**Основное:**\n"
+                    f"• ID: `{t.get('id')}`\n"
+                    f"• Класс: {CLASS_CHOICES.get(t.get('class'), t.get('class'))}\n"
+                    f"• Статус: {'✅ Активен' if t.get('enabled', True) else '❌ Отключен'}\n"
+                    f"• Владелец VK: {t.get('owner_vk_id', 0)}\n"
+                    f"• Уровень: {t.get('level', 0)}\n\n"
+                    f"**Голоса:**\n"
+                    f"• Текущие: {t.get('voices', 0)}\n"
+                    f"• Нужен ручной ввод: {'⚠️ Да' if t.get('needs_manual_voices', False) else '✅ Нет'}\n"
+                    f"• Виртуальных выдач: {t.get('virtual_voice_grants', 0)}\n\n"
+                    f"**Расы:**\n"
+                    f"• Постоянные: {', '.join(t.get('races', [])) or 'нет'}\n"
+                    f"• Временные: {', '.join(temp_races) or 'нет'}\n\n"
+                    f"**Статистика:**\n"
+                    f"• Успешных бафов: {success}/{total} ({success_rate:.1f}%)\n"
+                    f"• Капча: {captcha_status}"
+                )
+                
+                await update.message.reply_text(info_msg, parse_mode='Markdown')
+                return
+        
+        await update.message.reply_text(f"❌ Токен '{name}' не найден")
+
+    async def set_voices(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /set_voices - установка голосов для токена"""
+        uid = update.effective_user.id
+        if not self.is_admin(uid):
+            await update.message.reply_text("❌ Нет прав.")
+            return
+        
+        if len(context.args) < 2:
+            await update.message.reply_text("Использование: /set_voices <имя_токена> <количество>")
+            return
+        
+        name = context.args[0]
+        try:
+            voices = int(context.args[1])
+            if voices < 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ Количество голосов должно быть положительным числом")
+            return
+        
+        cfg = self._load()
+        for t in cfg.get("tokens", []):
+            if t.get("name", "").lower() == name.lower():
+                old_voices = t.get("voices", 0)
+                t["voices"] = voices
+                t["needs_manual_voices"] = False
+                self._save(cfg)
+                
+                await update.message.reply_text(
+                    f"✅ Голоса для '{name}' изменены: {old_voices} → {voices}\n"
+                    f"📌 Статус ручного ввода сброшен"
+                )
+                return
+        
+        await update.message.reply_text(f"❌ Токен '{name}' не найден")
+
+    # ---- Управление сервисами ----
+
+    async def restart_bot(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Перезапуск buffguild.service"""
+        uid = update.effective_user.id
+        if not self.is_admin(uid):
+            await update.message.reply_text("❌ Нет прав.")
+            return
+        
+        if not self.sudo_available:
+            await update.message.reply_text(
+                "❌ Нет прав sudo без пароля.\n"
+                "Настройте sudoers: добавьте 'ALL ALL=(ALL) NOPASSWD: /usr/bin/systemctl'"
+            )
+            return
+        
+        await update.message.reply_text(f"🔄 Перезапускаю {BUFFGUILD_SERVICE}...")
+        
+        success, message = ServiceManager.restart_service(BUFFGUILD_SERVICE)
+        await update.message.reply_text(message)
+        
+        # Если успешно, показываем статус
+        if success:
+            await asyncio.sleep(2)  # Даем время на запуск
+            status = ServiceManager.get_service_status(BUFFGUILD_SERVICE)
+            status_msg = (
+                f"📊 **Статус после перезапуска:**\n"
+                f"Активен: {'✅' if status['active'] else '❌'}\n"
+                f"PID: {status['pid'] or 'N/A'}\n"
+                f"Память: {status['memory'] or 'N/A'}\n"
+                f"CPU: {status['cpu'] or 'N/A'}"
+            )
+            await update.message.reply_text(status_msg, parse_mode='Markdown')
+
+    async def restart_tg(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Перезапуск telegram-bot.service"""
+        uid = update.effective_user.id
+        if not self.is_admin(uid):
+            await update.message.reply_text("❌ Нет прав.")
+            return
+        
+        if not self.sudo_available:
+            await update.message.reply_text(
+                "❌ Нет прав sudo без пароля.\n"
+                "Настройте sudoers: добавьте 'ALL ALL=(ALL) NOPASSWD: /usr/bin/systemctl'"
+            )
+            return
+        
+        await update.message.reply_text(f"🔄 Перезапускаю {TELEGRAM_SERVICE}...")
+        
+        success, message = ServiceManager.restart_service(TELEGRAM_SERVICE)
+        await update.message.reply_text(message)
+        
+        if success:
+            await asyncio.sleep(2)
+            status = ServiceManager.get_service_status(TELEGRAM_SERVICE)
+            status_msg = (
+                f"📊 **Статус после перезапуска:**\n"
+                f"Активен: {'✅' if status['active'] else '❌'}\n"
+                f"PID: {status['pid'] or 'N/A'}\n"
+                f"Память: {status['memory'] or 'N/A'}\n"
+                f"CPU: {status['cpu'] or 'N/A'}"
+            )
+            await update.message.reply_text(status_msg, parse_mode='Markdown')
+
+    async def service_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /status - статус сервисов"""
+        uid = update.effective_user.id
+        if not self.is_admin(uid):
+            await update.message.reply_text("❌ Нет прав.")
+            return
+        
+        # Получаем статус обоих сервисов
+        bot_status = ServiceManager.get_service_status(BUFFGUILD_SERVICE)
+        tg_status = ServiceManager.get_service_status(TELEGRAM_SERVICE)
+        
+        # Формируем клавиатуру для действий
+        keyboard = [
+            [
+                InlineKeyboardButton("🔄 Перезапустить бота", callback_data="restart_bot"),
+                InlineKeyboardButton("🔄 Перезапустить TG", callback_data="restart_tg")
+            ],
+            [
+                InlineKeyboardButton("📋 Логи бота", callback_data="logs_bot"),
+                InlineKeyboardButton("📋 Логи TG", callback_data="logs_tg")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        status_msg = (
+            "📊 **СТАТУС СЕРВИСОВ**\n\n"
+            f"**{BUFFGUILD_SERVICE}**\n"
+            f"Активен: {'✅' if bot_status['active'] else '❌'}\n"
+            f"PID: {bot_status['pid'] or 'N/A'}\n"
+            f"Память: {bot_status['memory'] or 'N/A'}\n"
+            f"CPU: {bot_status['cpu'] or 'N/A'}\n\n"
+            f"**{TELEGRAM_SERVICE}**\n"
+            f"Активен: {'✅' if tg_status['active'] else '❌'}\n"
+            f"PID: {tg_status['pid'] or 'N/A'}\n"
+            f"Память: {tg_status['memory'] or 'N/A'}\n"
+            f"CPU: {tg_status['cpu'] or 'N/A'}"
+        )
+        
+        await update.message.reply_text(status_msg, reply_markup=reply_markup, parse_mode='Markdown')
+
+    async def service_logs(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /logs - последние логи buffguild.service"""
+        uid = update.effective_user.id
+        if not self.is_admin(uid):
+            await update.message.reply_text("❌ Нет прав.")
+            return
+        
+        if not self.sudo_available:
+            await update.message.reply_text(
+                "❌ Нет прав sudo без пароля.\n"
+                "Настройте sudoers: добавьте 'ALL ALL=(ALL) NOPASSWD: /usr/bin/journalctl'"
+            )
+            return
+        
+        # Определяем, сколько строк показать
+        lines = 50
+        if context.args and context.args[0].isdigit():
+            lines = int(context.args[0])
+        
+        await update.message.reply_text(f"📋 Получаю последние {lines} строк логов {BUFFGUILD_SERVICE}...")
+        
+        logs = ServiceManager.get_logs(BUFFGUILD_SERVICE, lines)
+        
+        # Telegram имеет лимит 4096 символов на сообщение
+        if len(logs) > 4000:
+            # Отправляем частями
+            for i in range(0, len(logs), 4000):
+                part = logs[i:i+4000]
+                await update.message.reply_text(f"```\n{part}\n```", parse_mode='Markdown')
+        else:
+            await update.message.reply_text(f"```\n{logs}\n```", parse_mode='Markdown')
+
+    # ---- Мониторинг в реальном времени ----
+
+    async def watch_logs(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /watch - слежение за логами в реальном времени"""
+        uid = update.effective_user.id
+        if not self.is_admin(uid):
+            await update.message.reply_text("❌ Нет прав.")
+            return
+        
+        if not self.sudo_available:
+            await update.message.reply_text("❌ Нет прав sudo без пароля.")
+            return
+        
+        # Сохраняем состояние в context.user_data
+        context.user_data['watching'] = True
+        context.user_data['last_logs'] = ""
+        context.user_data['watch_message_id'] = None
+        context.user_data['watch_chat_id'] = update.effective_chat.id
+        
+        keyboard = [[InlineKeyboardButton("🛑 Остановить", callback_data="stop_watching")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        msg = await update.message.reply_text(
+            "📋 **Режим наблюдения за логами активирован**\n"
+            "Новые строки будут появляться каждые 10 секунд.\n"
+            "Нажмите кнопку ниже для остановки.",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+        
+        context.user_data['watch_message_id'] = msg.message_id
+        
+        # Запускаем фоновую задачу
+        asyncio.create_task(self._watch_logs_task(context))
+
+    async def _watch_logs_task(self, context: ContextTypes.DEFAULT_TYPE):
+        """Фоновая задача для отправки логов"""
+        chat_id = context.user_data.get('watch_chat_id')
+        message_id = context.user_data.get('watch_message_id')
+        
+        if not chat_id or not message_id:
+            return
+        
+        while context.user_data.get('watching', False):
+            try:
+                # Получаем новые логи
+                logs = ServiceManager.get_logs(BUFFGUILD_SERVICE, 20)
+                
+                # Сравниваем с предыдущими
+                if logs != context.user_data.get('last_logs', ''):
+                    context.user_data['last_logs'] = logs
+                    
+                    # Обрезаем если слишком длинные
+                    display_logs = logs[-3500:] if len(logs) > 3500 else logs
+                    
+                    # Редактируем существующее сообщение
+                    try:
+                        await context.bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            text=f"```\n{display_logs}\n```",
+                            parse_mode='Markdown',
+                            reply_markup=InlineKeyboardMarkup([[
+                                InlineKeyboardButton("🛑 Остановить", callback_data="stop_watching")
+                            ]])
+                        )
+                    except Exception as e:
+                        # Если не удалось отредактировать (например, слишком длинное), отправляем новое
+                        if "Message is not modified" not in str(e):
+                            msg = await context.bot.send_message(
+                                chat_id=chat_id,
+                                text=f"```\n{display_logs}\n```",
+                                parse_mode='Markdown',
+                                reply_markup=InlineKeyboardMarkup([[
+                                    InlineKeyboardButton("🛑 Остановить", callback_data="stop_watching")
+                                ]])
+                            )
+                            context.user_data['watch_message_id'] = msg.message_id
+                
+                # Ждем 10 секунд
+                for _ in range(10):
+                    if not context.user_data.get('watching', False):
+                        break
+                    await asyncio.sleep(1)
+                    
+            except Exception as e:
+                logging.error(f"Ошибка в watch_logs_task: {e}")
+                break
+
+    # ---- Управление ProfileManager ----
+
+    async def profile_manager_control(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /profile - управление ProfileManager"""
+        uid = update.effective_user.id
+        if not self.is_admin(uid):
+            await update.message.reply_text("❌ Нет прав.")
+            return
+        
+        if not self.profile_manager:
+            await update.message.reply_text(
+                "❌ ProfileManager не инициализирован.\n"
+                "Убедитесь, что он передан в конструктор TelegramAdmin."
+            )
+            return
+        
+        # Получаем статус ProfileManager
+        is_running = hasattr(self.profile_manager, '_running') and self.profile_manager._running
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("▶️ Запустить", callback_data="pm_start"),
+                InlineKeyboardButton("⏸️ Остановить", callback_data="pm_stop")
+            ],
+            [
+                InlineKeyboardButton("🔄 Перезапустить", callback_data="pm_restart"),
+                InlineKeyboardButton("📊 Статус", callback_data="pm_status")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            f"**Управление ProfileManager**\n"
+            f"Текущий статус: {'✅ Запущен' if is_running else '⏸️ Остановлен'}\n\n"
+            f"Выберите действие:",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+    # ---- Диагностика ----
+
+    async def full_diagnose(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /diagnose - полная диагностика системы"""
+        uid = update.effective_user.id
+        if not self.is_admin(uid):
+            await update.message.reply_text("❌ Нет прав.")
+            return
+        
+        await update.message.reply_text("🔍 Запускаю диагностику...")
+        
+        # Проверка сервисов
+        bot_status = ServiceManager.get_service_status(BUFFGUILD_SERVICE)
+        tg_status = ServiceManager.get_service_status(TELEGRAM_SERVICE)
+        
+        # Проверка API VK
+        vk_check = "✅ OK"
+        vk_error = ""
+        if self.bot_instance and hasattr(self.bot_instance, 'tm') and self.bot_instance.tm:
+            try:
+                # Пробуем получить observer
+                observer = self.bot_instance.tm.get_observer()
+                if observer:
+                    vk_check = "✅ OK (есть observer)"
+                else:
+                    vk_check = "⚠️ Observer не найден"
+            except Exception as e:
+                vk_check = "❌ Ошибка"
+                vk_error = str(e)
+        else:
+            vk_check = "❌ Нет доступа к VK боту"
+        
+        # Проверка ProfileManager
+        pm_check = "✅ Доступен" if self.profile_manager else "❌ Не инициализирован"
+        pm_status = ""
+        if self.profile_manager:
+            is_running = hasattr(self.profile_manager, '_running') and self.profile_manager._running
+            pm_status = f" ({'запущен' if is_running else 'остановлен'})"
+        
+        # Проверка файлов
+        files_check = []
+        for f in ["config.json", "jobs.json", "profile_manager_state.json"]:
+            if os.path.exists(f):
+                size = os.path.getsize(f) / 1024
+                mtime = os.path.getmtime(f)
+                age_hours = (time.time() - mtime) / 3600
+                files_check.append(f"✅ {f} ({size:.1f} KB, изменён {age_hours:.1f} ч назад)")
+            else:
+                files_check.append(f"⚠️ {f} (не найден)")
+        
+        # Проверка директорий
+        dirs_check = []
+        for d in ["data/voice_prophet", "logs"]:
+            if os.path.exists(d):
+                files = os.listdir(d) if os.path.isdir(d) else []
+                dirs_check.append(f"✅ {d}/ ({len(files)} файлов)")
+            else:
+                dirs_check.append(f"⚠️ {d}/ (не найдена)")
+        
+        # Проверка токенов
+        cfg = self._load()
+        tokens = cfg.get("tokens", [])
+        tokens_with_issues = []
+        total_success = 0
+        total_attempts = 0
+        
+        for t in tokens:
+            issues = []
+            if not t.get("access_token"):
+                issues.append("нет токена")
+            if t.get("needs_manual_voices"):
+                issues.append("ручной ввод")
+            if t.get("captcha_until", 0) > time.time():
+                issues.append("капча")
+            if not t.get("enabled", True):
+                issues.append("отключен")
+            
+            total_success += t.get("successful_buffs", 0)
+            total_attempts += t.get("total_attempts", 0)
+            
+            if issues:
+                tokens_with_issues.append(f"  • {t.get('name')}: {', '.join(issues)}")
+        
+        success_rate = (total_success / total_attempts * 100) if total_attempts > 0 else 0
+        
+        # Проверка прав sudo
+        sudo_check = "✅ Есть" if self.sudo_available else "❌ Нет"
+        
+        diag_msg = (
+            "📋 **РЕЗУЛЬТАТЫ ДИАГНОСТИКИ**\n\n"
+            f"**Сервисы:**\n"
+            f"• {BUFFGUILD_SERVICE}: {'✅' if bot_status['active'] else '❌'}\n"
+            f"• {TELEGRAM_SERVICE}: {'✅' if tg_status['active'] else '❌'}\n"
+            f"• VK API: {vk_check}\n"
+            f"{'  ' + vk_error if vk_error else ''}\n"
+            f"• ProfileManager: {pm_check}{pm_status}\n\n"
+            f"**Файлы:**\n" + "\n".join(files_check) + "\n\n"
+            f"**Директории:**\n" + "\n".join(dirs_check) + "\n\n"
+            f"**Токены:**\n"
+            f"• Всего: {len(tokens)}\n"
+            f"• Общая успешность: {success_rate:.1f}% ({total_success}/{total_attempts})\n"
+        )
+        
+        if tokens_with_issues:
+            diag_msg += "• Проблемные:\n" + "\n".join(tokens_with_issues) + "\n"
+        else:
+            diag_msg += "• Все токены в порядке ✅\n"
+        
+        diag_msg += f"\n**Права sudo:** {sudo_check}"
+        
+        await update.message.reply_text(diag_msg, parse_mode='Markdown')
+
+    # ---- Обработка кнопок ----
+
+    async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка нажатий на инлайн-кнопки"""
+        query = update.callback_query
+        await query.answer()
+        
+        uid = query.from_user.id
+        if not self.is_admin(uid):
+            await query.edit_message_text("❌ Нет прав.")
+            return
+        
+        # Управление сервисами
+        if query.data == "restart_bot":
+            await query.edit_message_text(f"🔄 Перезапускаю {BUFFGUILD_SERVICE}...")
+            success, message = ServiceManager.restart_service(BUFFGUILD_SERVICE)
+            await query.edit_message_text(message)
+        
+        elif query.data == "restart_tg":
+            await query.edit_message_text(f"🔄 Перезапускаю {TELEGRAM_SERVICE}...")
+            success, message = ServiceManager.restart_service(TELEGRAM_SERVICE)
+            await query.edit_message_text(message)
+        
+        elif query.data == "logs_bot":
+            logs = ServiceManager.get_logs(BUFFGUILD_SERVICE, 30)
+            if len(logs) > 4000:
+                logs = logs[:4000] + "..."
+            await query.edit_message_text(f"```\n{logs}\n```", parse_mode='Markdown')
+        
+        elif query.data == "logs_tg":
+            logs = ServiceManager.get_logs(TELEGRAM_SERVICE, 30)
+            if len(logs) > 4000:
+                logs = logs[:4000] + "..."
+            await query.edit_message_text(f"```\n{logs}\n```", parse_mode='Markdown')
+        
+        # Остановка слежения
+        elif query.data == "stop_watching":
+            context.user_data['watching'] = False
+            await query.edit_message_text("🛑 Наблюдение остановлено")
+        
+        # Управление ProfileManager
+        elif query.data == "pm_start":
+            if not self.profile_manager:
+                await query.edit_message_text("❌ ProfileManager не инициализирован")
+                return
+            
+            if hasattr(self.profile_manager, 'start'):
+                self.profile_manager.start()
+                await query.edit_message_text("✅ ProfileManager запущен")
+            else:
+                await query.edit_message_text("❌ Метод start не найден")
+        
+        elif query.data == "pm_stop":
+            if not self.profile_manager:
+                await query.edit_message_text("❌ ProfileManager не инициализирован")
+                return
+            
+            if hasattr(self.profile_manager, 'stop'):
+                self.profile_manager.stop()
+                await query.edit_message_text("⏸️ ProfileManager остановлен")
+            else:
+                await query.edit_message_text("❌ Метод stop не найден")
+        
+        elif query.data == "pm_restart":
+            if not self.profile_manager:
+                await query.edit_message_text("❌ ProfileManager не инициализирован")
+                return
+            
+            if hasattr(self.profile_manager, 'stop'):
+                self.profile_manager.stop()
+            await asyncio.sleep(2)
+            if hasattr(self.profile_manager, 'start'):
+                self.profile_manager.start()
+            await query.edit_message_text("🔄 ProfileManager перезапущен")
+        
+        elif query.data == "pm_status":
+            if not self.profile_manager:
+                await query.edit_message_text("❌ ProfileManager не инициализирован")
+                return
+            
+            is_running = hasattr(self.profile_manager, '_running') and self.profile_manager._running
+            status_msg = f"📊 ProfileManager: {'✅ Запущен' if is_running else '⏸️ Остановлен'}"
+            
+            # Добавляем статистику если есть
+            if hasattr(self.profile_manager, '_state'):
+                pending = len(self.profile_manager._state.get("pending_triggers", {}))
+                status_msg += f"\nАктивных триггеров: {pending}"
+            
+            await query.edit_message_text(status_msg)
+
+    # ---- Существующие методы управления токенами (без изменений) ----
 
     async def add_token(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Начало добавления токена"""
@@ -254,7 +1008,6 @@ class TelegramAdmin:
             seen.add(rk)
             race_keys.append(rk)
 
-        # Теперь RACE_NAMES доступен благодаря добавлению пути в sys.path
         for rk in race_keys:
             if rk not in RACE_NAMES:
                 await update.message.reply_text(
@@ -299,7 +1052,6 @@ class TelegramAdmin:
         cfg.setdefault("settings", {}).setdefault("delay", 2)
         self._save(cfg)
 
-        # bot_instance для отдельного сервиса, скорее всего, None, но оставим на будущее
         if self.bot_instance and hasattr(self.bot_instance, "tm"):
             self.bot_instance.tm.reload()
             logging.info("🔄 TokenManager.reload() после добавления токена")
@@ -329,8 +1081,6 @@ class TelegramAdmin:
         await update.message.reply_text("❌ Отменено.")
         return ConversationHandler.END
 
-    # ---- Список токенов ----
-
     async def list_tokens(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Список всех токенов"""
         uid = update.effective_user.id
@@ -344,7 +1094,7 @@ class TelegramAdmin:
             await update.message.reply_text("📭 Нет токенов.")
             return
 
-        lines = ["📋 Список токенов:"]
+        lines = ["📋 **Список токенов:**\n"]
         for i, t in enumerate(tokens, 1):
             cls = t.get("class", "apostle")
             cls_name = CLASS_CHOICES.get(cls, cls)
@@ -354,15 +1104,13 @@ class TelegramAdmin:
             manual = "⚠️" if t.get("needs_manual_voices", False) else ""
 
             lines.append(
-                f"{i}. {t.get('name', t['id'])}\n"
-                f" 🎭 {cls_name}\n"
-                f" {status} {voices_emoji} Голоса: {voices} {manual}\n"
-                f" 🆔 {t['id']}"
+                f"{i}. **{t.get('name', t['id'])}**\n"
+                f"  🎭 {cls_name}\n"
+                f"  {status} {voices_emoji} Голоса: {voices} {manual}\n"
+                f"  🆔 `{t['id']}`"
             )
 
-        await update.message.reply_text("\n\n".join(lines))
-
-    # ---- Включение/отключение токенов ----
+        await update.message.reply_text("\n\n".join(lines), parse_mode='Markdown')
 
     def _toggle(self, name: str, enabled: bool) -> bool:
         """Включить/отключить токен по имени"""
@@ -375,7 +1123,6 @@ class TelegramAdmin:
 
         if changed:
             self._save(cfg)
-            # bot_instance здесь, вероятнее всего, None, поэтому reload не вызываем
         return changed
 
     async def enable(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -412,8 +1159,6 @@ class TelegramAdmin:
             f"🚫 Токен '{name}' отключён" if ok else f"❌ Не найдено токена с именем: '{name}'"
         )
 
-    # ---- Удаление токена ----
-
     async def remove(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Удалить токен по имени"""
         uid = update.effective_user.id
@@ -440,15 +1185,21 @@ class TelegramAdmin:
             await update.message.reply_text(f"❌ Не найдено токена с именем: '{name}'")
 
     async def reload_config(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Перезагрузить конфигурацию (для отдельного сервиса фактически no-op)"""
+        """Перезагрузить конфигурацию"""
         uid = update.effective_user.id
         if not self.is_admin(uid):
             await update.message.reply_text("❌ Нет прав.")
             return
 
-        # Здесь только читаем файл — перезагрузку делает VK‑бот через свой TokenManager
+        # Перезагружаем конфиг
         _ = self._load()
-        await update.message.reply_text("🔄 Конфигурация перечитана с диска (локально)")
+        
+        # Если есть ссылка на VK бота, перезагружаем и его
+        if self.bot_instance and hasattr(self.bot_instance, "tm"):
+            self.bot_instance.tm.reload()
+            await update.message.reply_text("🔄 Конфигурация перечитана с диска и VK бот перезагружен")
+        else:
+            await update.message.reply_text("🔄 Конфигурация перечитана с диска (локально)")
 
     # ---- Запуск ----
 
@@ -456,6 +1207,7 @@ class TelegramAdmin:
         """Запуск Telegram бота"""
         app = Application.builder().token(self.telegram_token).build()
 
+        # Диалог добавления токена
         conv = ConversationHandler(
             entry_points=[CommandHandler("add_token", self.add_token)],
             states={
@@ -493,6 +1245,7 @@ class TelegramAdmin:
             fallbacks=[CommandHandler("cancel", self.cancel)],
         )
 
+        # Основные команды управления токенами
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(conv)
         app.add_handler(CommandHandler("list_tokens", self.list_tokens))
@@ -500,8 +1253,27 @@ class TelegramAdmin:
         app.add_handler(CommandHandler("disable", self.disable))
         app.add_handler(CommandHandler("remove", self.remove))
         app.add_handler(CommandHandler("reload", self.reload_config))
+        
+        # Новые команды для информации о токенах
+        app.add_handler(CommandHandler("token_info", self.token_info))
+        app.add_handler(CommandHandler("set_voices", self.set_voices))
+        
+        # Команды для управления сервисами
+        app.add_handler(CommandHandler("restart_bot", self.restart_bot))
+        app.add_handler(CommandHandler("restart_tg", self.restart_tg))
+        app.add_handler(CommandHandler("status", self.service_status))
+        app.add_handler(CommandHandler("logs", self.service_logs))
+        
+        # Мониторинг и диагностика
+        app.add_handler(CommandHandler("stats", self.system_stats))
+        app.add_handler(CommandHandler("watch", self.watch_logs))
+        app.add_handler(CommandHandler("profile", self.profile_manager_control))
+        app.add_handler(CommandHandler("diagnose", self.full_diagnose))
+        
+        # Обработчик инлайн-кнопок
+        app.add_handler(CallbackQueryHandler(self.button_callback))
 
-        logging.info("🤖 Telegram Admin Bot started")
+        logging.info("🤖 Telegram Admin Bot started with enhanced features")
         app.run_polling()
 
 
@@ -520,6 +1292,16 @@ def main():
 
     admin_ids = [int(x.strip()) for x in admins.split(",") if x.strip()]
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    
+    # Проверка наличия sudo прав
+    if not ServiceManager.check_sudo_permissions():
+        logging.warning(
+            "⚠️ Нет прав sudo без пароля! Команды управления сервисами будут недоступны.\n"
+            "Добавьте в sudoers: username ALL=(ALL) NOPASSWD: /usr/bin/systemctl, /usr/bin/journalctl"
+        )
+    
+    # Здесь profile_manager не передается, потому что это отдельный запуск
+    # Для работы с profile_manager нужно использовать основной main.py
     TelegramAdmin(tg_token, admin_ids, config_path).run()
 
 
