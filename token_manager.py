@@ -59,12 +59,23 @@ class OptimizedTokenManager:
         self.observer_token_id: str = ""
         self.settings: Dict[str, Any] = {}
 
+        # ============= ДОБАВЛЯЕМ ССЫЛКУ НА PROFILE MANAGER =============
+        self.profile_manager = None
+        # ==============================================================
+
         # Обработчик сообщества
         self.group_handler: Optional[Any] = None
 
         self.load()
         self._init_group_handler()
         self._build_indexes()
+
+    # ============= НОВЫЙ МЕТОД =============
+    def set_profile_manager(self, profile_manager):
+        """Устанавливает ссылку на ProfileManager"""
+        self.profile_manager = profile_manager
+        logger.info("🔗 ProfileManager связан с TokenManager")
+    # ========================================
 
     def _init_group_handler(self):
         """Инициализация обработчика сообщества"""
@@ -125,6 +136,20 @@ class OptimizedTokenManager:
         for t in self.tokens:
             self._by_owner_index.setdefault(t.owner_vk_id, []).append(t)
             self._by_class_index.setdefault(t.class_type, []).append(t)
+            
+            # ============= ВАЖНО: Проверяем и синхронизируем голоса при загрузке =============
+            # Если есть реальные голоса, но есть и виртуальные - очищаем виртуальные
+            if t.voices > 0 and t.virtual_voices > 0:
+                logger.info(f"🔄 {t.name}: обнаружены реальные ({t.voices}) и виртуальные ({t.virtual_voices}) голоса, очищаем виртуальные")
+                t.virtual_voices = 0
+                t.mark_for_save()
+            
+            # Если есть реальные голоса и флаг ручного ввода - сбрасываем флаг
+            if t.voices > 0 and t.needs_manual_voices:
+                logger.info(f"🔄 {t.name}: сброс флага ручного ввода при загрузке (есть {t.voices} голосов)")
+                t.needs_manual_voices = False
+                t.mark_for_save()
+            # =================================================================================
 
             if t.class_type == "apostle" and (not obs or t.id != obs.id):
                 if t.temp_races:
@@ -275,6 +300,7 @@ class OptimizedTokenManager:
                         "needs_manual_voices": t.needs_manual_voices,
                         "virtual_voice_grants": t.virtual_voice_grants,
                         "next_virtual_grant_ts": t.next_virtual_grant_ts,
+                        "virtual_voices": t.virtual_voices,  # Добавляем виртуальные голоса
                     }
                 )
 

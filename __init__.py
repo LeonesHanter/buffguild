@@ -21,7 +21,8 @@ from .commands import (
     parse_resurrection_cmd,
     is_resurrection_cmd,
     is_apo_cmd,
-    is_baf_cancel_cmd
+    is_baf_cancel_cmd,
+    is_prof_cmd,
 )
 from .regexes import (
     RE_SUCCESS,
@@ -76,7 +77,8 @@ from .ability import build_ability_text_and_cd
 from .job_storage import JobStorage
 from .state_store import JobStateStore
 from .logging_setup import setup_logging
-from .custom_triggers import custom_parser, CustomBuff, custom_storage
+from .custom_triggers import trigger_store, custom_storage
+from .observer_triggers import CustomTriggerHandler  # ← ИЗМЕНЕНО: SimpleTriggerHandler → CustomTriggerHandler
 from .voice_prophet import VoiceProphet
 
 __version__ = "3.1.0"
@@ -96,12 +98,12 @@ __all__ = [
     'GroupProxy',
     'Job',
     'ParsedAbility',
-    'CustomBuff',
     'JobStorage',
     'JobStateStore',
-    'custom_parser',
-    'custom_storage',
     'VoiceProphet',
+    'CustomTriggerHandler',  # ← ИЗМЕНЕНО: SimpleTriggerHandler → CustomTriggerHandler
+    'trigger_store',
+    'custom_storage',
     'setup_logging',
     'parse_baf_letters',
     'parse_golosa_cmd',
@@ -110,6 +112,7 @@ __all__ = [
     'is_resurrection_cmd',
     'is_apo_cmd',
     'is_baf_cancel_cmd',
+    'is_prof_cmd',
     'build_registration_text',
     'build_final_text',
     'build_ability_text_and_cd',

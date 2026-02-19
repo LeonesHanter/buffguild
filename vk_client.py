@@ -41,6 +41,37 @@ class ResilientVKClient:
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
         return fut.result(timeout=30)
 
+    # ============= НОВЫЙ МЕТОД С RETRY =============
+    def call_with_retry(self, method: str, data: Dict[str, Any], max_retries: int = 3) -> Dict[str, Any]:
+        """
+        Вызвать метод VK API с повторными попытками при ошибках.
+        Использует tenacity с экспоненциальной задержкой.
+        """
+        @retry(
+            stop=stop_after_attempt(max_retries),
+            wait=wait_exponential(multiplier=1, min=2, max=10),
+            retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError)),
+            before_sleep=lambda retry_state: logger.warning(
+                f"⏳ Retry {method} (попытка {retry_state.attempt_number}/{max_retries})"
+            )
+        )
+        async def _call_with_retry():
+            if not self._session:
+                raise RuntimeError("VK session not ready")
+            url = f"{VK_API_BASE}/{method}"
+            async with self._session.post(url, data=data) as resp:
+                return await resp.json()
+
+        try:
+            result = self.call(_call_with_retry())
+            if "error" in result:
+                logger.error(f"❌ VK API {method} error: {result['error']}")
+            return result
+        except Exception as e:
+            logger.error(f"❌ VK API {method} failed after {max_retries} retries: {e}")
+            return {"error": {"error_code": -1, "error_msg": str(e)}}
+    # ================================================
+
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),

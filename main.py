@@ -35,6 +35,13 @@ def main() -> None:
     # Инициализация менеджера токенов
     tm = OptimizedTokenManager(CONFIG_PATH, vk)
     
+    # ============= ВАЖНО: Создаём ProfileManager ДО executor =============
+    profile_manager = ProfileManager(tm)
+    # Устанавливаем ссылку на ProfileManager в TokenManager
+    tm.set_profile_manager(profile_manager)
+    logging.info("🔄 ProfileManager связан с TokenManager")
+    # ======================================================================
+    
     # Инициализация исполнителя бафов
     executor = AbilityExecutor(tm)
     
@@ -61,7 +68,6 @@ def main() -> None:
                 logging.info(f"🔮 Voice Prophet активирован для {token.name}")
 
     # ============= ЗАПУСК МЕНЕДЖЕРА С ПРОФИЛЯМИ =============
-    profile_manager = ProfileManager(tm)
     profile_manager.start()
     logging.info("🔄 ProfileManager запущен с Voice Prophet")
     

@@ -37,7 +37,20 @@ def is_apo_cmd(text: str) -> bool:
 
 
 def is_baf_cancel_cmd(text: str) -> bool:
-    return normalize_text(text or "") == "/баф отмена"
+    """Проверяет, является ли текст командой отмены бафа"""
+    norm = normalize_text(text or "")
+    cancel_variants = [
+        "/баф отмена",
+        "/баф отменить",
+        "/бафотмена",
+    ]
+    return norm in cancel_variants
+
+
+def is_prof_cmd(text: str) -> bool:
+    """Проверяет, является ли текст командой проверки профиля"""
+    norm = normalize_text(text or "")
+    return norm.startswith("/проф")
 
 
 def parse_golosa_cmd(text: str) -> Optional[Tuple[None, int]]:

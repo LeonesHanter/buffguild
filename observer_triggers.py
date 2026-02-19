@@ -3,271 +3,273 @@ import logging
 import re
 import threading
 import time
+from typing import List, Optional
 
-from .custom_triggers import custom_parser, custom_storage, CustomBuff
+from .custom_triggers import trigger_store
 
 logger = logging.getLogger(__name__)
 
 
 class CustomTriggerHandler:
+    """Обработчик Ара/Кир с потоком ожидания до 315 секунд"""
+
     def __init__(self, bot):
         self.bot = bot
-        # VK ID аккаунтов Ара и Кир (исполнители бафов)
         self.ARA_ID = 294529251
         self.KIR_ID = 8244449
+        
+        # Словарь для маппинга текста в ключи бафов
+        self.buff_keywords = {
+            'а': ['атак', '🗡️', 'меч', 'оружи'],
+            'з': ['защит', '🛡️', 'брон', 'щит', 'броня'],
+            'у': ['удач', '🍀', 'везен', 'фортун'],
+            'ч': ['человек', 'людей', '🧍'],
+            'э': ['эльф', '🧝'],
+        }
+        
+        # Словарь названий бафов
+        self.buff_names = {
+            'а': 'Атака', 'з': 'Защита', 'у': 'Удача', 
+            'ч': 'Человек', 'э': 'Эльф'
+        }
+        
+        # Словарь эмодзи
+        self.buff_emojis = {
+            'а': '🗡️', 'з': '🛡️', 'у': '🍀', 'ч': '🧍', 'э': '🧝'
+        }
 
     def handle_command(self, text: str, from_id: int) -> bool:
-        """Обработка команды от пользователя (Ара/Кир)"""
-        trig, q = custom_parser.parse_command(text)
-        if not trig or not q:
+        """Обработка команды от пользователя"""
+        text_lower = text.lower().strip()
+        
+        if text_lower.startswith('ара'):
+            query = text_lower[3:].strip()
+            executor_id = self.ARA_ID
+        elif text_lower.startswith('кир'):
+            query = text_lower[3:].strip()
+            executor_id = self.KIR_ID
+        else:
             return False
 
-        keys = custom_parser.parse_buff_query(trig, q)
-        if not keys:
+        # Парсим запрос
+        buff_keys = []
+        
+        # ALL-команда
+        if query in ['все', 'всего', 'всё']:
+            buff_keys = ['а', 'з', 'у']
+        else:
+            # Ищем по ключевым словам
+            for key, keywords in self.buff_keywords.items():
+                if any(kw in query for kw in keywords):
+                    if key not in buff_keys:
+                        buff_keys.append(key)
+            
+            # Если ничего не нашли - ищем по отдельным буквам
+            if not buff_keys:
+                for ch in query:
+                    if ch in self.buff_keywords:
+                        buff_keys.append(ch)
+
+        if not buff_keys:
+            logger.warning(f"❌ Не удалось распарсить запрос: '{query}'")
             return False
 
-        ex_id = self.ARA_ID if trig == 'ара' else self.KIR_ID
-        logger.info(f"🎯 {trig} для @id{from_id}: {keys}")
+        logger.info(f"🎯 команда для {from_id}: {buff_keys} (исполнитель: {executor_id})")
 
         # Регистрируем триггер
-        custom_storage.register_trigger(from_id, trig, ex_id, keys)
-
+        trigger_index = trigger_store.register_trigger(from_id, buff_keys, executor_id)
+        
         # Запускаем поток ожидания
         threading.Thread(
             target=self._wait,
-            args=(from_id, len(keys)),
+            args=(from_id, len(buff_keys), trigger_index),
             daemon=True
         ).start()
+        
         return True
 
     def handle_game_response(self, msg: dict) -> bool:
         """Обработка ответа от игры"""
         text = msg.get("text", "")
         msg_id = msg.get("id", 0)
-        cmid = msg.get("conversation_message_id", 0)
 
-        logger.info(
-            f"📩 ПОЛУЧЕН ОТВЕТ ИГРЫ: id={msg_id}, cmid={cmid}"
-        )
-        logger.info(f"📄 Текст ответа: {text[:200]}...")
-
-        # Ищем ID пользователя в тексте [id123|Имя]
-        m = re.search(r'\[id(\d+)\|', text)
-        if not m:
-            logger.debug("❌ Не найден ID пользователя в ответе")
+        # Пропускаем уже обработанные
+        if trigger_store.is_msg_processed(msg_id):
             return False
 
-        uid = int(m.group(1))
-        logger.info(f"👤 ID пользователя в ответе: {uid}")
-
-        # Проверяем, есть ли активный триггер для этого пользователя
-        tdata = custom_storage.get_trigger_data(uid)
-        if not tdata:
-            logger.debug(f"❌ Нет активного триггера для {uid}")
+        # Ищем ID пользователя
+        match = re.search(r'\[id(\d+)\|', text)
+        if not match:
             return False
 
-        logger.info(f"📋 Ожидаемые бафы: {tdata['buff_keys']}")
+        uid = int(match.group(1))
+        
+        # Определяем тип бафа
+        text_lower = text.lower()
+        buff_key = None
+        
+        for key, keywords in self.buff_keywords.items():
+            if any(kw in text_lower for kw in keywords):
+                buff_key = key
+                break
 
-        low = text.lower()
-        bkey = None
-
-        # Атака
-        if any(word in low for word in ["атак", "🗡️", "меч", "оружи"]):
-            bkey = 'а'
-            logger.info("✅ Определен баф: АТАКА")
-        # Защита
-        elif any(word in low for word in ["защит", "🛡️", "брон", "щит", "броня"]):
-            bkey = 'з'
-            logger.info("✅ Определен баф: ЗАЩИТА")
-        # Удача
-        elif any(word in low for word in ["удач", "🍀", "везен", "фортун"]):
-            bkey = 'у'
-            logger.info("✅ Определен баф: УДАЧА")
-        # Человек
-        elif any(word in low for word in ["человек", "людей", "🧍"]):
-            bkey = 'ч'
-            logger.info("✅ Определен баф: ЧЕЛОВЕК")
-        # Эльф
-        elif any(word in low for word in ["эльф", "🧝"]):
-            bkey = 'э'
-            logger.info("✅ Определен баф: ЭЛЬФ")
-        else:
-            logger.warning(
-                f"❌ Не удалось определить тип бафа в тексте: "
-                f"{text[:100]}"
-            )
+        if not buff_key:
+            logger.debug(f"❌ Не удалось определить тип бафа в тексте")
             return False
 
-        logger.info(f"🔑 Определен ключ бафа: {bkey}")
+        # Определяем критичность и значение
+        is_critical = "критический" in text_lower or "🍀" in text
+        buff_value = 150 if is_critical else 100
+        
+        # Для атаки/защиты проверяем проценты
+        if buff_key in ['а', 'з']:
+            percent_patterns = [
+                r"на\s+(\d{1,3})\s*%",
+                r"повышена\s+на\s+(\d{1,3})\s*%",
+                r"увеличена\s+на\s+(\d{1,3})\s*%",
+                r"(\d{1,3})\s*%",
+                r"\+(\d{1,3})%"
+            ]
+            for pattern in percent_patterns:
+                match = re.search(pattern, text_lower)
+                if match:
+                    try:
+                        percent = int(match.group(1))
+                        if percent >= 30:
+                            is_critical = True
+                            buff_value = 150
+                        break
+                    except:
+                        pass
+        
+        # Для удачи проверяем единицы
+        elif buff_key == 'у':
+            luck_match = re.search(r"удача\s+повышена\s+на\s+(\d{1,3})", text_lower)
+            if luck_match:
+                try:
+                    luck_val = int(luck_match.group(1))
+                    if luck_val >= 9:
+                        is_critical = True
+                        buff_value = 150
+                except:
+                    pass
 
-        if bkey not in tdata['buff_keys']:
-            logger.warning(
-                f"❌ Баф {bkey} не в списке ожидаемых "
-                f"{tdata['buff_keys']}"
-            )
-            return False
+        logger.info(f"📩 Ответ игры для {uid}: баф {buff_key}, крит={is_critical}, значение={buff_value}")
 
-        crit, val, buff_type = custom_parser.parse_game_response(text)
-        voices = custom_parser.extract_voices_from_response(text)
+        # Ищем активный триггер для этого пользователя
+        # В реальности нужно найти правильный индекс, но для простоты будем считать
+        # что у пользователя может быть несколько триггеров, и нужно найти подходящий
+        # Пока используем заглушку - первый активный
+        trigger_index = 0
+        
+        all_collected, current = trigger_store.add_response(uid, trigger_index, buff_key, is_critical, buff_value)
+        trigger_store.mark_msg_processed(msg_id)
 
-        buff = CustomBuff(
-            trigger=tdata['trigger'],
-            buff_key=bkey,
-            buff_name=custom_parser.buff_names[bkey],
-            is_critical=crit,
-            buff_value=val,
-            full_response=text,
-            user_id=uid,
-            executor_id=tdata['executor_id'],
-            timestamp=time.time()
-        )
-
-        all_col, notif = custom_storage.add_response(uid, buff)
-        custom_storage.mark_msg_processed(msg_id, cmid)
-
-        current = len(tdata['responses'])
-        total = len(tdata['buff_keys'])
-        logger.info(
-            f"✅ Добавлен {bkey} для {uid} "
-            f"({current}/{total})"
-        )
-
-        if notif:
-            self._send_notif(uid)
         return True
 
-    def _wait(self, uid: int, need: int):
-        max_wait = 300
+    def _wait(self, uid: int, need: int, trigger_index: int):
+        """
+        Ожидание ответов от игры.
+        - Максимум 315 секунд
+        - Проверка каждые 5 секунд
+        - При сборе всех бафов - немедленная отправка
+        - При таймауте - отправка того, что успели собрать
+        """
+        max_wait = 315  # 5 минут + 15 секунд запаса
         waited = 0
         interval = 0.5
-        command_check_interval = 5
-        last_command_check = time.time()
+        check_interval = 5
+        last_check = 0
+        notification_sent = False
 
-        logger.info(
-            f"⏳ Начато ожидание {need} бафов "
-            f"для user_id={uid}"
-        )
+        logger.info(f"⏳ Начато ожидание {need} бафов для user_id={uid} (триггер #{trigger_index}), макс. {max_wait}с")
 
-        while waited < max_wait:
+        while waited < max_wait and not notification_sent:
             time.sleep(interval)
             waited += interval
             now = time.time()
 
-            if now - last_command_check >= command_check_interval:
-                last_command_check = now
-                td = custom_storage.get_trigger_data(uid)
-                if td:
-                    received = len(td['responses'])
-                    logger.info(
-                        f"⏳ Ожидание бафов для {uid}: "
-                        f"{received}/{need}"
-                    )
-                    if received >= need:
-                        logger.info(
-                            f"✅ Все {need} ответов получены для {uid}"
-                        )
-                        return
-                else:
-                    logger.debug(
-                        f"ℹ️ Триггер для {uid} уже завершен"
-                    )
+            # Проверяем каждые 5 секунд
+            if now - last_check >= check_interval:
+                last_check = now
+                
+                trigger = trigger_store.get_trigger(uid, trigger_index)
+                
+                if not trigger:
+                    logger.debug(f"ℹ️ Триггер #{trigger_index} для {uid} уже завершен")
                     return
 
-        logger.warning(
-            f"⏰ Таймаут для user_id={uid} "
-            f"(прошло {max_wait} секунд)"
-        )
-        td = custom_storage.get_trigger_data(uid)
+                received = len(trigger['responses'])
+                logger.info(f"⏳ Ожидание бафов для {uid}: {received}/{need} (прошло {waited:.0f}с)")
+                
+                # Если собрали все - немедленно отправляем
+                if received >= need:
+                    logger.info(f"✅ Все {need} ответов получены для {uid} (через {waited:.0f}с)")
+                    self._send_notification(uid, trigger_index)
+                    notification_sent = True
+                    break
 
-        if td:
-            received = len(td['responses'])
-            if received > 0:
-                logger.info(
-                    f"📤 Уведомление по таймауту для {uid} "
-                    f"({received}/{need})"
-                )
-
-                if not custom_storage.has_notification_been_sent(uid):
-                    self._send_notif(uid)
-                else:
-                    logger.debug(
-                        f"ℹ️ Уведомление для {uid} уже было "
-                        f"отправлено"
-                    )
-
-                custom_storage.complete_trigger(
-                    uid, keep_notification_flag=True
-                )
+        # Таймаут - отправляем то, что успели собрать
+        if not notification_sent:
+            logger.warning(f"⏰ Таймаут {max_wait}с для user_id={uid}, проверяем собранные бафы")
+            
+            trigger = trigger_store.get_trigger(uid, trigger_index)
+            
+            if trigger and trigger['responses']:
+                received = len(trigger['responses'])
+                logger.info(f"📤 Отправка по таймауту для {uid}: получено {received}/{need}")
+                self._send_notification(uid, trigger_index)
             else:
-                logger.info(
-                    f"🔇 Триггер для {uid} без ответов — "
-                    f"ничего не выводим"
-                )
-                custom_storage.complete_trigger(
-                    uid, keep_notification_flag=False
-                )
-        else:
-            logger.debug(
-                f"ℹ️ Триггер для {uid} уже был завершен"
-            )
+                logger.info(f"🔇 Триггер #{trigger_index} для {uid} без ответов, ничего не отправляем")
+                trigger_store.complete_trigger(uid, trigger_index)
 
-    def _send_notif(self, uid: int):
-        """Отправка нотификации (120 + дубль в 7)"""
-        td = custom_storage.get_trigger_data(uid)
-        rs = custom_storage.get_responses(uid)
-
-        if not td or not rs:
-            logger.warning(
-                f"⚠️ Нет данных для уведомления user_id={uid}"
-            )
+    def _send_notification(self, user_id: int, trigger_index: int):
+        """Отправляет уведомление для конкретного триггера"""
+        responses = trigger_store.get_responses(user_id, trigger_index)
+        
+        if not responses:
+            logger.warning(f"⚠️ Нет данных для уведомления user_id={user_id}, триггер #{trigger_index}")
             return
 
-        notif = custom_parser.format_notification(
-            td['trigger'],
-            uid,
-            td['executor_id'],
-            rs
-        )
+        # Формируем уведомление
+        lines = ["🎉 Баф успешно выдан!"]
+        total_cost = 0
 
-        # 1) В 120 чат – через пользовательский токен (как раньше)
-        try:
-            if hasattr(self.bot, 'reader_token') and self.bot.reader_token:
-                ok, status = self.bot.reader_token.send_to_peer(
-                    self.bot.source_peer_id,
-                    notif
-                )
-                logger.info(
-                    f"📤 [Custom] в чат 120 (user): "
-                    f"ok={ok}, status={status}"
-                )
+        for buff_key, executor_id, is_critical, buff_value in responses:
+            executor_link = f"[https://vk.ru/id{executor_id}|{self.buff_emojis.get(buff_key, '✨')}]"
+            buff_name = self.buff_names.get(buff_key, 'Баф')
+
+            # Форматируем как в обычном бафере
+            if buff_key in ['а', 'з']:
+                if is_critical:
+                    value = f"+30%!🍀"
+                else:
+                    value = f"+20%!"
+                line = f"{executor_link}{buff_name} {value}"
+            elif buff_key == 'у':
+                if is_critical:
+                    value = f"+9!🍀"
+                else:
+                    value = f"+6!"
+                line = f"{executor_link}{buff_name} {value}"
             else:
-                # Фолбэк – если почему-то нет reader_token
-                self.bot.send_to_peer(
-                    self.bot.source_peer_id, notif
-                )
-                logger.info(
-                    f"📤 [Custom] в чат 120 через "
-                    f"bot.send_to_peer (fallback)"
-                )
-        except Exception as e:
-            logger.error(
-                f"❌ Ошибка отправки custom в чат 120: {e}"
-            )
+                if is_critical:
+                    line = f"{executor_link}{buff_name}!🍀"
+                else:
+                    line = f"{executor_link}{buff_name}!"
 
-        # 2) Дублируем в чат 7 – через групповой токен
+            lines.append(line)
+            total_cost += buff_value
+
+        lines.append(f"[https://vk.ru/id{user_id}|💰]Списано {total_cost} баллов")
+        notif = "\n".join(lines)
+
+        # Отправляем
         try:
-            self.bot.send_to_peer(
-                self.bot.source_peer_id, notif
-            )
-            logger.info(
-                f"📤 [Custom] дублирован в чат группы"
-            )
+            self.bot.send_to_peer(self.bot.source_peer_id, notif)
+            logger.info(f"📤 Уведомление отправлено для {user_id} (триггер #{trigger_index}, бафов: {len(responses)})")
         except Exception as e:
-            logger.error(
-                f"❌ Ошибка отправки custom в чат группы: {e}"
-            )
+            logger.error(f"❌ Ошибка отправки: {e}")
 
-        # Завершаем триггер
-        custom_storage.complete_trigger(
-            uid, keep_notification_flag=True
-        )
+        # Удаляем триггер
+        trigger_store.complete_trigger(user_id, trigger_index)

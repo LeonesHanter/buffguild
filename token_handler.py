@@ -38,6 +38,7 @@ class TokenHandler:
         )
 
         self.voices: int = int(cfg.get("voices", 0))
+        self.virtual_voices: int = int(cfg.get("virtual_voices", 0))
         self.enabled: bool = bool(cfg.get("enabled", True))
         self.races: List[str] = list(cfg.get("races", []))
 
@@ -105,7 +106,7 @@ class TokenHandler:
 
         try:
             data = {"access_token": self.access_token, "v": VK_API_VERSION}
-            ret = self._vk.call(self._vk.post("users.get", data))
+            ret = self._vk.call_with_retry("users.get", data)
             if "response" in ret and ret["response"]:
                 uid = int(ret["response"][0]["id"])
                 old_owner_id = self.owner_vk_id
@@ -177,7 +178,7 @@ class TokenHandler:
             self.successful_buffs += 1
         self.mark_for_save()
     
-    # ============= SPEND VOICE - ТОЛЬКО ДЛЯ РАСХОДА =============
+    # ============= РАСХОД ГОЛОСА =============
     def spend_voice(self) -> bool:
         """
         Списать один голос при успешном бафе.
@@ -185,22 +186,436 @@ class TokenHandler:
         Returns:
             bool: True если голос списан, False если голосов нет
         """
-        if self.voices <= 0:
-            logger.debug(f"⚠️ {self.name}: попытка списать голос, но voices={self.voices}")
-            return False
+        # Проверяем, есть ли реальные голоса
+        if self.voices > 0:
+            old_voices = self.voices
+            self.voices -= 1
+            self.mark_for_save()
+            
+            # Записываем РАСХОД в Voice Prophet
+            if self.voice_prophet:
+                self.voice_prophet.record_spend(old_voices)
+            
+            logger.info(f"🗣️ {self.name}: списан реальный голос ({old_voices}→{self.voices})")
+            return True
         
-        old_voices = self.voices
-        self.voices -= 1
-        self.mark_for_save()
+        # Если реальных нет, но есть виртуальные
+        if self.virtual_voices > 0:
+            old_virtual = self.virtual_voices
+            self.virtual_voices -= 1
+            self.mark_for_save()
+            logger.info(f"🎭 {self.name}: списан виртуальный голос (осталось {self.virtual_voices})")
+            return True
         
-        # Записываем РАСХОД в Voice Prophet
-        if self.voice_prophet:
-            self.voice_prophet.record_spend(old_voices)
-        
-        logger.info(f"🗣️ {self.name}: списан голос ({old_voices}→{self.voices})")
-        return True
+        logger.debug(f"⚠️ {self.name}: попытка списать голос, но voices={self.voices}, virtual={self.virtual_voices}")
+        return False
     # ============================================================
 
+    def clear_virtual_voices(self) -> None:
+        """Очищает виртуальные голоса при получении реальных"""
+        if self.virtual_voices > 0:
+            old = self.virtual_voices
+            self.virtual_voices = 0
+            self.mark_for_save()
+            logger.info(f"🧹 {self.name}: очищены виртуальные голоса ({old} шт.)")
+    
+    # ============= ПРИНУДИТЕЛЬНАЯ ОЧИСТКА ВИРТУАЛЬНЫХ ГОЛОСОВ =============
+    def force_clear_virtual_voices(self) -> bool:
+        """
+        Принудительно очищает виртуальные голоса и сбрасывает флаги.
+        Используется для ручного вмешательства или при проблемах.
+        """
+        if self.virtual_voices > 0 or self.needs_manual_voices:
+            old_virtual = self.virtual_voices
+            old_manual = self.needs_manual_voices
+            
+            self.virtual_voices = 0
+            self.needs_manual_voices = False
+            
+            if hasattr(self._manager, 'profile_manager') and self._manager.profile_manager:
+                self._manager.profile_manager.reset_virtual_attempts(self.id)
+                logger.info(f"🔄 {self.name}: сброшены виртуальные попытки в ProfileManager (принудительно)")
+            
+            self.mark_for_save()
+            logger.info(f"🧹 {self.name}: принудительно очищены виртуальные голоса (было {old_virtual}), сброшен ручной ввод (был {old_manual})")
+            return True
+        return False
+    # ======================================================================
+
+    # ============= ОБНОВЛЕНИЕ ГОЛОСОВ ИЗ СИСТЕМЫ =============
+    def update_voices_from_system(self, new_voices: int) -> None:
+        """
+        Обновить голоса из системы (ответ на "Мой профиль" или лог игры).
+        ПРИ ЛЮБОМ получении реальных голосов очищаем виртуальные и сбрасываем попытки.
+        """
+        new_voices = int(new_voices)
+        if new_voices < 0:
+            new_voices = 0
+
+        # Запоминаем состояние ДО обновления
+        had_virtual = self.virtual_voices > 0
+        old_voices = self.voices
+        old_manual = self.needs_manual_voices
+        old_virtual = self.virtual_voices
+
+        # Обновляем реальные голоса
+        self.voices = new_voices
+        
+        # ============= КРИТИЧЕСКИ ВАЖНО: Очищаем виртуальные голоса ПРИ ЛЮБОМ получении реальных =============
+        if new_voices > 0:
+            # Если были виртуальные голоса - очищаем
+            if self.virtual_voices > 0:
+                logger.info(f"✅ {self.name}: получены реальные голоса ({new_voices}), очищаем виртуальные ({self.virtual_voices})")
+                self.virtual_voices = 0
+                
+                # Сбрасываем счётчик попыток в ProfileManager
+                if hasattr(self._manager, 'profile_manager') and self._manager.profile_manager:
+                    self._manager.profile_manager.reset_virtual_attempts(self.id)
+                    logger.info(f"🔄 {self.name}: сброшены виртуальные попытки в ProfileManager")
+            
+            # ВСЕГДА сбрасываем флаг ручного ввода, если есть реальные голоса
+            if self.needs_manual_voices:
+                self.needs_manual_voices = False
+                logger.info(f"✅ {self.name}: сброшен флаг ручного ввода (появились реальные голоса)")
+        # =====================================================================================================
+        
+        self.mark_for_save()
+        
+        # Логируем изменения
+        changes = []
+        if old_voices != new_voices:
+            changes.append(f"голоса: {old_voices}→{new_voices}")
+        if had_virtual and self.virtual_voices == 0:
+            changes.append("виртуальные очищены")
+        if old_manual and not self.needs_manual_voices:
+            changes.append("ручной ввод сброшен")
+        if old_virtual != self.virtual_voices and self.virtual_voices > 0:
+            changes.append(f"виртуальные: {old_virtual}→{self.virtual_voices}")
+        
+        if changes:
+            logger.info(f"🗣 {self.name}: обновление: {', '.join(changes)}")
+        
+        self.mark_real_voices_received()
+        
+        # Записываем ПРОВЕРКУ в Voice Prophet
+        if self.voice_prophet:
+            predicted = self.voice_prophet.predict_zero_at()
+            self.voice_prophet.record_check(new_voices, predicted)
+    # ==========================================================
+
+    def update_voices_manual(self, new_voices: int) -> None:
+        new_voices = int(new_voices)
+        if new_voices < 0:
+            new_voices = 0
+
+        old = self.voices
+        self.voices = new_voices
+        self.needs_manual_voices = False  # Явно сбрасываем
+        self.virtual_voices = 0  # Очищаем виртуальные при ручной установке
+        self.virtual_voice_grants = 0
+        self.next_virtual_grant_ts = 0
+        self.mark_for_save()
+        
+        # Сбрасываем счётчик попыток в ProfileManager
+        if hasattr(self._manager, 'profile_manager') and self._manager.profile_manager:
+            self._manager.profile_manager.reset_virtual_attempts(self.id)
+            logger.info(f"🔄 {self.name}: сброшены виртуальные попытки в ProfileManager (ручная установка)")
+        
+        logger.info(f"🛠 {self.name}: manual voices {old} → {new_voices}, виртуальные очищены")
+
+    def reset_manual_voices_flag(self) -> bool:
+        """Принудительно сбрасывает флаг ручного ввода"""
+        if self.needs_manual_voices:
+            self.needs_manual_voices = False
+            self.mark_for_save()
+            logger.info(f"🔄 {self.name}: принудительно сброшен флаг ручного ввода")
+            return True
+        return False
+
+    def update_level(self, lvl: int) -> None:
+        lvl = int(lvl)
+        if lvl < 0:
+            lvl = 0
+
+        if self.level != lvl:
+            old = self.level
+            self.level = lvl
+            self.mark_for_save()
+            logger.info(f"💀 {self.name}: level {old} → {lvl}")
+
+    # ============= МЕТОДЫ API С RETRY =============
+    def get_history(self, peer_id: int, count: int = 20) -> List[Dict[str, Any]]:
+        """Получает историю сообщений чата с повторными попытками"""
+        try:
+            data = {
+                "access_token": self.access_token,
+                "v": VK_API_VERSION,
+                "peer_id": int(peer_id),
+                "count": int(count),
+            }
+            ret = self._vk.call_with_retry("messages.getHistory", data)
+            if "error" in ret:
+                err = ret["error"]
+                logger.error(f"❌ {self.name}: getHistory error {err.get('error_code')} {err.get('error_msg')}")
+                return []
+            return ret.get("response", {}).get("items", []) or []
+        except Exception as e:
+            logger.error(f"❌ {self.name}: getHistory exception {e}")
+            return []
+
+    def get_history_cached(self, peer_id: int, count: int = 20) -> List[Dict[str, Any]]:
+        """Получает историю с кэшированием"""
+        cache_key = f"history_{peer_id}_{count}"
+        now = time.time()
+        with self._cache_lock:
+            if cache_key in self._history_cache:
+                cached_time, cached_data = self._history_cache[cache_key]
+                if now - cached_time < self._cache_ttl:
+                    return cached_data.copy()
+
+        fresh_data = self.get_history(peer_id, count)
+        with self._cache_lock:
+            self._history_cache[cache_key] = (now, fresh_data.copy())
+        return fresh_data
+
+    def invalidate_cache(self, peer_id: Optional[int] = None) -> None:
+        """Инвалидирует кэш истории"""
+        with self._cache_lock:
+            if peer_id is None:
+                self._history_cache.clear()
+                return
+            keys_to_delete = [
+                k for k in self._history_cache.keys()
+                if k.startswith(f"history_{peer_id}_")
+            ]
+            for k in keys_to_delete:
+                del self._history_cache[k]
+
+    def get_by_id(self, message_ids: List[int]) -> List[Dict[str, Any]]:
+        """Получает сообщения по их ID с повторными попытками"""
+        try:
+            data = {
+                "access_token": self.access_token,
+                "v": VK_API_VERSION,
+                "message_ids": ",".join(str(int(x)) for x in message_ids),
+            }
+            ret = self._vk.call_with_retry("messages.getById", data)
+            if "error" in ret:
+                err = ret["error"]
+                logger.error(f"❌ {self.name}: getById error {err.get('error_code')} {err.get('error_msg')}")
+                return []
+            return ret.get("response", {}).get("items", []) or []
+        except Exception as e:
+            logger.error(f"❌ {self.name}: getById exception {e}")
+            return []
+
+    def send_to_peer(
+        self,
+        peer_id: int,
+        text: str,
+        forward_msg_id: Optional[int] = None,
+        reply_to_cmid: Optional[int] = None,
+    ) -> Tuple[bool, str]:
+        """Отправляет сообщение в чат с повторными попытками"""
+        if not self.enabled:
+            return False, "DISABLED"
+        if self.is_captcha_paused():
+            return False, "CAPTCHA_PAUSED"
+
+        try:
+            jitter_sleep()
+            data: Dict[str, Any] = {
+                "access_token": self.access_token,
+                "v": VK_API_VERSION,
+                "peer_id": int(peer_id),
+                "message": text,
+                "random_id": random.randrange(1, 2_000_000_000),
+                "disable_mentions": 1,
+            }
+            if forward_msg_id:
+                data["forward_messages"] = str(int(forward_msg_id))
+            elif reply_to_cmid:
+                data["reply_to"] = str(int(reply_to_cmid))
+
+            ret = self._vk.call_with_retry("messages.send", data)
+            
+            if "error" in ret:
+                err = ret["error"]
+                code = int(err.get("error_code", 0))
+                msg = str(err.get("error_msg", ""))
+
+                if code == 14:
+                    self.set_captcha_pause(60)
+                    return False, "CAPTCHA"
+                if code == 9:
+                    return False, "FLOOD"
+                if code in (4, 5):
+                    return False, "AUTH"
+
+                logger.error(f"❌ {self.name}: send error {code} {msg}")
+                return False, "ERROR"
+
+            response = ret.get("response")
+            
+            if isinstance(response, dict):
+                message_id = response.get("id")
+                if message_id:
+                    logger.info(f"✅ {self.name}: сообщение отправлено, ID={message_id}")
+                    return True, str(message_id)
+            
+            elif isinstance(response, (int, str)) and str(response).isdigit():
+                message_id = int(response)
+                if message_id > 0:
+                    logger.info(f"✅ {self.name}: сообщение отправлено, ID={message_id}")
+                    return True, str(message_id)
+            
+            logger.warning(f"⚠️ {self.name}: не удалось получить ID сообщения, response={response}")
+            return True, "OK"
+
+        except Exception as e:
+            logger.error(f"❌ {self.name}: send exception {e}")
+            return False, "ERROR"
+
+    def edit_message(self, peer_id: int, message_id: int, text: str) -> Tuple[bool, str]:
+        """
+        Редактирует существующее сообщение с повторными попытками
+        
+        Args:
+            peer_id: ID чата
+            message_id: ID сообщения для редактирования
+            text: новый текст сообщения
+            
+        Returns:
+            Tuple[bool, str]: (успех, статус)
+        """
+        if not self.enabled:
+            return False, "DISABLED"
+        if self.is_captcha_paused():
+            return False, "CAPTCHA_PAUSED"
+
+        try:
+            jitter_sleep()
+            data = {
+                "access_token": self.access_token,
+                "v": VK_API_VERSION,
+                "peer_id": int(peer_id),
+                "message_id": int(message_id),
+                "message": text,
+                "dont_parse_links": 1,
+            }
+            
+            # Для групповых токенов добавляем group_id
+            if hasattr(self, 'group_id') and self.group_id:
+                data["group_id"] = abs(self.group_id)
+                
+            ret = self._vk.call_with_retry("messages.edit", data)
+            
+            if "error" in ret:
+                err = ret["error"]
+                code = int(err.get("error_code", 0))
+                msg = str(err.get("error_msg", ""))
+                
+                if code == 14:
+                    self.set_captcha_pause(60)
+                    return False, "CAPTCHA"
+                if code == 9:
+                    return False, "FLOOD"
+                if code == 29:
+                    logger.warning(f"⏳ {self.name}: rate limit при редактировании")
+                    return False, "RATE_LIMITED"
+                
+                logger.error(f"❌ {self.name}: edit error {code} {msg}")
+                return False, "ERROR"
+            
+            logger.info(f"✏️ {self.name}: сообщение {message_id} отредактировано")
+            return True, "OK"
+
+        except Exception as e:
+            logger.error(f"❌ {self.name}: edit exception {e}")
+            return False, "ERROR"
+
+    def delete_message(self, peer_id: int, message_id: int) -> bool:
+        """Удаляет сообщение с повторными попытками"""
+        if not self.enabled:
+            return False
+        if self.is_captcha_paused():
+            return False
+
+        try:
+            jitter_sleep()
+            data = {
+                "access_token": self.access_token,
+                "v": VK_API_VERSION,
+                "peer_id": int(peer_id),
+                "cmids": str(int(message_id)),
+                "delete_for_all": 1,
+            }
+            ret = self._vk.call_with_retry("messages.delete", data)
+            if "error" in ret:
+                err = ret["error"]
+                logger.error(f"❌ {self.name}: delete error {err.get('error_code')} {err.get('error_msg')}")
+                return False
+            return True
+        except Exception as e:
+            logger.error(f"❌ {self.name}: delete exception {e}")
+            return False
+
+    def send_reaction_success(self, peer_id: int, cmid: int) -> bool:
+        """Отправляет реакцию 🎉 на сообщение с повторными попытками"""
+        if cmid is None:
+            return False
+
+        try:
+            jitter_sleep()
+            data = {
+                "access_token": self.access_token,
+                "v": VK_API_VERSION,
+                "peer_id": int(peer_id),
+                "cmid": int(cmid),
+                "reaction_id": 16,
+            }
+            ret = self._vk.call_with_retry("messages.sendReaction", data)
+            if "error" in ret:
+                err = ret["error"]
+                logger.error(f"❌ {self.name}: sendReaction error {err.get('error_code')} {err.get('error_msg')}")
+                return False
+
+            logger.info(f"🙂 {self.name}: реакция 🎉 поставлена (peer={peer_id} cmid={cmid})")
+            return True
+        except Exception as e:
+            logger.error(f"❌ {self.name}: sendReaction exception {e}")
+            return False
+
+    def get_health_info(self) -> Dict[str, Any]:
+        """Возвращает информацию о состоянии токена"""
+        with self._lock:
+            social_info = self.get_social_cooldown_info()
+            return {
+                "id": self.id,
+                "name": self.name,
+                "class": self.class_type,
+                "enabled": self.enabled,
+                "captcha_paused": self.is_captcha_paused(),
+                "captcha_until": self.captcha_until,
+                "needs_manual_voices": self.needs_manual_voices,
+                "voices": self.voices,
+                "virtual_voices": self.virtual_voices,
+                "level": self.level,
+                "temp_races_count": self.get_temp_race_count(),
+                "successful_buffs": self.successful_buffs,
+                "total_attempts": self.total_attempts,
+                "success_rate": (
+                    self.successful_buffs / self.total_attempts
+                    if self.total_attempts > 0
+                    else 0.0
+                ),
+                "owner_vk_id": self.owner_vk_id,
+                "races": self.races,
+                "temp_races": self.temp_races.copy(),
+                "social_cd": social_info or "-",
+            }
+    
+    # ============= МЕТОДЫ ДЛЯ РАС =============
     def _cleanup_expired_temp_races(self, force: bool = False) -> bool:
         now = time.time()
         
@@ -280,7 +695,6 @@ class TokenHandler:
                     logger.debug(f"✅ {self.name}: найдена временная раса '{race_key}' (осталось {remaining:.0f} мин)")
                     return True
                 else:
-                    # Удаляем просроченную запись
                     logger.debug(f"🧹 {self.name}: удаляем просроченную расу {race_key}")
                     self.temp_races = [
                         t for t in self.temp_races 
@@ -303,10 +717,6 @@ class TokenHandler:
         duration_hours: int = 2,
         expires_at: Optional[int] = None,
     ) -> bool:
-        """
-        Добавляет временную расу с ЗАЩИТНЫМ ТАЙМЕРОМ.
-        Реальный срок жизни сокращается на SAFETY_MARGIN секунд.
-        """
         with self._lock:
             if race_key not in RACE_NAMES:
                 return False
@@ -322,7 +732,6 @@ class TokenHandler:
             if expires_at is None:
                 expires_at = round(time.time() + duration_hours * 3600)
             
-            # КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: защитный зазор
             safe_expires_at = expires_at - self.SAFETY_MARGIN
 
             self.temp_races.append({
@@ -365,10 +774,6 @@ class TokenHandler:
     
     # ============= GET TEMP RACES INFO =============
     def get_temp_races_info(self) -> List[Dict]:
-        """
-        Получить информацию о временных расах с таймерами.
-        Для логирования и отладки.
-        """
         result = []
         now = time.time()
         
@@ -392,6 +797,7 @@ class TokenHandler:
     # ================================================
 
     def mark_real_voices_received(self) -> None:
+        """Отмечает, что получены реальные голоса и сбрасывает счётчики"""
         if (
             self.needs_manual_voices
             or self.virtual_voice_grants
@@ -401,363 +807,3 @@ class TokenHandler:
             self.virtual_voice_grants = 0
             self.next_virtual_grant_ts = 0
             self.mark_for_save()
-    
-    # ============= UPDATE VOICES FROM SYSTEM - ТОЛЬКО ДЛЯ ПРОВЕРОК =============
-    def update_voices_from_system(self, new_voices: int) -> None:
-        """
-        Обновить голоса из системы (ответ на "Мой профиль").
-        """
-        new_voices = int(new_voices)
-        if new_voices < 0:
-            new_voices = 0
-
-        if self.voices != new_voices:
-            old = self.voices
-            self.voices = new_voices
-            self.mark_for_save()
-            logger.info(f"🗣 {self.name}: voices {old} → {new_voices}")
-            
-            # ВАЖНО: Сбрасываем флаг ручного ввода, если голоса появились
-            if new_voices > 0 and self.needs_manual_voices:
-                self.needs_manual_voices = False
-                logger.info(f"✅ {self.name}: сброшен флаг ручного ввода (появились голоса)")
-            
-            self.mark_real_voices_received()
-            
-            # Записываем ПРОВЕРКУ в Voice Prophet
-            if self.voice_prophet:
-                predicted = self.voice_prophet.predict_zero_at()
-                self.voice_prophet.record_check(new_voices, predicted)
-
-    def update_voices_manual(self, new_voices: int) -> None:
-        new_voices = int(new_voices)
-        if new_voices < 0:
-            new_voices = 0
-
-        old = self.voices
-        self.voices = new_voices
-        self.needs_manual_voices = False  # Явно сбрасываем
-        self.virtual_voice_grants = 0
-        self.next_virtual_grant_ts = 0
-        self.mark_for_save()
-        logger.info(f"🛠 {self.name}: manual voices {old} → {new_voices}")
-
-    def reset_manual_voices_flag(self) -> bool:
-        """Принудительно сбрасывает флаг ручного ввода"""
-        if self.needs_manual_voices:
-            self.needs_manual_voices = False
-            self.mark_for_save()
-            logger.info(f"🔄 {self.name}: принудительно сброшен флаг ручного ввода")
-            return True
-        return False
-
-    def update_level(self, lvl: int) -> None:
-        lvl = int(lvl)
-        if lvl < 0:
-            lvl = 0
-
-        if self.level != lvl:
-            old = self.level
-            self.level = lvl
-            self.mark_for_save()
-            logger.info(f"💀 {self.name}: level {old} → {lvl}")
-
-    async def _messages_get_history(self, peer_id: int, count: int = 20) -> Dict[str, Any]:
-        data = {
-            "access_token": self.access_token,
-            "v": VK_API_VERSION,
-            "peer_id": int(peer_id),
-            "count": int(count),
-        }
-        return await self._vk.post("messages.getHistory", data)
-
-    def get_history(self, peer_id: int, count: int = 20) -> List[Dict[str, Any]]:
-        try:
-            ret = self._vk.call(self._messages_get_history(peer_id, count))
-            if "error" in ret:
-                err = ret["error"]
-                logger.error(
-                    f"❌ {self.name}: getHistory error "
-                    f"{err.get('error_code')} {err.get('error_msg')}"
-                )
-                return []
-            return ret.get("response", {}).get("items", []) or []
-        except Exception as e:
-            logger.error(f"❌ {self.name}: getHistory exception {e}")
-            return []
-
-    def get_history_cached(self, peer_id: int, count: int = 20) -> List[Dict[str, Any]]:
-        cache_key = f"history_{peer_id}_{count}"
-        now = time.time()
-        with self._cache_lock:
-            if cache_key in self._history_cache:
-                cached_time, cached_data = self._history_cache[cache_key]
-                if now - cached_time < self._cache_ttl:
-                    return cached_data.copy()
-
-        fresh_data = self.get_history(peer_id, count)
-        with self._cache_lock:
-            self._history_cache[cache_key] = (now, fresh_data.copy())
-        return fresh_data
-
-    def invalidate_cache(self, peer_id: Optional[int] = None) -> None:
-        with self._cache_lock:
-            if peer_id is None:
-                self._history_cache.clear()
-                return
-            keys_to_delete = [
-                k for k in self._history_cache.keys()
-                if k.startswith(f"history_{peer_id}_")
-            ]
-            for k in keys_to_delete:
-                del self._history_cache[k]
-
-    async def _messages_get_by_id(self, message_ids: List[int]) -> Dict[str, Any]:
-        data = {
-            "access_token": self.access_token,
-            "v": VK_API_VERSION,
-            "message_ids": ",".join(str(int(x)) for x in message_ids),
-        }
-        return await self._vk.post("messages.getById", data)
-
-    def get_by_id(self, message_ids: List[int]) -> List[Dict[str, Any]]:
-        try:
-            ret = self._vk.call(self._messages_get_by_id(message_ids))
-            if "error" in ret:
-                err = ret["error"]
-                logger.error(
-                    f"❌ {self.name}: getById error "
-                    f"{err.get('error_code')} {err.get('error_msg')}"
-                )
-                return []
-            return ret.get("response", {}).get("items", []) or []
-        except Exception as e:
-            logger.error(f"❌ {self.name}: getById exception {e}")
-            return []
-
-    async def _messages_send(
-        self,
-        peer_id: int,
-        text: str,
-        forward_msg_id: Optional[int] = None,
-        reply_to_cmid: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        jitter_sleep()
-        data: Dict[str, Any] = {
-            "access_token": self.access_token,
-            "v": VK_API_VERSION,
-            "peer_id": int(peer_id),
-            "message": text,
-            "random_id": random.randrange(1, 2_000_000_000),
-            "disable_mentions": 1,
-        }
-        if forward_msg_id:
-            data["forward_messages"] = str(int(forward_msg_id))
-        elif reply_to_cmid:
-            data["reply_to"] = str(int(reply_to_cmid))
-        return await self._vk.post("messages.send", data)
-
-    def send_to_peer(
-        self,
-        peer_id: int,
-        text: str,
-        forward_msg_id: Optional[int] = None,
-        reply_to_cmid: Optional[int] = None,
-    ) -> Tuple[bool, str]:
-        if not self.enabled:
-            return False, "DISABLED"
-        if self.is_captcha_paused():
-            return False, "CAPTCHA_PAUSED"
-
-        try:
-            ret = self._vk.call(
-                self._messages_send(peer_id, text, forward_msg_id, reply_to_cmid)
-            )
-            if "error" in ret:
-                err = ret["error"]
-                code = int(err.get("error_code", 0))
-                msg = str(err.get("error_msg", ""))
-
-                if code == 14:
-                    self.set_captcha_pause(60)
-                    return False, "CAPTCHA"
-                if code == 9:
-                    return False, "FLOOD"
-                if code in (4, 5):
-                    return False, "AUTH"
-
-                logger.error(
-                    f"❌ {self.name}: send error {code} {msg}"
-                )
-                return False, "ERROR"
-
-            # ВАЖНО: Проверяем структуру ответа
-            response = ret.get("response")
-            
-            # Если response - словарь, ищем id
-            if isinstance(response, dict):
-                message_id = response.get("id")
-                if message_id:
-                    logger.info(f"✅ {self.name}: сообщение отправлено, ID={message_id}")
-                    return True, str(message_id)
-            
-            # Если response - число, это и есть ID
-            elif isinstance(response, (int, str)) and str(response).isdigit():
-                message_id = int(response)
-                if message_id > 0:
-                    logger.info(f"✅ {self.name}: сообщение отправлено, ID={message_id}")
-                    return True, str(message_id)
-            
-            # Если ничего не нашли
-            logger.warning(f"⚠️ {self.name}: не удалось получить ID сообщения, response={response}")
-            return True, "OK"
-
-        except Exception as e:
-            logger.error(f"❌ {self.name}: send exception {e}")
-            return False, "ERROR"
-
-    # ============= МЕТОД ДЛЯ РЕДАКТИРОВАНИЯ =============
-    def edit_message(self, peer_id: int, message_id: int, text: str) -> Tuple[bool, str]:
-        """
-        Редактирует существующее сообщение
-        
-        Args:
-            peer_id: ID чата
-            message_id: ID сообщения для редактирования
-            text: новый текст сообщения
-            
-        Returns:
-            Tuple[bool, str]: (успех, статус)
-        """
-        if not self.enabled:
-            return False, "DISABLED"
-        if self.is_captcha_paused():
-            return False, "CAPTCHA_PAUSED"
-
-        try:
-            jitter_sleep()
-            data = {
-                "access_token": self.access_token,
-                "v": VK_API_VERSION,
-                "peer_id": int(peer_id),
-                "message_id": int(message_id),
-                "message": text,
-                "dont_parse_links": 1,  # Не парсить ссылки
-            }
-            
-            # Для групповых токенов добавляем group_id
-            if hasattr(self, 'group_id') and self.group_id:
-                data["group_id"] = abs(self.group_id)
-                
-            ret = self._vk.call(self._vk.post("messages.edit", data))
-            
-            if "error" in ret:
-                err = ret["error"]
-                code = int(err.get("error_code", 0))
-                msg = str(err.get("error_msg", ""))
-                
-                if code == 14:
-                    self.set_captcha_pause(60)
-                    return False, "CAPTCHA"
-                if code == 9:
-                    return False, "FLOOD"
-                if code == 29:  # Rate limit
-                    logger.warning(f"⏳ {self.name}: rate limit при редактировании")
-                    return False, "RATE_LIMITED"
-                
-                logger.error(f"❌ {self.name}: edit error {code} {msg}")
-                return False, "ERROR"
-            
-            logger.info(f"✏️ {self.name}: сообщение {message_id} отредактировано")
-            return True, "OK"
-
-        except Exception as e:
-            logger.error(f"❌ {self.name}: edit exception {e}")
-            return False, "ERROR"
-    # =====================================================
-
-    def delete_message(self, peer_id: int, message_id: int) -> bool:
-        if not self.enabled:
-            return False
-        if self.is_captcha_paused():
-            return False
-
-        try:
-            jitter_sleep()
-            data = {
-                "access_token": self.access_token,
-                "v": VK_API_VERSION,
-                "peer_id": int(peer_id),
-                "cmids": str(int(message_id)),
-                "delete_for_all": 1,
-            }
-            ret = self._vk.call(self._vk.post("messages.delete", data))
-            if "error" in ret:
-                err = ret["error"]
-                logger.error(
-                    f"❌ {self.name}: delete error "
-                    f"{err.get('error_code')} {err.get('error_msg')}"
-                )
-                return False
-            return True
-        except Exception as e:
-            logger.error(f"❌ {self.name}: delete exception {e}")
-            return False
-
-    def send_reaction_success(self, peer_id: int, cmid: int) -> bool:
-        if cmid is None:
-            return False
-
-        jitter_sleep()
-        data = {
-            "access_token": self.access_token,
-            "v": VK_API_VERSION,
-            "peer_id": int(peer_id),
-            "cmid": int(cmid),
-            "reaction_id": 16,
-        }
-        try:
-            ret = self._vk.call(self._vk.post("messages.sendReaction", data))
-            if "error" in ret:
-                err = ret["error"]
-                logger.error(
-                    f"❌ {self.name}: sendReaction error "
-                    f"{err.get('error_code')} {err.get('error_msg')}"
-                )
-                return False
-
-            logger.info(
-                f"🙂 {self.name}: реакция 🎉 поставлена "
-                f"(peer={peer_id} cmid={cmid})"
-            )
-            return True
-        except Exception as e:
-            logger.error(f"❌ {self.name}: sendReaction exception {e}")
-            return False
-
-    def get_health_info(self) -> Dict[str, Any]:
-        with self._lock:
-            social_info = self.get_social_cooldown_info()
-            return {
-                "id": self.id,
-                "name": self.name,
-                "class": self.class_type,
-                "enabled": self.enabled,
-                "captcha_paused": self.is_captcha_paused(),
-                "captcha_until": self.captcha_until,
-                "needs_manual_voices": self.needs_manual_voices,
-                "voices": self.voices,
-                "level": self.level,
-                "temp_races_count": self.get_temp_race_count(),
-                "successful_buffs": self.successful_buffs,
-                "total_attempts": self.total_attempts,
-                "success_rate": (
-                    self.successful_buffs / self.total_attempts
-                    if self.total_attempts > 0
-                    else 0.0
-                ),
-                "owner_vk_id": self.owner_vk_id,
-                "races": self.races,
-                "temp_races": self.temp_races.copy(),
-                "social_cd": social_info or "-",
-            }

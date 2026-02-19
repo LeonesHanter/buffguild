@@ -169,7 +169,7 @@ class ProfileManager:
         
         # ============= Активируем Voice Prophet для всех токенов =============
         for token in self.tm.tokens:
-            if token.class_type in ["apostle", "crusader", "light_incarnation"]:  # УБРАЛИ warlock
+            if token.class_type in ["apostle", "crusader", "light_incarnation"]:
                 if not token.voice_prophet:
                     token.enable_voice_prophet(self.VOICE_PROPHET_STORAGE)
                     logger.debug(f"🔮 Voice Prophet активирован для {token.name}")
@@ -223,7 +223,7 @@ class ProfileManager:
 
             if for_profile:
                 # ДЛЯ ПРОВЕРКИ ПРОФИЛЯ: исключаем warlock
-                if token.class_type not in ["warlock"]:  # warlock не проверяем профиль
+                if token.class_type not in ["warlock"]:
                     eligible.append(token)
             else:
                 # ДЛЯ ВИРТУАЛЬНЫХ ГОЛОСОВ: все классы, включая warlock
@@ -322,7 +322,6 @@ class ProfileManager:
         Проверяет профиль одного токена.
         Возвращает True если были изменения (голоса/уровень/расы), иначе False.
         """
-        # Пропускаем warlock (хотя они не должны сюда попадать, но на всякий случай)
         if token.class_type == "warlock":
             logger.debug(f"⏭️ {token.name}: пропускаем проверку профиля (warlock)")
             return False
@@ -370,13 +369,32 @@ class ProfileManager:
 
                 found_any_profile_msg = True
 
-                # 1) Голоса — для всех классов (кроме warlock, но они сюда не попадают)
-                if profile_data["voices"] is not None and token.voices != int(profile_data["voices"]):
-                    old = token.voices
-                    token.update_voices_from_system(int(profile_data["voices"]))
-                    token.mark_for_save()
-                    logger.info(f"🗣 {token.name}: voices {old} → {token.voices}")
-                    found_any_change = True
+                # 1) Голоса — для всех классов
+                if profile_data["voices"] is not None:
+                    new_voices = int(profile_data["voices"])
+                    
+                    # Запоминаем старые значения для Voice Prophet
+                    old_voices = token.voices
+                    old_manual_flag = token.needs_manual_voices
+                    
+                    # Обновляем голоса через систему (этот метод сам решит, сбрасывать ли флаг)
+                    token.update_voices_from_system(new_voices)
+                    
+                    # Логируем изменение
+                    if old_voices != new_voices:
+                        logger.info(f"🗣 {token.name}: voices {old_voices} → {new_voices}")
+                        found_any_change = True
+                        
+                        # Если были реальные голоса и флаг ручного ввода сбросился
+                        if old_manual_flag and not token.needs_manual_voices and new_voices > 0:
+                            logger.info(f"✅ {token.name}: сброшен флаг ручного ввода (получены реальные голоса)")
+                    else:
+                        # Голоса не изменились, но проверяем, не было ли виртуальных
+                        if token.virtual_voices > 0 and new_voices > 0:
+                            # Токен получил реальные голоса, виртуальные больше не нужны
+                            token.clear_virtual_voices()
+                            logger.info(f"✅ {token.name}: виртуальные голоса очищены (получены реальные)")
+                            found_any_change = True
 
                 # 2) Уровень — для паладинов/воплощений
                 if token.class_type in ["crusader", "light_incarnation"]:
@@ -547,23 +565,27 @@ class ProfileManager:
                 attempts = int(self._state.get("virtual_attempts", {}).get(token.id, 0)) + 1
                 self._state.setdefault("virtual_attempts", {})[token.id] = attempts
 
+            # Запоминаем, что это виртуальный голос
             old_voices = token.voices
-            # ============= ВСЕГДА 1 ГОЛОС =============
-            token.voices = 1
-            # =========================================
+            old_virtual = token.virtual_voices
+            
+            # Увеличиваем счётчик виртуальных голосов
+            token.virtual_voices += 1
+            # Для совместимости также увеличиваем реальные голоса
+            token.voices += 1
             token.mark_for_save()
 
             logger.info(
                 f"🎁 {token.name}: виртуальный голос выдан "
                 f"(попытка {attempts}/{self.MAX_VIRTUAL_ATTEMPTS}), "
-                f"голоса {old_voices}→{token.voices}"
+                f"голоса {old_voices}→{token.voices} (виртуальных: {old_virtual}→{token.virtual_voices})"
             )
 
             if attempts >= self.MAX_VIRTUAL_ATTEMPTS:
                 token.needs_manual_voices = True
                 token.mark_for_save()
                 logger.warning(
-                    f"🚫 {token.name}: превышен лимит виртуальных голосов. "
+                    f"🚫 {token.name}: превышен лимит виртуальных голосов ({self.MAX_VIRTUAL_ATTEMPTS}). "
                     f"Требуется ручной ввод."
                 )
 
@@ -586,9 +608,7 @@ class ProfileManager:
         if now - last < float(self.VIRTUAL_VOICE_RETRY_INTERVAL):
             return
 
-        # ============= ВСЕ ТОКЕНЫ С 0 ГОЛОСОВ =============
         eligible = self._get_eligible_tokens(for_profile=False)
-        # =================================================
 
         candidates: List[TokenHandler] = []
         for token in eligible:
@@ -611,8 +631,12 @@ class ProfileManager:
                 )
                 continue
 
-            if token.voices <= 0:
+            # Учитываем виртуальные голоса при проверке
+            if token.voices <= 0 and token.virtual_voices == 0:
                 candidates.append(token)
+            elif token.voices <= 0 and token.virtual_voices > 0:
+                # Уже есть виртуальные голоса, но реальных нет
+                logger.debug(f"ℹ️ {token.name}: есть виртуальные голоса ({token.virtual_voices}), но реальных нет")
 
         logger.debug(f"🎟️ ProfileManager: eligible_for_virtual={len(eligible)}")
 

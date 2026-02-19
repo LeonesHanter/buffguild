@@ -39,7 +39,58 @@ class GroupHandler:
         self._cache_ttl = 3
         self._cache_lock = threading.Lock()
 
+        # LongPoll переменные
+        self._lp_server: str = ""
+        self._lp_key: str = ""
+        self._lp_ts: str = ""
+
         logger.info(f"👥 GroupHandler создан: {self.name} (ID: {self.group_id})")
+
+    # ──────────────────────────────────────────────
+    #  API вызов с retry
+    # ──────────────────────────────────────────────
+    def _api_call(self, method: str, params: Dict[str, Any], with_retry: bool = True) -> Dict:
+        """
+        Вызов API VK с поддержкой повторных попыток.
+        
+        Args:
+            method: метод API (например, 'messages.send')
+            params: параметры вызова
+            with_retry: использовать ли повторные попытки
+        
+        Returns:
+            ответ API
+        """
+        call_params = dict(params)
+        call_params['access_token'] = self.access_token
+        call_params['v'] = VK_API_VERSION
+
+        debug_params = {k: v for k, v in call_params.items() if k != 'access_token'}
+        logger.debug(f"🔧 [{self.name}] API {method}: {debug_params}")
+
+        try:
+            if with_retry:
+                ret = self._vk.call_with_retry(method, call_params)
+            else:
+                ret = self._vk.call(self._vk.post(method, call_params))
+            
+            logger.debug(f"🔧 [{self.name}] API {method} ответ: {ret}")
+            
+            # Сбрасываем счётчик ошибок при успехе
+            self._consecutive_failures = 0
+            return ret
+            
+        except Exception as e:
+            self._consecutive_failures += 1
+            logger.error(f"❌ {self.name}: API {method} exception: {e}")
+            
+            # Если слишком много ошибок подряд, увеличиваем задержку
+            if self._consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
+                wait_time = min(60 * (2 ** (self._consecutive_failures - self.MAX_CONSECUTIVE_FAILURES)), 3600)
+                self._rate_limit_until = time.time() + wait_time
+                logger.warning(f"⏳ Слишком много ошибок, пауза {wait_time}с")
+            
+            return {'error': {'error_code': -1, 'error_msg': str(e)}}
 
     # ──────────────────────────────────────────────
     #  Валидация и LongPoll
@@ -49,9 +100,9 @@ class GroupHandler:
         return bool(self.group_id and self.access_token)
 
     def get_long_poll_server(self) -> bool:
-        """Проверка доступности Group LongPoll"""
+        """Получение LongPoll сервера для группы"""
         try:
-            params = {'group_id': self.group_id}
+            params = {'group_id': abs(self.group_id)}  # group_id должен быть положительным!
             ret = self._api_call('groups.getLongPollServer', params)
             if 'error' in ret:
                 err = ret['error']
@@ -60,8 +111,15 @@ class GroupHandler:
                     f"{err.get('error_code')} {err.get('error_msg')}"
                 )
                 return False
+                
+            resp = ret.get('response', {})
+            self._lp_server = resp.get('server', '')
+            self._lp_key = resp.get('key', '')
+            self._lp_ts = resp.get('ts', '')
+            
             logger.info(f"✅ [{self.name}] LongPoll доступен")
             return True
+            
         except Exception as e:
             logger.error(f"❌ [{self.name}] LongPoll ошибка: {e}")
             return False
@@ -74,26 +132,6 @@ class GroupHandler:
         return max(0, int(remaining))
 
     # ──────────────────────────────────────────────
-    #  API вызов
-    # ──────────────────────────────────────────────
-    def _api_call(self, method: str, params: Dict[str, Any]) -> Dict:
-        """Прямой вызов VK API с токеном группы"""
-        call_params = dict(params)
-        call_params['access_token'] = self.access_token
-        call_params['v'] = VK_API_VERSION
-
-        debug_params = {k: v for k, v in call_params.items() if k != 'access_token'}
-        logger.debug(f"🔧 [{self.name}] API {method}: {debug_params}")
-
-        try:
-            ret = self._vk.call(self._vk.post(method, call_params))
-            logger.debug(f"🔧 [{self.name}] API {method} ответ: {ret}")
-            return ret
-        except Exception as e:
-            logger.error(f"❌ {self.name}: API {method} exception: {e}")
-            return {'error': {'error_code': -1, 'error_msg': str(e)}}
-
-    # ──────────────────────────────────────────────
     #  ОТПРАВКА СООБЩЕНИЯ
     # ──────────────────────────────────────────────
     def send_message(
@@ -104,7 +142,7 @@ class GroupHandler:
         forward_msg_id: Optional[int] = None
     ) -> Tuple[bool, Optional[Dict]]:
         """
-        Отправить сообщение от имени группы.
+        Отправить сообщение от имени группы с повторными попытками.
 
         Групповой токен НЕ возвращает message_id (всегда 0),
         но возвращает conversation_message_id (cmid).
@@ -146,7 +184,7 @@ class GroupHandler:
             f"has_forward={'forward' in params}"
         )
 
-        ret = self._api_call('messages.send', params)
+        ret = self._api_call('messages.send', params, with_retry=True)
 
         logger.info(f"🔧 response: {ret}")
 
@@ -220,7 +258,7 @@ class GroupHandler:
         cmid: int = 0
     ) -> Tuple[bool, str]:
         """
-        Редактировать своё сообщение.
+        Редактировать своё сообщение с повторными попытками.
         Для группового токена message_id=0,
         поэтому ПРИОРИТЕТ у cmid.
         """
@@ -246,7 +284,7 @@ class GroupHandler:
             }
             logger.info(f"✏️ Попытка через cmid={cmid}")
 
-            ret = self._api_call('messages.edit', params_cmid)
+            ret = self._api_call('messages.edit', params_cmid, with_retry=True)
 
             if 'error' not in ret and ret.get('response') == 1:
                 logger.info(f"✅ Отредактировано через cmid={cmid}")
@@ -272,7 +310,7 @@ class GroupHandler:
             }
             logger.info(f"✏️ Попытка через message_id={message_id}")
 
-            ret = self._api_call('messages.edit', params)
+            ret = self._api_call('messages.edit', params, with_retry=True)
 
             if 'error' not in ret and ret.get('response') == 1:
                 logger.info(
@@ -302,7 +340,7 @@ class GroupHandler:
         cmid: int = 0
     ) -> bool:
         """
-        Удалить сообщение группы.
+        Удалить сообщение группы с повторными попытками.
         Для группового токена message_id обычно 0,
         поэтому ПРИОРИТЕТ у cmid.
         """
@@ -329,7 +367,7 @@ class GroupHandler:
             logger.error("❌ Нет ни message_id ни cmid для удаления")
             return False
 
-        ret = self._api_call('messages.delete', params)
+        ret = self._api_call('messages.delete', params, with_retry=True)
 
         if 'error' in ret:
             err = ret['error']
@@ -346,12 +384,13 @@ class GroupHandler:
     #  ИСТОРИЯ
     # ──────────────────────────────────────────────
     def get_history(self, peer_id: int, count: int = 20) -> List[Dict[str, Any]]:
+        """Получает историю сообщений чата с повторными попытками"""
         if self.is_rate_limited():
             return []
 
         try:
             params = {'peer_id': peer_id, 'count': count}
-            ret = self._api_call('messages.getHistory', params)
+            ret = self._api_call('messages.getHistory', params, with_retry=True)
 
             if 'error' in ret:
                 err = ret['error']
@@ -371,6 +410,7 @@ class GroupHandler:
             return []
 
     def get_history_cached(self, peer_id: int, count: int = 20) -> List[Dict[str, Any]]:
+        """Получает историю с кэшированием"""
         cache_key = f"history_{peer_id}_{count}"
         now = time.time()
 
@@ -388,6 +428,7 @@ class GroupHandler:
         return fresh_data
 
     def invalidate_cache(self, peer_id: Optional[int] = None) -> None:
+        """Инвалидирует кэш истории"""
         with self._cache_lock:
             if peer_id is None:
                 self._history_cache.clear()
